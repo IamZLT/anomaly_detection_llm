@@ -1,0 +1,262 @@
+CUDA_VISIBLE_DEVICES=1 HF_ENDPOINT=https://hf-mirror.com python main_mvtec.py 
+
+
+CUDA_VISIBLE_DEVICES=5 HF_ENDPOINT=https://hf-mirror.com python main_mvtec_re.py  --proj_finetune_ratio 0.001
+
+
+
+# shot4
+CUDA_VISIBLE_DEVICES=3 HF_ENDPOINT=https://hf-mirror.com python main_mvtec.py \
+--shot 4 --save_path ./results/main_mvtec_shot4 > ./results/log/main_mvtec_shot4.txt
+
+
+# 可视化
+CUDA_VISIBLE_DEVICES=2 HF_ENDPOINT=https://hf-mirror.com python main_mvtec_for_visualization.py \
+    --enable_visualization \
+    --max_visualizations_per_epoch 10 \
+    --epochs 1 \
+    --test_interval 1
+
+CUDA_VISIBLE_DEVICES=6  HF_ENDPOINT=https://hf-mirror.com  python test_visa_for_visualization.py 
+
+# shot 1
+CUDA_VISIBLE_DEVICES=6 HF_ENDPOINT=https://hf-mirror.com  \
+python main_mvtec.py  --proj_finetune_ratio 0.001 \
+--temperature 0.07 \
+--temperature_scale 0.1 \
+--save_path ./results/main_mvtec_shot1_retrain \
+--shot 1 > ./results/log/main_mvtec_shot1_retrain_11031710.txt
+
+
+CUDA_VISIBLE_DEVICES=5 HF_ENDPOINT=https://hf-mirror.com  \
+python main_mvtec.py  --proj_finetune_ratio 0.001 \
+--temperature 0.07 \
+--image_size 336 \
+--temperature_scale 0.1 \
+--save_path ./results/main_mvtec_shot1_retrain_image_size_336 \
+--shot 1 > ./results/log/main_mvtec_shot1_retrain_image_size_336_11031000.txt
+
+
+CUDA_VISIBLE_DEVICES=4 HF_ENDPOINT=https://hf-mirror.com  \
+python main_mvtec.py  --proj_finetune_ratio 0.001 \
+--temperature 0.07 \
+--image_size 256 \
+--temperature_scale 0.1 \
+--save_path ./results/main_mvtec_shot1_retrain_image_size_256 \
+--shot 1 > ./results/log/main_mvtec_shot1_retrain_image_size_256_11031000.txt
+
+# shot 2
+CUDA_VISIBLE_DEVICES=5 HF_ENDPOINT=https://hf-mirror.com  \
+python main_mvtec.py  --proj_finetune_ratio 0.001 \
+--temperature 0.2 \
+--temperature_scale 0.1 \
+--save_path ./results/main_mvtec_shot2_retrain \
+--shot 2 > ./results/log/main_mvtec_shot2_retrain_10271704.txt
+
+
+# shot 4
+# screen: main_mvtec_shot4_retrain
+CUDA_VISIBLE_DEVICES=6 HF_ENDPOINT=https://hf-mirror.com  \
+python main_mvtec.py  --proj_finetune_ratio 0.001 \
+--temperature 0.3 \
+--temperature_scale 0.1 \
+--save_path ./results/main_mvtec_shot4_retrain \
+--shot 4 > ./results/log/main_mvtec_shot4_retrain_10271708.txt
+
+
+
+
+# pretrain mvtec for visa
+CUDA_VISIBLE_DEVICES=1 python pretrain_mvtec_for_visa.py > results/log/pretrain_mvtec_for_visa.txt
+
+
+# compare main vvclip
+screen -R compare_main_vvclip
+CUDA_VISIBLE_DEVICES= HF_ENDPOINT=https://hf-mirror.com \
+python compare_main_vvclip.py > results/log/compare_main_vvclip_11012348.txt \
+--save_path ./results/compare_main_vvclip_11012348 \
+
+
+screen -R compare_main_vvclip
+CUDA_VISIBLE_DEVICES=2 HF_ENDPOINT=https://hf-mirror.com \
+python compare_main_vvclip.py > results/log/compare_main_vvclip_11012350.txt \
+--save_path ./results/compare_main_vvclip_11012350 
+
+
+CUDA_VISIBLE_DEVICES=3 HF_ENDPOINT=https://hf-mirror.com \
+python compare_main_vvclip.py > results/log/compare_main_vvclip_11020000.txt \
+--save_path ./results/compare_main_vvclip_11020000 
+
+# Visa
+# shot 1
+CUDA_VISIBLE_DEVICES=4 HF_ENDPOINT=https://hf-mirror.com  \
+python main_visa.py  --proj_finetune_ratio 0.001 \
+--temperature 0.07 \
+--temperature_scale 0.1 \
+--save_path ./results/main_visa_shot1_retrain \
+--shot 1 > ./results/log/main_visa_shot1_retrain_10281344.txt
+
+
+CUDA_VISIBLE_DEVICES=4 HF_ENDPOINT=https://hf-mirror.com  \
+python main_visa.py  --proj_finetune_ratio 0.001 \
+--test_interval 5 \
+--temperature 0.07 \
+--temperature_scale 0.1 \
+--save_path ./results/main_visa_shot1_retrain_pretrained_proj_epoch_5 \
+--shot 1 > ./results/log/main_visa_shot1_retrain_pretrained_proj_epoch_5.txt
+
+
+
+CUDA_VISIBLE_DEVICES=3 HF_ENDPOINT=https://hf-mirror.com  \
+python main_visa.py  --proj_finetune_ratio 0.001 \
+--temperature 0.07 \
+--image_size 256 \
+--temperature_scale 0.1 \
+--save_path ./results/main_visa_shot1_retrain_image_size_256 \
+--shot 1 > ./results/log/main_visa_shot1_retrain_image_size_256_11031000.txt
+
+
+CUDA_VISIBLE_DEVICES=4 HF_ENDPOINT=https://hf-mirror.com  \
+python main_visa.py  --proj_finetune_ratio 0.001 \
+--temperature 0.07 \
+--temperature_scale 0.05 \
+--pretrained_proj_path model_card/pretrain_mvtec_for_visa/projection_layers_epoch_3.pth \
+--save_path ./results/main_visa_shot1_retrain_temperature_0.07_0.05__epoch_3 \
+--shot 1 > ./results/log/main_visa_shot1_retrain_temperature_0.07_0.05_epoch_3.txt
+
+
+CUDA_VISIBLE_DEVICES=5 HF_ENDPOINT=https://hf-mirror.com  \
+python main_visa.py  --proj_finetune_ratio 0.001  --threshold 0.001953125 \
+--temperature 0.07 \
+--temperature_scale 0.05 \
+--pretrained_proj_path model_card/pretrain_mvtec_for_visa/projection_layers_epoch_3.pth \
+--save_path ./results/main_visa_shot1_retrain_temperature_0.07_0.05_epoch_3_threshold_1_512 \
+--shot 1 > ./results/log/main_visa_shot1_retrain_temperature_0.07_0.05_epoch_3_threshold_1_512.txt
+
+CUDA_VISIBLE_DEVICES=6 HF_ENDPOINT=https://hf-mirror.com  \
+python main_visa.py  --proj_finetune_ratio 0.001  --threshold 0.0078125 \
+--temperature 0.07 \
+--temperature_scale 0.05 \
+--pretrained_proj_path model_card/pretrain_mvtec_for_visa/projection_layers_epoch_3.pth \
+--save_path ./results/main_visa_shot1_retrain_temperature_0.07_0.05_epoch_3_threshold_1_128 \
+--shot 1 > ./results/log/main_visa_shot1_retrain_temperature_0.07_0.05_epoch_3_threshold_1_128.txt
+
+
+
+
+# shot 2
+CUDA_VISIBLE_DEVICES=5 HF_ENDPOINT=https://hf-mirror.com  \
+python main_visa.py  --proj_finetune_ratio 0.001 \
+--temperature 0.2 \
+--temperature_scale 0.1 \
+--save_path ./results/main_visa_shot2_retrain \
+--shot 2 > ./results/log/main_visa_shot2_retrain_10281454.txt
+
+CUDA_VISIBLE_DEVICES=5 HF_ENDPOINT=https://hf-mirror.com  \
+python main_visa.py  --proj_finetune_ratio 0.001 \
+--temperature 0.1 \
+--temperature_scale 0.05 \
+--save_path ./results/main_visa_shot2_retrain_temperature_0.1_0.05 \
+--shot 2 > ./results/log/main_visa_shot2_retrain_temperature_0.1_0.05.txt
+
+# shot 4
+# screen: main_mvtec_shot4_retrain
+CUDA_VISIBLE_DEVICES=6 HF_ENDPOINT=https://hf-mirror.com  \
+python main_visa.py  --proj_finetune_ratio 0.001 \
+--temperature 0.3 \
+--temperature_scale 0.1 \
+--save_path ./results/main_visa_shot4_retrain \
+--shot 4 > ./results/log/main_visa_shot4_retrain_10281456z.txt
+
+
+
+CUDA_VISIBLE_DEVICES=6 HF_ENDPOINT=https://hf-mirror.com  \
+python main_visa.py  --proj_finetune_ratio 0.001 \
+--temperature 0.1 \
+--temperature_scale 0.05 \
+--save_path ./results/main_visa_shot4_retrain_temperature_0.1_0.05 \
+--shot 4 > ./results/log/main_visa_shot4_retrain_temperature_0.1_0.05.txt
+
+# 消融实验
+# step 1： 三组 loss 组合
+CUDA_VISIBLE_DEVICES=1 HF_ENDPOINT=https://hf-mirror.com \
+python xiaorong1_pretrain_visa_for_mvtec.py > results/log/xiaorong1_pretrain_visa_for_mvtec.txt
+
+CUDA_VISIBLE_DEVICES=2 HF_ENDPOINT=https://hf-mirror.com \
+python xiaorong2_pretrain_visa_for_mvtec.py > results/log/xiaorong2_pretrain_visa_for_mvtec.txt
+
+CUDA_VISIBLE_DEVICES=3 HF_ENDPOINT=https://hf-mirror.com \
+python xiaorong3_pretrain_visa_for_mvtec.py > results/log/xiaorong3_pretrain_visa_for_mvtec.txt
+
+# 消融测试
+
+
+CUDA_VISIBLE_DEVICES=3 HF_ENDPOINT=https://hf-mirror.com \
+python main_mvtec_no_retrain.py \
+--shot 1 \
+--save_path ./results/xiaorong1_mvtec_shot1_no_retrain \
+--pretrained_proj_path model_card/xiaorong1_pretrain_visa_for_mvtec/best_projection_layers.pth \
+--temperature 0.07 \
+--temperature_scale 0.1 \
+> results/log/xiaorong1_mvtec_shot1_no_retrain.txt
+
+CUDA_VISIBLE_DEVICES=4 HF_ENDPOINT=https://hf-mirror.com \
+python main_mvtec_no_retrain.py \
+--shot 1 \
+--save_path ./results/xiaorong2_mvtec_shot1_no_retrain \
+--pretrained_proj_path model_card/xiaorong2_pretrain_visa_for_mvtec/best_projection_layers.pth \
+--temperature 0.07 \
+--temperature_scale 0.1 \
+> results/log/xiaorong2_mvtec_shot2_no_retrain.txt
+
+
+CUDA_VISIBLE_DEVICES=5 HF_ENDPOINT=https://hf-mirror.com \
+python main_mvtec_no_retrain.py \
+--shot 1 \
+--save_path ./results/xiaorong3_mvtec_shot1_no_retrain \
+--pretrained_proj_path model_card/xiaorong3_pretrain_visa_for_mvtec/best_projection_layers.pth \
+--temperature 0.07 \
+--temperature_scale 0.1 \
+> results/log/xiaorong4_mvtec_shot4_no_retrain.txt
+
+
+CUDA_VISIBLE_DEVICES=6 HF_ENDPOINT=https://hf-mirror.com \
+python xiaorong0_main_mvtec.py \
+--shot 1 \
+--save_path ./results/xiaorong0_mvtec_shot1_retrain \
+--temperature 0.07 \
+--temperature_scale 0.1 \
+> results/log/xiaorong0_mvtec_shot1_retrain.txt
+
+
+# 消融4: 分数去掉视觉text
+CUDA_VISIBLE_DEVICES=5 HF_ENDPOINT=https://hf-mirror.com \
+python xiaorong4_main_mvtec.py --proj_finetune_ratio 0.001 \
+--shot 1 \
+--save_path ./results/xiaorong4_mvtec_shot1_retrain \
+--temperature 0.07 \
+--temperature_scale 0.1 \
+> results/log/xiaorong4_mvtec_shot1_retrain.txt
+
+# 消融5: 去掉视觉bank，只用text的
+CUDA_VISIBLE_DEVICES=3 HF_ENDPOINT=https://hf-mirror.com \
+python xiaorong5_main_mvtec.py --proj_finetune_ratio 0.001 \
+--shot 1 \
+--save_path ./results/xiaorong5_mvtec_shot1_retrain \
+--temperature 0.07 \
+--temperature_scale 0.1 \
+> results/log/xiaorong5_mvtec_shot1_retrain.txt
+
+
+# 可视化
+ CUDA_VISIBLE_DEVICES=6 HF_ENDPOINT=https://hf-mirror.com \
+ python test_mvtec_for_visualization.py
+
+
+# 直方图可视化
+python scripts/analyze_distribution.py
+
+
+
+CUDA_VISIBLE_DEVICES=0,1,2 HF_ENDPOINT=https://hf-mirror.com torchrun --nproc_per_node=3 main_qwen3.py --config configs/qwen.yaml
+ HF_ENDPOINT=https://hf-mirror.com /home/zlt/miniconda3/envs/clip/bin/huggingface-cli download Qwen/Qwen3-VL-4B-Instruct --local-dir "/data2/zlt/anomaly_detection_llm/model_card/Qwen3-VL-4B-Instruct"

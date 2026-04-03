@@ -1,0 +1,74 @@
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.cursor/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Environments
+.env
+.env.*
+.venv/
+venv/
+env/
+
+# Build / Packaging
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Training artifacts
+logs/
+outputs/
+runs/
+checkpoints/
+**/events.out.tfevents.*
+*.ckpt
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.onnx
+
+# HuggingFace / model cache and local model weights
+model_card/
+.cache/
+**/.cache/
+
+# Data (large local datasets)
+datasets/
+data_raw/
+data_processed/
+*.zip
+*.tar
+*.tar.gz
+*.7z
+
+# App runtime files
+app/uploads/
+app/static/outputs/
+Anomaly-OneVision-main/
+model_card/
+docs/
+
+# Notebook checkpoints
+.ipynb_checkpoints/

@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Qwen3-VL 缺陷检测模型 - Web界面</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .header p {
+            font-size: 1.1em;
+            opacity: 0.9;
+        }
+        
+        .content {
+            padding: 40px;
+        }
+        
+        .upload-section {
+            margin-bottom: 30px;
+        }
+        
+        .upload-area {
+            border: 3px dashed #667eea;
+            border-radius: 15px;
+            padding: 40px;
+            text-align: center;
+            background: #f8f9fa;
+            transition: all 0.3s;
+            cursor: pointer;
+        }
+        
+        .upload-area:hover {
+            background: #e9ecef;
+            border-color: #764ba2;
+        }
+        
+        .upload-area.dragover {
+            background: #e7f3ff;
+            border-color: #667eea;
+        }
+        
+        .upload-icon {
+            font-size: 4em;
+            margin-bottom: 20px;
+        }
+        
+        .file-input {
+            display: none;
+        }
+        
+        .preview-section {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .image-preview {
+            border: 2px solid #dee2e6;
+            border-radius: 10px;
+            overflow: hidden;
+            background: #f8f9fa;
+        }
+        
+        .image-preview img {
+            width: 100%;
+            height: auto;
+            display: block;
+        }
+        
+        .image-preview-label {
+            padding: 10px;
+            background: #667eea;
+            color: white;
+            text-align: center;
+            font-weight: bold;
+        }
+        
+        .prompt-section {
+            margin-bottom: 30px;
+        }
+        
+        .prompt-section label {
+            display: block;
+            margin-bottom: 10px;
+            font-weight: bold;
+            color: #333;
+        }
+        
+        .prompt-section textarea {
+            width: 100%;
+            padding: 15px;
+            border: 2px solid #dee2e6;
+            border-radius: 10px;
+            font-size: 1em;
+            resize: vertical;
+            font-family: inherit;
+        }
+        
+        .prompt-section textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .button-group {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+        
+        .btn {
+            flex: 1;
+            padding: 15px 30px;
+            border: none;
+            border-radius: 10px;
+            font-size: 1.1em;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        
+        .btn-primary:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .btn-secondary {
+            background: #6c757d;
+            color: white;
+        }
+        
+        .btn-secondary:hover {
+            background: #5a6268;
+        }
+        
+        .result-section {
+            margin-top: 30px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 10px;
+            display: none;
+        }
+        
+        .result-section.show {
+            display: block;
+        }
+        
+        .result-title {
+            font-size: 1.5em;
+            margin-bottom: 20px;
+            color: #333;
+        }
+        
+        .response-box {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            border-left: 4px solid #667eea;
+        }
+        
+        .bbox-info {
+            background: #fff3cd;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            border-left: 4px solid #ffc107;
+        }
+        
+        .bbox-info h3 {
+            margin-bottom: 10px;
+            color: #856404;
+        }
+        
+        .bbox-info pre {
+            background: white;
+            padding: 10px;
+            border-radius: 5px;
+            overflow-x: auto;
+        }
+        
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 20px;
+        }
+        
+        .loading.show {
+            display: block;
+        }
+        
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .error {
+            background: #f8d7da;
+            color: #721c24;
+            padding: 15px;
+            border-radius: 10px;
+            margin-top: 20px;
+            border-left: 4px solid #dc3545;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔍 Qwen3-VL 缺陷检测模型</h1>
+            <p>上传图像，输入提示词，获取模型推理结果</p>
+        </div>
+        
+        <div class="content">
+            <!-- 上传区域 -->
+            <div class="upload-section">
+                <div class="upload-area" id="uploadArea">
+                    <div class="upload-icon">📷</div>
+                    <h3>点击或拖拽图像到此处上传</h3>
+                    <p>支持 PNG, JPG, JPEG 格式，最大 16MB</p>
+                    <input type="file" id="fileInput" class="file-input" accept="image/*">
+                </div>
+            </div>
+            
+            <!-- 图像预览 -->
+            <div class="preview-section" id="previewSection" style="display: none;">
+                <div class="image-preview">
+                    <div class="image-preview-label">原始图像</div>
+                    <img id="originalPreview" alt="原始图像">
+                </div>
+                <div class="image-preview">
+                    <div class="image-preview-label">标注结果</div>
+                    <img id="annotatedPreview" alt="标注结果" style="display: none;">
+                </div>
+            </div>
+            
+            <!-- 提示词输入 -->
+            <div class="prompt-section">
+                <label for="promptInput">提示词（Prompt）:</label>
+                <textarea 
+                    id="promptInput" 
+                    rows="3" 
+                    placeholder="输入你的问题或提示词..."
+                >Locate the anomaly region in this image and output the bbox coordinates in JSON format.</textarea>
+            </div>
+            
+            <!-- 按钮组 -->
+            <div class="button-group">
+                <button class="btn btn-primary" id="inferenceBtn" disabled>🚀 开始推理</button>
+                <button class="btn btn-secondary" id="clearBtn">🗑️ 清空</button>
+            </div>
+            
+            <!-- 加载提示 -->
+            <div class="loading" id="loading">
+                <div class="spinner"></div>
+                <p>正在处理中，请稍候...</p>
+            </div>
+            
+            <!-- 结果显示 -->
+            <div class="result-section" id="resultSection">
+                <h2 class="result-title">📝 推理结果</h2>
+                <div class="response-box" id="responseBox"></div>
+                <div class="bbox-info" id="bboxInfo" style="display: none;">
+                    <h3>📍 检测到的边界框信息</h3>
+                    <pre id="bboxData"></pre>
+                </div>
+            </div>
+            
+            <!-- 错误提示 -->
+            <div class="error" id="errorMsg" style="display: none;"></div>
+        </div>
+    </div>
+    
+    <script>
+        const uploadArea = document.getElementById('uploadArea');
+        const fileInput = document.getElementById('fileInput');
+        const previewSection = document.getElementById('previewSection');
+        const originalPreview = document.getElementById('originalPreview');
+        const annotatedPreview = document.getElementById('annotatedPreview');
+        const promptInput = document.getElementById('promptInput');
+        const inferenceBtn = document.getElementById('inferenceBtn');
+        const clearBtn = document.getElementById('clearBtn');
+        const loading = document.getElementById('loading');
+        const resultSection = document.getElementById('resultSection');
+        const responseBox = document.getElementById('responseBox');
+        const bboxInfo = document.getElementById('bboxInfo');
+        const bboxData = document.getElementById('bboxData');
+        const errorMsg = document.getElementById('errorMsg');
+        
+        let currentFile = null;
+        
+        // 点击上传区域
+        uploadArea.addEventListener('click', () => fileInput.click());
+        
+        // 文件选择
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                handleFile(e.target.files[0]);
+            }
+        });
+        
+        // 拖拽上传
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        });
+        
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragover');
+        });
+        
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            if (e.dataTransfer.files.length > 0) {
+                handleFile(e.dataTransfer.files[0]);
+            }
+        });
+        
+        // 处理文件
+        function handleFile(file) {
+            if (!file.type.startsWith('image/')) {
+                showError('请上传图像文件！');
+                return;
+            }
+            
+            currentFile = file;
+            const reader = new FileReader();
+            
+            reader.onload = (e) => {
+                originalPreview.src = e.target.result;
+                previewSection.style.display = 'grid';
+                annotatedPreview.style.display = 'none';
+                inferenceBtn.disabled = false;
+                hideError();
+                hideResult();
+            };
+            
+            reader.readAsDataURL(file);
+        }
+        
+        // 开始推理
+        inferenceBtn.addEventListener('click', async () => {
+            if (!currentFile) {
+                showError('请先上传图像！');
+                return;
+            }
+            
+            const formData = new FormData();
+            formData.append('image', currentFile);
+            formData.append('prompt', promptInput.value);
+            
+            loading.classList.add('show');
+            inferenceBtn.disabled = true;
+            hideError();
+            hideResult();
+            
+            try {
+                const response = await fetch('/inference', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    showResult(data);
+                } else {
+                    showError(data.error || '推理失败');
+                }
+            } catch (error) {
+                showError('网络错误: ' + error.message);
+            } finally {
+                loading.classList.remove('show');
+                inferenceBtn.disabled = false;
+            }
+        });
+        
+        // 显示结果
+        function showResult(data) {
+            responseBox.innerHTML = '<strong>模型回复:</strong><br><br>' + 
+                data.response.replace(/\n/g, '<br>');
+            
+            if (data.bbox_info) {
+                bboxInfo.style.display = 'block';
+                bboxData.textContent = JSON.stringify(data.bbox_info, null, 2);
+                annotatedPreview.src = data.annotated_image;
+                annotatedPreview.style.display = 'block';
+            } else {
+                bboxInfo.style.display = 'none';
+            }
+            
+            resultSection.classList.add('show');
+        }
+        
+        // 清空
+        clearBtn.addEventListener('click', () => {
+            currentFile = null;
+            fileInput.value = '';
+            originalPreview.src = '';
+            annotatedPreview.src = '';
+            previewSection.style.display = 'none';
+            inferenceBtn.disabled = true;
+            hideResult();
+            hideError();
+        });
+        
+        // 隐藏结果
+        function hideResult() {
+            resultSection.classList.remove('show');
+        }
+        
+        // 显示错误
+        function showError(msg) {
+            errorMsg.textContent = msg;
+            errorMsg.style.display = 'block';
+        }
+        
+        // 隐藏错误
+        function hideError() {
+            errorMsg.style.display = 'none';
+        }
+    </script>
+</body>
+</html>

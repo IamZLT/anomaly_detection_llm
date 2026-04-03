@@ -1,0 +1,79 @@
+paths:
+  dataset_root: /data2/zlt/anomaly_detection_llm/datasets/mvtec_anomaly_detection
+  conversation_json_path: /data2/zlt/anomaly_detection_llm/datasets/mvtec_zero_shot.json
+  output_dir: ./logs
+
+runtime:
+  mode: train
+  run_name: grounding_mvtec
+  auto_create_output_dir: true
+
+tensorboard:
+  auto_start: true
+  host: 0.0.0.0
+  port: 5000
+
+model:
+  name: /data2/zlt/anomaly_detection_llm/model_card/Qwen3-VL-4B-Instruct
+  # name: /data2/zlt/anomaly_detection_llm/model_card/Qwen3-VL-8B-Instruct
+
+  local_files_only: true
+  freeze_vit: true
+
+dino:
+  model_path: /data2/zlt/anomaly_detection_llm/model_card/dinov3-vitl16-pretrain-lvd1689m
+  image_size: 512
+  layer_indices: [12, 16, 20, 24]
+  freeze: true
+  use_mlp: true
+  mask_loss_weight: 0.5
+
+clip:
+  enabled: true
+  model_path: /data2/zlt/anomaly_detection_llm/model_card/clip-vit-large-patch14
+  image_size: 224
+  freeze: true
+  use_mlp: true
+
+data:
+  use_grounding_format: true
+  max_image_size: 512
+  factor: 28
+
+lora:
+  enabled: true
+  r: 8
+  alpha: 32
+  dropout: 0.05
+
+training:
+  num_epochs: 5
+  batch_size: 1
+  gradient_accumulation_steps: 16
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  max_length: 2048
+  logging_steps: 10
+  save_steps: 100
+  save_total_limit: 3
+  fp16: false
+  bf16: true
+  gradient_checkpointing: true
+  num_workers: 4
+  seed: 42
+  resume_from_checkpoint: null
+
+distributed:
+  deepspeed: null
+  local_rank: -1
+  ddp_find_unused_parameters: false
+
+inference:
+  model_path: null
+  image_path: null
+  prompt: Locate the anomaly region in this image and output the bbox coordinates in JSON format.
+  max_new_tokens: 512
+  temperature: 0.7
+  top_p: 0.9
+  do_sample: true
