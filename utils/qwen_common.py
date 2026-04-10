@@ -7,7 +7,20 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from PIL import Image
+import torch.nn as nn
+from PIL import Image, ImageDraw, ImageFont
+
+
+def infer_model_compute_device(mod: nn.Module) -> torch.device:
+    """与词嵌入同一设备，供输入张量 .to(device)；避免 device_map 下 next(parameters) 先遍历到 CPU 分片。"""
+    try:
+        if hasattr(mod, "get_input_embeddings"):
+            emb = mod.get_input_embeddings()
+            if emb is not None and hasattr(emb, "weight"):
+                return emb.weight.device
+    except Exception:
+        pass
+    return next(mod.parameters()).device
 
 
 def set_seed(seed: int) -> None:
@@ -40,7 +53,28 @@ def scale_bbox(bbox: Optional[List[int]], scale_factor: Tuple[float, float]) -> 
     return [int(x1 * sx), int(y1 * sy), int(x2 * sx), int(y2 * sy)]
 
 
+def _strip_markdown_json_fence(text: str) -> str:
+    s = text.strip()
+    m = re.match(r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", s, re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return s
+
+
 def parse_grounding_output(response: str) -> Optional[Dict]:
+    """解析模型输出中的 bbox；支持 ```json 代码块、单对象、数组包对象、[x1,y1,x2,y2]。"""
+    stripped = _strip_markdown_json_fence(response)
+    try:
+        j = json.loads(stripped)
+        if isinstance(j, list):
+            for item in j:
+                if isinstance(item, dict) and (item.get("bbox_2d") is not None or item.get("bbox") is not None):
+                    return item
+        if isinstance(j, dict) and (j.get("bbox_2d") is not None or j.get("bbox") is not None):
+            return j
+    except Exception:
+        pass
+
     json_match = re.search(r'\{[^{}]*"bbox_2d"[^{}]*\}', response, re.DOTALL)
     if json_match:
         try:
@@ -52,11 +86,34 @@ def parse_grounding_output(response: str) -> Optional[Dict]:
     if array_match:
         try:
             arr = json.loads(array_match.group())
-            if isinstance(arr, list) and len(arr) == 4:
+            if isinstance(arr, list) and len(arr) == 4 and all(isinstance(x, (int, float)) for x in arr):
                 return {"bbox_2d": arr}
         except Exception:
             pass
     return None
+
+
+def draw_bbox_on_image(image: Image.Image, bbox: List[int], label: str = "Anomaly") -> Image.Image:
+    """在图像上绘制边界框（与 app/app.py 一致）。"""
+    draw = ImageDraw.Draw(image)
+    if len(bbox) != 4:
+        return image
+    x1, y1, x2, y2 = bbox
+    draw.rectangle([x1, y1, x2, y2], outline="red", width=3)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
+    except OSError:
+        try:
+            font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 16)
+        except OSError:
+            font = ImageFont.load_default()
+    bbox_text = draw.textbbox((0, 0), label, font=font)
+    tw = bbox_text[2] - bbox_text[0]
+    th = bbox_text[3] - bbox_text[1]
+    label_y = max(0, y1 - th - 4)
+    draw.rectangle([x1, label_y, x1 + tw + 8, label_y + th + 4], fill="red", outline="red")
+    draw.text((x1 + 4, label_y + 2), label, fill="white", font=font)
+    return image
 
 
 def prepare_output_dir(base_dir: str, run_name: str, auto_create: bool) -> str:

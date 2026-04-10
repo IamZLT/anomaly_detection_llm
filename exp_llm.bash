@@ -23,8 +23,8 @@ torchrun --nproc_per_node=2 main_qwen3.py \
 
 
 # CUDA_VISIBLE_DEVICES=1,2 python test_qwen3_vl.py
-CUDA_VISIBLE_DEVICES=1,2  python run_app.py 
-tensorboard --logdir ./outputs/ --port 6005 --host 0.0.0.0
+CUDA_VISIBLE_DEVICES=1  python run_app.py 
+tensorboard --logdir ./logs/ --port 6009 --host 0.0.0.0
 
 
 # ============================================================================

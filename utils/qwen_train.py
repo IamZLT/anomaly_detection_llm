@@ -1,18 +1,442 @@
 import os
+import json
+import random
 import shutil
 import socket
 import subprocess
 import time
 
+import numpy as np
 import torch
-from transformers import Trainer, TrainingArguments
-from transformers.trainer_callback import PrinterCallback
+from tqdm.auto import tqdm
+from transformers import Trainer, TrainingArguments, TrainerCallback
+from transformers.trainer_callback import PrinterCallback, ProgressCallback
+from transformers.trainer_utils import has_length
+
+try:
+    from transformers.utils.notebook import NotebookProgressCallback
+except ImportError:
+    NotebookProgressCallback = None  # type: ignore[misc,assignment]
+from PIL import Image
+from transformers import AutoImageProcessor
 
 from data.load_mvtec_data import MVTecDataManager
 from data.qwen_grounding_dataset import MVTecQwenGroundingDataset
-from models.qwen3_modeling import setup_model_and_processor
+from models.qwen3_modeling import (
+    QwenDinoBridgeModel,
+    setup_model_and_processor,
+)
+from models.visual_proto import infer_square_hw
 from utils.qwen_common import prepare_output_dir, set_seed
-from utils.qwen_logging import EnhancedLoggingCallback
+from utils.qwen_infer import decode_generation_output
+
+
+def _build_generation_inputs_for_eval(
+    cfg: dict,
+    processor,
+    image: Image.Image,
+    prompt: str,
+) -> dict:
+    """
+    Minimal copy of utils.qwen_infer.build_generation_inputs to avoid circular imports during training.
+    """
+    use_dino_bridge = bool(cfg.get("dino", {}).get("enabled", True))
+    local_files_only = cfg.get("model", {}).get("local_files_only", True)
+    if use_dino_bridge:
+        dino_processor = AutoImageProcessor.from_pretrained(
+            cfg["dino"]["model_path"],
+            trust_remote_code=True,
+            local_files_only=local_files_only,
+        )
+        clip_processor = AutoImageProcessor.from_pretrained(
+            cfg["clip"]["model_path"],
+            trust_remote_code=True,
+            local_files_only=local_files_only,
+        )
+        messages = [{"role": "user", "content": prompt}]
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = processor(text=[text], return_tensors="pt", padding=True)
+        dino_inputs = dino_processor(
+            images=image,
+            return_tensors="pt",
+            do_resize=True,
+            size={
+                "height": int(cfg.get("dino", {}).get("image_size", 512)),
+                "width": int(cfg.get("dino", {}).get("image_size", 512)),
+            },
+        )
+        inputs["dino_pixel_values"] = dino_inputs["pixel_values"]
+        clip_inputs = clip_processor(
+            images=image,
+            return_tensors="pt",
+            do_resize=True,
+            size={
+                "height": int(cfg.get("clip", {}).get("image_size", 224)),
+                "width": int(cfg.get("clip", {}).get("image_size", 224)),
+            },
+        )
+        inputs["clip_pixel_values"] = clip_inputs["pixel_values"]
+        return inputs
+
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": "image", "image": image}, {"type": "text", "text": prompt}],
+        }
+    ]
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    return processor(text=[text], images=[image], return_tensors="pt", padding=True)
+
+
+class BridgeAndProcessorCheckpointCallback(TrainerCallback):
+    """
+    Trainer 保存 checkpoint-* 时只写入 unwrap 后的 HF 基座权重，不会调用 QwenDinoBridgeModel.save_pretrained，
+    因此缺 dino_bridge.bin；也不会自动 save processor。在 on_save 里补全，使中间 checkpoint 与 final_model 一样可推理。
+    """
+
+    def __init__(self, cfg: dict, processor, manager: MVTecDataManager):
+        self.cfg = cfg
+        self.processor = processor
+        self.manager = manager
+        self._last_eval_step: int | None = None
+        self._seen_batches: int = 0
+
+    def on_save(self, args, state, control, model=None, **kwargs):
+        if not _is_main_process() or model is None:
+            return control
+        m = model.module if hasattr(model, "module") else model
+        if not isinstance(m, QwenDinoBridgeModel):
+            return control
+        ckpt = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        if not os.path.isdir(ckpt):
+            _train_log(f"[checkpoint] 目录不存在，跳过补全: {ckpt}")
+            return control
+        try:
+            tr = self.cfg.get("training", {}) or {}
+
+            # 1) 保存 checkpoint 为可直接推理目录（可配置开关）
+            if bool(tr.get("save_pretrained_on_save", True)):
+                m.save_pretrained(ckpt)
+                self.processor.save_pretrained(ckpt)
+                _train_log(f"[checkpoint] saved pretrained + dino_bridge.bin + processor → {ckpt}")
+
+            # 2) 保存后随机可视化/推理若干样本（可配置开关与数量）
+            if bool(tr.get("eval_on_save", True)):
+                # on_save 时也允许跑一次（主要用于与 checkpoint 绑定的可视化产物）
+                step = int(getattr(state, "global_step", 0) or 0)
+                if self._last_eval_step != step:
+                    self._last_eval_step = step
+                    self._run_eval_after_save(m, ckpt, global_step=step)
+        except Exception as e:
+            _train_log(f"[checkpoint] 补全保存失败: {e}")
+        return control
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        """
+        真正按“batch step”频率跑 eval（不依赖 save_steps）。
+        注意：Trainer 的 global_step 在梯度累积时按 optimizer update 计数，不等于 batch 数；
+        这里用 _seen_batches 统计 batch 次数，满足用户“每 N 个 batch 测一次”的需求。
+        """
+        if not _is_main_process() or model is None:
+            return control
+        tr = self.cfg.get("training", {}) or {}
+        if not bool(tr.get("eval_on_save", True)):
+            return control
+        every = int(tr.get("eval_every_n_steps", 0))
+        if every <= 0:
+            return control
+
+        self._seen_batches += 1
+        if self._seen_batches % every != 0:
+            return control
+
+        m = model.module if hasattr(model, "module") else model
+        if not isinstance(m, QwenDinoBridgeModel):
+            return control
+
+        step = int(getattr(state, "global_step", 0) or 0)
+        out_dir = os.path.join(args.output_dir, "eval_steps", f"batch_{self._seen_batches:08d}_step_{step:08d}")
+        os.makedirs(out_dir, exist_ok=True)
+        self._run_eval_after_save(m, out_dir, global_step=step)
+        return control
+
+    @torch.no_grad()
+    def _run_eval_after_save(self, model: QwenDinoBridgeModel, ckpt_dir: str, global_step: int) -> None:
+        tr = self.cfg.get("training", {}) or {}
+        prompt = str(tr.get("eval_prompt", "Does this image have any anomalies?"))
+        k = int(tr.get("eval_num_samples", 5))
+        if k <= 0:
+            return
+        out_dir = os.path.join(ckpt_dir, "eval_samples")
+        os.makedirs(out_dir, exist_ok=True)
+
+        # sample pool from manager json（整份 JSON，随机抽）
+        pool = self.manager.get_all_grounding_samples(mode="test", anomaly_only=False)
+
+        seed = int(self.cfg.get("training", {}).get("seed", 42))
+        rng = random.Random(seed + int(global_step))
+        picks = [pool[i] for i in rng.sample(range(len(pool)), k=min(k, len(pool)))]
+
+        device = next(model.parameters()).device
+        was_training = model.training
+        model.eval()
+
+        results = []
+        for j, s in enumerate(picks):
+            img_path = s.get("full_img_path") or s.get("image")
+            if not img_path or (not os.path.isfile(str(img_path))):
+                continue
+
+            try:
+                img = Image.open(str(img_path)).convert("RGB")
+            except Exception:
+                continue
+
+            # match inference preprocessing: smart_resize inside build_generation_inputs expects resized image
+            from utils.qwen_common import smart_resize
+
+            img_rs, orig_size, _ = smart_resize(
+                img.copy(),
+                max_size=int(self.cfg["data"]["max_image_size"]),
+                factor=int(self.cfg["data"]["factor"]),
+            )
+
+            inputs = _build_generation_inputs_for_eval(self.cfg, self.processor, img_rs, prompt)
+            inputs = {k: v.to(device) if torch.is_tensor(v) else v for k, v in inputs.items()}
+
+            # feature visualization (overlay heatmap on image)
+            dino_pv = inputs.get("dino_pixel_values")
+            clip_pv = inputs.get("clip_pixel_values")
+            dino_hm_path = None
+            mapped_hm_path = None
+            clip_hm_path = None
+            if dino_pv is not None and clip_pv is not None:
+                cls_stack, patch_stack, dino_patches = model._encode_dino(dino_pv, device)
+                clip_patches = model._encode_clip(clip_pv, device)
+                mapped_patches = model.patch_mapper(patch_stack)
+
+                def _heatmap_overlay(image: Image.Image, heat: np.ndarray, alpha: float = 0.45) -> Image.Image:
+                    heat = np.clip(heat, 0.0, 1.0)
+                    r = np.clip(1.5 * heat - 0.5, 0.0, 1.0)
+                    g = np.clip(1.5 - np.abs(2.0 * heat - 1.0), 0.0, 1.0)
+                    b = np.clip(0.5 - 1.5 * (heat - 1.0), 0.0, 1.0)
+                    cm = np.stack([r, g, b], axis=-1)
+                    cm_u8 = (cm * 255.0).astype(np.uint8)
+                    hm = Image.fromarray(cm_u8, mode="RGB")
+                    if hm.size != image.size:
+                        hm = hm.resize(image.size, Image.Resampling.BILINEAR)
+                    return Image.blend(image.convert("RGB"), hm, float(alpha))
+
+                def _save_patch_norm_overlay(patches: torch.Tensor, name: str) -> str:
+                    # patches: [1, P, C]
+                    p = int(patches.shape[1])
+                    h, w = infer_square_hw(p)
+                    norms = patches[0].float().norm(dim=-1).view(h, w)
+                    norms = (norms - norms.min()) / (norms.max() - norms.min() + 1e-8)
+                    heat = norms.detach().cpu().numpy()
+                    alpha = float(tr.get("eval_heatmap_alpha", 0.45))
+                    overlay = _heatmap_overlay(img_rs, heat, alpha=alpha)
+                    path = os.path.join(out_dir, f"{global_step:08d}_{j:02d}_{name}.png")
+                    overlay.save(path)
+                    return path
+
+                def _save_mapped_clip_cosdiff_overlay(mapped: torch.Tensor, clip: torch.Tensor, name: str) -> str:
+                    # mapped: [1, Pd, C], clip: [1, Pc, C]
+                    pd = int(mapped.shape[1])
+                    hd, wd = infer_square_hw(pd)
+                    pc = int(clip.shape[1])
+                    hc, wc = infer_square_hw(pc)
+
+                    # resize clip patch grid -> dino grid
+                    c = int(clip.shape[-1])
+                    clip_map = clip.view(1, hc, wc, c).permute(0, 3, 1, 2)  # [1,C,Hc,Wc]
+                    clip_map = torch.nn.functional.interpolate(
+                        clip_map, size=(hd, wd), mode="bilinear", align_corners=False
+                    )
+                    clip_map = clip_map.permute(0, 2, 3, 1).reshape(1, pd, c)
+
+                    mp = torch.nn.functional.normalize(mapped.float(), dim=-1)
+                    cp = torch.nn.functional.normalize(clip_map.float(), dim=-1)
+                    cos = (mp * cp).sum(dim=-1)[0].view(hd, wd)
+                    heat = (1.0 - cos)
+                    heat = (heat - heat.min()) / (heat.max() - heat.min() + 1e-8)
+                    heat_np = heat.detach().cpu().numpy()
+
+                    alpha = float(tr.get("eval_heatmap_alpha", 0.45))
+                    overlay = _heatmap_overlay(img_rs, heat_np, alpha=alpha)
+                    path = os.path.join(out_dir, f"{global_step:08d}_{j:02d}_{name}.png")
+                    overlay.save(path)
+                    return path
+
+                dino_hm_path = _save_patch_norm_overlay(dino_patches, "dino_norm_overlay")
+                mapped_hm_path = _save_mapped_clip_cosdiff_overlay(
+                    mapped_patches, clip_patches, "mapped_clip_cosdiff_overlay"
+                )
+                clip_hm_path = _save_patch_norm_overlay(clip_patches, "clip_norm_overlay")
+
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=int(self.cfg.get("inference", {}).get("max_new_tokens", 64)),
+                temperature=float(self.cfg.get("inference", {}).get("temperature", 0.0)),
+                top_p=float(self.cfg.get("inference", {}).get("top_p", 0.9)),
+                do_sample=bool(self.cfg.get("inference", {}).get("do_sample", False)),
+            )
+            answer = decode_generation_output(self.processor, outputs, inputs, self.cfg)
+
+            rec = {
+                "global_step": int(global_step),
+                "idx": int(j),
+                "prompt": prompt,
+                "image_path": str(img_path),
+                "orig_size": list(orig_size),
+                "answer": str(answer),
+                "dino_feature_vis": dino_hm_path,
+                "mapped_feature_vis": mapped_hm_path,
+                "clip_feature_vis": clip_hm_path,
+            }
+            results.append(rec)
+
+        with open(os.path.join(out_dir, f"eval_{global_step:08d}.json"), "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+
+        if was_training:
+            model.train()
+
+
+class PerEpochProgressCallback(TrainerCallback):
+    """
+    HuggingFace 默认 ProgressCallback 用一条 tqdm 覆盖全程 max_steps。
+    本回调改为每个 epoch 一条进度条（0%→100% 对应当轮 optimizer steps）。
+    """
+
+    def __init__(self):
+        self.training_bar = None
+        self.prediction_bar = None
+        self.current_step = 0
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.current_step = int(state.global_step)
+
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        ne = max(1, int(getattr(state, "num_train_epochs", 1) or 1))
+        ms = max(0, int(getattr(state, "max_steps", 0) or 0))
+        gs = int(state.global_step)
+        remaining = max(0, ms - gs)
+        spe = max(1, (ms + ne - 1) // ne) if ms > 0 else 1
+        total_this_epoch = max(1, min(spe, remaining))
+        if self.training_bar is not None:
+            self.training_bar.close()
+        ep_label = int(state.epoch or 0) + 1
+        ep_label = max(1, min(ep_label, ne))
+        desc = f"Epoch {ep_label}/{ne}"
+        self.training_bar = tqdm(total=total_this_epoch, dynamic_ncols=True, desc=desc, leave=True)
+        self.current_step = gs
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.is_world_process_zero and self.training_bar is not None:
+            delta = int(state.global_step) - self.current_step
+            if delta:
+                self.training_bar.update(delta)
+            self.current_step = int(state.global_step)
+
+    def on_prediction_step(self, args, state, control, eval_dataloader=None, **kwargs):
+        if state.is_world_process_zero and has_length(eval_dataloader):
+            if self.prediction_bar is None:
+                self.prediction_bar = tqdm(
+                    total=len(eval_dataloader), leave=self.training_bar is None, dynamic_ncols=True
+                )
+            self.prediction_bar.update(1)
+
+    def on_evaluate(self, args, state, control, **kwargs):
+        if state.is_world_process_zero:
+            if self.prediction_bar is not None:
+                self.prediction_bar.close()
+            self.prediction_bar = None
+
+    def on_predict(self, args, state, control, **kwargs):
+        if state.is_world_process_zero:
+            if self.prediction_bar is not None:
+                self.prediction_bar.close()
+            self.prediction_bar = None
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        # 不往 tqdm 写 logs（否则会与 PrettyTrainLogCallback 重复一行 dict）
+        pass
+
+    def on_train_end(self, args, state, control, **kwargs):
+        if state.is_world_process_zero and self.training_bar is not None:
+            self.training_bar.close()
+            self.training_bar = None
+
+
+class PrettyTrainLogCallback(TrainerCallback):
+    def on_log(self, args, state, control, logs=None, model=None, **kwargs):
+        if not _is_main_process():
+            return control
+        if not logs:
+            return control
+
+        m = model.module if (model is not None and hasattr(model, "module")) else model
+        extra = {}
+        if m is not None and hasattr(m, "get_last_loss_stats"):
+            try:
+                extra = m.get_last_loss_stats() or {}
+            except Exception:
+                extra = {}
+
+        # epoch is fractional progress (e.g. 0.02 means 2% of epoch 1)
+        step = int(getattr(state, "global_step", 0) or 0)
+        epoch = getattr(state, "epoch", None)
+        epoch_s = "?"
+        if epoch is not None:
+            try:
+                epoch_s = f"{float(epoch):.2f}"
+            except Exception:
+                epoch_s = str(epoch)
+
+        loss_total = logs.get("loss", extra.get("loss_total", None))
+        lr = logs.get("learning_rate", None)
+        gnorm = logs.get("grad_norm", None)
+
+        parts = []
+        if loss_total is not None:
+            parts.append(f"loss={float(loss_total):.4f}")
+        if extra.get("loss_lm") is not None:
+            parts.append(f"loss_lm={float(extra['loss_lm']):.4f}")
+        # helpful bridge stats
+        if extra.get("bridge_tokens") is not None:
+            parts.append(f"bridge_tok={int(extra['bridge_tokens'])}")
+        if extra.get("raw_visual_tokens") is not None:
+            parts.append(f"raw_vis_tok={int(extra['raw_visual_tokens'])}")
+        if lr is not None:
+            parts.append(f"lr={float(lr):.3e}")
+        if gnorm is not None:
+            parts.append(f"gnorm={float(gnorm):.2f}")
+
+        _train_log(f"step={step} epoch={epoch_s} | " + " ".join(parts))
+        return control
+
+
+def _is_main_process() -> bool:
+    """单进程或未设 RANK 时视为主进程；多卡以 RANK==0 为准，否则退化为 LOCAL_RANK==0。"""
+    r = os.environ.get("RANK")
+    if r is not None:
+        return int(r) == 0
+    lr = os.environ.get("LOCAL_RANK")
+    if lr is not None:
+        return int(lr) == 0
+    return True
+
+
+def _train_log(msg: str, main_only: bool = False) -> None:
+    if main_only and not _is_main_process():
+        return
+    rank = os.environ.get("RANK", "?")
+    lr = os.environ.get("LOCAL_RANK", "?")
+    prefix = f"[train rank={rank} local={lr}] "
+    print(prefix + msg, flush=True)
 
 
 def _is_port_in_use(host: str, port: int) -> bool:
@@ -54,8 +478,13 @@ def _auto_start_tensorboard(cfg: dict, output_dir: str) -> None:
 
 
 def train_main(cfg: dict) -> None:
-    is_world_process_zero = int(os.environ.get("RANK", "0")) == 0
+    is_world_process_zero = _is_main_process()
+    _train_log("进入 train_main …")
     set_seed(cfg["training"]["seed"])
+
+    # 避免 DataLoader 多进程通过 /dev/shm 传 tensor 时写爆（常见于容器 shm 很小）
+    # 可在 yaml 里设置 training.multiprocessing_sharing_strategy: file_system
+    mp_strategy = str(cfg.get("training", {}).get("multiprocessing_sharing_strategy", "")).strip().lower()
 
     output_dir = prepare_output_dir(
         base_dir=cfg["paths"]["output_dir"],
@@ -63,14 +492,20 @@ def train_main(cfg: dict) -> None:
         auto_create=cfg["runtime"]["auto_create_output_dir"],
     )
     cfg["paths"]["output_dir"] = output_dir
+    if is_world_process_zero:
+        _train_log(f"输出目录: {output_dir}", main_only=True)
 
     manager = MVTecDataManager(
         dataset_root=cfg["paths"]["dataset_root"],
         conversation_json_path=cfg["paths"]["conversation_json_path"],
     )
+    _train_log("正在加载 MVTec 元数据 …")
     manager.load_all()
+    _train_log("MVTec 元数据加载完成")
 
+    _train_log("正在 setup_model_and_processor（全量 Qwen + DINO/CLIP 桥接；DINO/CLIP 骨干冻结，可能数分钟无输出）…")
     model, processor = setup_model_and_processor(cfg, for_inference=False)
+    _train_log("模型与 processor 构建完成")
     train_dataset = MVTecQwenGroundingDataset(
         manager=manager,
         processor=processor,
@@ -82,44 +517,108 @@ def train_main(cfg: dict) -> None:
         dino_cfg=cfg.get("dino", {}),
         clip_cfg=cfg.get("clip", {}),
         local_files_only=cfg.get("model", {}).get("local_files_only", True),
+        train_anomaly_only=bool(cfg["data"].get("train_anomaly_only", False)),
     )
+    _train_log(f"训练集样本数 len(dataset)={len(train_dataset)}")
 
-    training_args = TrainingArguments(
+    # Save a small snapshot of random training samples + resized images for sanity check (configurable)
+    if is_world_process_zero:
+        tr = cfg.get("training", {}) or {}
+        k = int(tr.get("data_snapshot_num_samples", 5))
+        if k <= 0:
+            k = 0
+        _dump_dir = os.path.join(output_dir, "data_samples")
+        os.makedirs(_dump_dir, exist_ok=True)
+        seed = int(cfg.get("training", {}).get("seed", 42))
+        rng = random.Random(seed)
+        k = min(k, len(train_dataset.samples))
+        picks = rng.sample(range(len(train_dataset.samples)), k=k) if k > 0 else []
+        dumped = []
+        for j, idx in enumerate(picks):
+            s = train_dataset.samples[idx]
+            img_path = s.get("full_img_path") or s.get("image")
+            meta = s.get("metadata", {}) or {}
+            conv = s.get("conversations", None)
+            rec = {"idx": int(idx), "image_path": str(img_path), "metadata": meta, "conversations": conv}
+            if img_path and os.path.isfile(str(img_path)):
+                try:
+                    img = Image.open(str(img_path)).convert("RGB")
+                    from utils.qwen_common import smart_resize
+
+                    img_rs, orig_size, _ = smart_resize(
+                        img.copy(),
+                        max_size=int(cfg["data"]["max_image_size"]),
+                        factor=int(cfg["data"]["factor"]),
+                    )
+                    out_img = os.path.join(_dump_dir, f"sample_{j:02d}.png")
+                    img_rs.save(out_img)
+                    rec["saved_image"] = out_img
+                    rec["orig_size"] = list(orig_size)
+                    rec["resized_size"] = [img_rs.size[0], img_rs.size[1]]
+                except Exception as e:
+                    rec["image_error"] = str(e)
+            dumped.append(rec)
+
+        with open(os.path.join(_dump_dir, "samples.json"), "w", encoding="utf-8") as f:
+            json.dump(dumped, f, ensure_ascii=False, indent=2)
+        _train_log(f"[data] saved {len(dumped)} samples snapshot → {_dump_dir}", main_only=True)
+
+    # torchrun 会设置 LOCAL_RANK；yaml 里 -1 时需从环境读取，否则多卡不会进 DDP
+    _local_rank = int(cfg["distributed"]["local_rank"])
+    if _local_rank < 0:
+        _local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
+
+    tr = cfg["training"]
+    num_workers = int(tr.get("num_workers", 0))
+    ta_common = dict(
         output_dir=output_dir,
-        num_train_epochs=cfg["training"]["num_epochs"],
-        per_device_train_batch_size=cfg["training"]["batch_size"],
-        gradient_accumulation_steps=cfg["training"]["gradient_accumulation_steps"],
-        learning_rate=cfg["training"]["learning_rate"],
-        weight_decay=cfg["training"]["weight_decay"],
-        warmup_ratio=cfg["training"]["warmup_ratio"],
-        logging_steps=cfg["training"]["logging_steps"],
-        save_steps=cfg["training"]["save_steps"],
+        num_train_epochs=tr["num_epochs"],
+        per_device_train_batch_size=tr["batch_size"],
+        gradient_accumulation_steps=tr["gradient_accumulation_steps"],
+        learning_rate=tr["learning_rate"],
+        weight_decay=tr["weight_decay"],
+        warmup_ratio=tr["warmup_ratio"],
+        logging_steps=tr["logging_steps"],
+        logging_first_step=True,
+        save_steps=tr["save_steps"],
         save_strategy="steps",
-        save_total_limit=cfg["training"]["save_total_limit"],
+        save_total_limit=tr["save_total_limit"],
         save_safetensors=False,
-        fp16=cfg["training"]["fp16"],
-        bf16=cfg["training"]["bf16"],
-        gradient_checkpointing=cfg["training"]["gradient_checkpointing"],
-        dataloader_num_workers=cfg["training"]["num_workers"],
+        fp16=tr["fp16"],
+        bf16=tr["bf16"],
+        gradient_checkpointing=tr["gradient_checkpointing"],
+        dataloader_num_workers=num_workers,
         dataloader_pin_memory=False,
-        dataloader_prefetch_factor=2,
         report_to=[],
         remove_unused_columns=False,
         logging_dir=os.path.join(output_dir, "logs"),
         disable_tqdm=False,
         ddp_find_unused_parameters=cfg["distributed"]["ddp_find_unused_parameters"],
-        local_rank=cfg["distributed"]["local_rank"],
+        local_rank=_local_rank,
         deepspeed=cfg["distributed"]["deepspeed"],
     )
+    # transformers: prefetch_factor 只能在 num_workers>0 时设置
+    if num_workers > 0:
+        ta_common["dataloader_prefetch_factor"] = 2
+    gckw = tr.get("gradient_checkpointing_kwargs")
+    if gckw:
+        ta_common["gradient_checkpointing_kwargs"] = gckw
+    training_args = TrainingArguments(**ta_common)
 
-    callback = EnhancedLoggingCallback(output_dir=output_dir)
+    bridge_ckpt_cb = BridgeAndProcessorCheckpointCallback(cfg=cfg, processor=processor, manager=manager)
+    pretty_log_cb = PrettyTrainLogCallback()
+    per_epoch_pbar_cb = PerEpochProgressCallback()
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        callbacks=[callback],
+        callbacks=[bridge_ckpt_cb, pretty_log_cb, per_epoch_pbar_cb],
     )
-    trainer.remove_callback(PrinterCallback)
+    # 去掉默认进度条（终端 ProgressCallback / Notebook 下 NotebookProgressCallback），改用 PerEpochProgressCallback
+    _skip_progress = (PrinterCallback, ProgressCallback)
+    if NotebookProgressCallback is not None:
+        _skip_progress = _skip_progress + (NotebookProgressCallback,)
+    trainer.callback_handler.callbacks = [cb for cb in trainer.callback_handler.callbacks if not isinstance(cb, _skip_progress)]
 
     if is_world_process_zero:
         _auto_start_tensorboard(cfg, output_dir)
@@ -128,11 +627,12 @@ def train_main(cfg: dict) -> None:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    _train_log("开始 trainer.train（首轮 forward / DataLoader 启动可能较慢）…")
     trainer.train(resume_from_checkpoint=cfg["training"]["resume_from_checkpoint"])
 
     final_model_path = os.path.join(output_dir, "final_model")
-    trainer.save_model(final_model_path)
     if is_world_process_zero:
+        model.save_pretrained(final_model_path)
         processor.save_pretrained(final_model_path)
 
     mins = (time.time() - t0) / 60

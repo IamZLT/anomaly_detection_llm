@@ -1,313 +1,153 @@
 #!/usr/bin/env python3
 """
-独立的Qwen3-VL微调模型测试脚本
-随机从MVTec数据集中选择一张图像进行测试
+单图测试：与当前训练一致，使用 QwenDinoBridgeModel + DINO/CLIP 桥接（configs/qwen.yaml）。
+
+与 test_qwen3.py 的区别：可从 MVTec test 集随机抽一张图（--random）。
+
+用法:
+  python test_qwen3_vl.py --config configs/qwen.yaml --image-path /path/to/img.png
+  python test_qwen3_vl.py --config configs/qwen.yaml --random
+  python test_qwen3_vl.py --config configs/qwen.yaml --model-path ./logs/xxx/final_model --random
 """
 
+import argparse
 import os
 import random
-import json
-import re
-import torch
-from PIL import Image
-from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+import sys
 
-# ============================================================================
-# 配置参数
-# ============================================================================
-MODEL_PATH = "./outputs/grounding_mvtec_20260116_204905/final_model"
-DATASET_ROOT = "/data2/zlt/anomaly_detection_llm/datasets/mvtec_anomaly_detection"
-MAX_IMAGE_SIZE = 512
-FACTOR = 28
-PROMPT = "Locate the anomaly region in this image and output the bbox coordinates in JSON format."
-MAX_NEW_TOKENS = 512
-TEMPERATURE = 0.7
-TOP_P = 0.9
-DO_SAMPLE = True
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-# ============================================================================
-# 辅助函数
-# ============================================================================
+from utils.qwen_config import apply_runtime_overrides, load_yaml_config
+from utils.qwen_infer import inference_main
 
-def smart_resize(image: Image.Image, max_size: int = 1024, factor: int = 28):
-    """
-    智能resize图像，确保尺寸是factor的倍数（满足ViT patch要求）
-    
-    Args:
-        image: PIL图像
-        max_size: 最大边长
-        factor: 尺寸必须是factor的倍数
-        
-    Returns:
-        resized_image, original_size, scale_factor
-    """
-    original_size = image.size
-    width, height = original_size
-    
-    # 计算缩放比例
-    if max(width, height) > max_size:
-        scale = max_size / max(width, height)
-        new_width = int(width * scale)
-        new_height = int(height * scale)
-    else:
-        new_width = width
-        new_height = height
-    
-    # 确保尺寸是factor的倍数
-    new_width = (new_width // factor) * factor
-    new_height = (new_height // factor) * factor
-    
-    # 至少保持factor大小
-    new_width = max(new_width, factor)
-    new_height = max(new_height, factor)
-    
-    # Resize
-    resized_image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-    
-    # 计算缩放因子
-    scale_factor = (new_width / width, new_height / height)
-    
-    return resized_image, original_size, scale_factor
+# 默认可视化目录（可被 yaml inference.visual_output_dir 覆盖）
+_DEFAULT_VIS_DIR = os.path.join(PROJECT_ROOT, "outputs", "qwen3_vl_test")
 
 
-def parse_grounding_output(response: str):
-    """
-    解析模型输出的bbox JSON
-    
-    Args:
-        response: 模型输出文本
-        
-    Returns:
-        bbox数据字典或None
-    """
-    # 尝试提取JSON格式的bbox
-    # 匹配 {...} 格式的JSON
-    json_pattern = r'\{[^{}]*"bbox[^}]*\}'
-    matches = re.findall(json_pattern, response, re.IGNORECASE | re.DOTALL)
-    
-    for match in matches:
-        try:
-            data = json.loads(match)
-            if 'bbox' in data or 'bbox_2d' in data:
-                return data
-        except:
-            continue
-    
-    # 尝试提取数组格式的bbox [x1, y1, x2, y2]
-    array_pattern = r'\[[\d\s,\.]+\]'
-    array_match = re.search(array_pattern, response)
-    if array_match:
-        array_str = array_match.group()
-        try:
-            bbox_list = json.loads(array_str)
-            if isinstance(bbox_list, list) and len(bbox_list) == 4:
-                return {"bbox_2d": bbox_list}
-        except:
-            pass
-    
-    return None
+def _find_random_test_image(dataset_root: str) -> str:
+    """在 MVTec 目录下递归收集 test/ 下图像，随机选一张。"""
+    dataset_root = os.path.abspath(os.path.expanduser(dataset_root))
+    if not os.path.isdir(dataset_root):
+        raise FileNotFoundError(f"数据集根目录不存在: {dataset_root}")
 
-
-def find_random_test_image():
-    """随机找一张测试图像"""
-    print("🔍 正在随机选择测试图像...")
-    
-    test_images = []
-    for category in os.listdir(DATASET_ROOT):
-        category_path = os.path.join(DATASET_ROOT, category)
+    test_images: list[str] = []
+    for category in os.listdir(dataset_root):
+        category_path = os.path.join(dataset_root, category)
         if not os.path.isdir(category_path):
             continue
-        
         test_dir = os.path.join(category_path, "test")
-        if os.path.exists(test_dir):
-            for root, dirs, files in os.walk(test_dir):
-                for f in files:
-                    if f.lower().endswith(('.png', '.jpg', '.jpeg')):
-                        test_images.append(os.path.join(root, f))
-    
+        if not os.path.exists(test_dir):
+            continue
+        for root, _, files in os.walk(test_dir):
+            for f in files:
+                if f.lower().endswith((".png", ".jpg", ".jpeg")):
+                    test_images.append(os.path.join(root, f))
+
     if not test_images:
-        print("❌ 未找到测试图像！")
-        return None
-    
-    selected_image = random.choice(test_images)
-    print(f"  ✓ 已选择图像: {selected_image}")
-    print(f"  📁 类别: {os.path.basename(os.path.dirname(os.path.dirname(selected_image)))}")
-    print(f"  📁 子类型: {os.path.basename(os.path.dirname(selected_image))}")
-    
-    return selected_image
+        raise RuntimeError(f"在 {dataset_root} 下未找到 test 图像")
+
+    path = random.choice(test_images)
+    print(f"[test_qwen3_vl] 随机选择: {path}")
+    return path
 
 
-# ============================================================================
-# 主推理函数
-# ============================================================================
+def _resolve_image_path(cfg: dict, args: argparse.Namespace) -> str:
+    if getattr(args, "random_image", False):
+        root = args.dataset_root or (cfg.get("paths") or {}).get("dataset_root")
+        if not root:
+            raise ValueError("随机抽图需要 paths.dataset_root 或 --dataset-root")
+        return _find_random_test_image(str(root))
 
-def run_inference(image_path: str):
-    """运行推理"""
-    print(f"\n{'='*60}")
-    print("🚀 开始推理")
-    print(f"{'='*60}")
-    
-    # 1. 加载Processor
-    print(f"\n[1/4] 正在加载Processor...")
-    print(f"  模型路径: {MODEL_PATH}")
-    processor = AutoProcessor.from_pretrained(
-        MODEL_PATH,
-        trust_remote_code=True,
-        use_fast=True
+    if getattr(args, "image_path", None):
+        return os.path.abspath(os.path.expanduser(args.image_path))
+
+    test_cfg = cfg.get("test") or {}
+    if test_cfg.get("image_path"):
+        return os.path.abspath(str(test_cfg["image_path"]))
+
+    inf = cfg.get("inference") or {}
+    if inf.get("image_path"):
+        return os.path.abspath(str(inf["image_path"]))
+
+    return ""
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Qwen3-VL + DINO 桥 单图测试（与训练配置一致）")
+    p.add_argument("--config", type=str, default="configs/qwen.yaml", help="YAML 配置")
+    p.add_argument(
+        "--model-path",
+        type=str,
+        default=None,
+        dest="model_path",
+        help="覆盖 inference.model_path（微调输出 final_model 目录）",
     )
-    print("  ✓ Processor加载完成")
-    
-    # 2. 加载模型
-    print(f"\n[2/4] 正在加载模型（这可能需要几分钟）...")
-    model = Qwen3VLForConditionalGeneration.from_pretrained(
-        MODEL_PATH,
-        device_map="auto",
-        trust_remote_code=True,
-        dtype=torch.bfloat16
+    p.add_argument("--image-path", type=str, default=None, dest="image_path", help="测试图像路径")
+    p.add_argument(
+        "--random",
+        action="store_true",
+        dest="random_image",
+        help="从 paths.dataset_root 下 MVTec test 随机选一张图",
     )
-    model.eval()
-    print("  ✓ 模型加载完成")
-    
-    # 3. 处理图像
-    print(f"\n[3/4] 正在处理图像...")
-    print(f"  图像路径: {image_path}")
-    image = Image.open(image_path).convert('RGB')
-    original_size = image.size
-    print(f"  原始尺寸: {original_size}")
-    
-    image, original_size, scale_factor = smart_resize(
-        image,
-        max_size=MAX_IMAGE_SIZE,
-        factor=FACTOR
+    p.add_argument(
+        "--dataset-root",
+        type=str,
+        default=None,
+        dest="dataset_root",
+        help="覆盖 dataset_root（仅 --random 时有用）",
     )
-    print(f"  处理后尺寸: {image.size}")
-    print(f"  缩放因子: {scale_factor}")
-    print("  ✓ 图像处理完成")
-    
-    # 4. 构建消息并生成
-    print(f"\n[4/4] 正在生成回复...")
-    print(f"  提示词: {PROMPT[:100]}...")
-    
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image},
-                {"type": "text", "text": PROMPT}
-            ]
-        }
-    ]
-    
-    # 处理输入
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = processor(
-        text=[text],
-        images=[image],
-        return_tensors="pt",
-        padding=True
-    ).to(model.device)
-    
-    # 生成
-    print("  → 正在生成（这可能需要几秒到几分钟）...")
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=MAX_NEW_TOKENS,
-            temperature=TEMPERATURE,
-            top_p=TOP_P,
-            do_sample=DO_SAMPLE
+    p.add_argument("--prompt", type=str, default=None, help="覆盖 inference.prompt")
+    p.add_argument(
+        "--vis-dir",
+        type=str,
+        default=None,
+        help="解析到 bbox 时保存可视化目录，默认项目下 outputs/qwen3_vl_test",
+    )
+    return p
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    cfg = load_yaml_config(args.config)
+    cfg = apply_runtime_overrides(cfg, args)
+
+    img = _resolve_image_path(cfg, args)
+    if not img:
+        raise ValueError(
+            "请指定图像: --image-path /path/to.png，或使用 --random，"
+            "或在 yaml 中设置 test.image_path / inference.image_path"
         )
-    print("  ✓ 生成完成")
-    
-    # 解码
-    response = processor.decode(outputs[0], skip_special_tokens=True)
-    
-    print(f"\n{'='*60}")
-    print("📝 模型回复:")
-    print(f"{'='*60}")
-    print(response)
-    print(f"{'='*60}")
-    
-    # 解析Grounding输出
-    print(f"\n{'='*60}")
-    print("🔍 解析Bbox数据")
-    print(f"{'='*60}")
-    try:
-        bbox_data = parse_grounding_output(response)
-        if bbox_data:
-            print("  ✓ 成功解析Bbox数据:")
-            print(json.dumps(bbox_data, indent=2, ensure_ascii=False))
-            
-            # 如果有bbox，需要映射回原始图像尺寸
-            if isinstance(bbox_data, dict) and bbox_data.get('bbox_2d'):
-                bbox = bbox_data['bbox_2d']
-                if bbox:
-                    # 反向缩放bbox到原始图像尺寸
-                    inv_scale_x = 1.0 / scale_factor[0]
-                    inv_scale_y = 1.0 / scale_factor[1]
-                    original_bbox = [
-                        int(bbox[0] * inv_scale_x),
-                        int(bbox[1] * inv_scale_y),
-                        int(bbox[2] * inv_scale_x),
-                        int(bbox[3] * inv_scale_y)
-                    ]
-                    print(f"\n  📐 映射到原始图像尺寸的Bbox:")
-                    print(f"     - 处理后的Bbox: {bbox}")
-                    print(f"     - 原始图像Bbox: {original_bbox}")
-                    print(f"     - 原始图像尺寸: {original_size}")
-                    print(f"     - 缩放因子: {scale_factor}")
-        else:
-            print("  ⚠ 未能从回复中解析出Bbox数据")
-            print("  提示: 检查模型输出是否包含有效的JSON格式bbox")
-    except Exception as e:
-        print(f"  ❌ 解析bbox失败: {e}")
-        import traceback
-        traceback.print_exc()
-    
-    print(f"\n{'='*60}")
-    print("✅ 推理完成")
-    print(f"{'='*60}")
+    if not os.path.isfile(img):
+        raise FileNotFoundError(f"测试图像不存在: {img}")
 
+    cfg.setdefault("inference", {})["image_path"] = img
 
-# ============================================================================
-# 主函数
-# ============================================================================
+    mp = cfg.get("inference", {}).get("model_path")
+    if not mp:
+        raise ValueError(
+            "未设置 inference.model_path（final_model 目录，含 pytorch 权重与 dino_bridge.bin）。"
+            "请在 configs/qwen.yaml 中填写或使用 --model-path"
+        )
 
-def main():
-    """主函数"""
-    print(f"{'='*60}")
-    print("🧪 Qwen3-VL 微调模型测试脚本（独立版本）")
-    print(f"{'='*60}")
-    
-    # 检查模型路径
-    if not os.path.exists(MODEL_PATH):
-        print(f"❌ 模型路径不存在: {MODEL_PATH}")
-        print(f"\n请修改脚本中的 MODEL_PATH 变量为你的模型路径")
-        print(f"例如: ./outputs/grounding_mvtec_YYYYMMDD_HHMMSS/final_model")
-        return
-    
-    print(f"✓ 模型路径: {MODEL_PATH}")
-    
-    # 随机选择测试图像
-    image_path = find_random_test_image()
-    if not image_path:
-        return
-    
-    # 运行推理
-    try:
-        run_inference(image_path)
-    except KeyboardInterrupt:
-        print(f"\n⚠️  推理被用户中断")
-    except Exception as e:
-        print(f"\n❌ 推理失败: {e}")
-        import traceback
-        traceback.print_exc()
-    
-    print(f"\n💡 提示:")
-    print(f"  - 可以修改脚本中的 MODEL_PATH 来测试不同的模型")
-    print(f"  - 可以修改 DATASET_ROOT 来指定不同的数据集路径")
-    print(f"  - 可以修改 PROMPT 参数来使用不同的提示词")
-    print(f"  - 可以修改 MAX_IMAGE_SIZE, TEMPERATURE 等参数")
+    if args.vis_dir:
+        cfg.setdefault("inference", {})["visual_output_dir"] = os.path.abspath(
+            os.path.expanduser(args.vis_dir)
+        )
+    elif not (cfg.get("inference") or {}).get("visual_output_dir"):
+        cfg.setdefault("inference", {})["visual_output_dir"] = _DEFAULT_VIS_DIR
+
+    # 相对路径相对项目根目录解析（inference_main 内也会对 model_path 做 abspath）
+    if not os.path.isabs(mp):
+        mp = os.path.join(PROJECT_ROOT, mp)
+    cfg["inference"]["model_path"] = os.path.abspath(mp)
+
+    print(f"[test_qwen3_vl] config: {os.path.abspath(args.config)}")
+    print(f"[test_qwen3_vl] model_path: {cfg['inference']['model_path']}")
+    print(f"[test_qwen3_vl] image_path: {img}")
+
+    inference_main(cfg)
 
 
 if __name__ == "__main__":

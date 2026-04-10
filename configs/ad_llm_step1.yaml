@@ -1,0 +1,79 @@
+paths:
+  dataset_root: /data2/zlt/anomaly_detection_llm/datasets/mvtec_anomaly_detection
+  conversation_json_path: /data2/zlt/anomaly_detection_llm/datasets/mvtec_zero_shot.json
+  output_dir: ./logs
+
+runtime:
+  mode: train
+  run_name: ad_llm
+  auto_create_output_dir: true
+
+distributed:
+  # >1 时 ad_llm_step1.py 会自动用 torch.distributed.run 以 DDP 启动
+  num_gpu: 1
+
+model:
+  local_files_only: true
+
+dino:
+  model_path: /data2/zlt/anomaly_detection_llm/model_card/dinov3-vitl16-pretrain-lvd1689m
+  image_size: 384
+  layer_indices: [12, 15, 18, 21, 24]
+  use_mlp: true
+
+# CLIP 固定启用（Stage-1 只用 CLIP vision 特征做语义锚点）
+clip:
+  model_path: /data2/zlt/anomaly_detection_llm/model_card/clip-vit-large-patch14
+  image_size: 224
+  use_mlp: true
+
+data:
+  # Stage-1 不用对话/文本，但仍复用 JSON 来找图像路径
+  train_anomaly_only: false
+  max_image_size: 512
+  factor: 28
+
+training:
+  seed: 42
+  # Stage-1 轮数（外层仍复用 training.num_epochs 字段）
+  num_epochs: 1
+
+step1:
+  # 默认：冻结 DINO/CLIP/融合，仅训练 dino_to_clip_mapper
+  train_all: false
+
+  batch_size: 8
+  num_workers: 0
+  lr: 1.0e-4
+  weight_decay: 0.01
+
+  # InfoNCE 超参
+  temperature: 0.07
+  symmetric: true
+
+  # patch-level mask 对齐（缺陷区域加权）
+  lambda_patch: 1.0
+  patch_pos_weight: 4.0
+
+  # 每 N step 保存一次 dino_bridge.bin；0 表示只在结束保存
+  save_every: 500
+
+  # 0 表示不限制；>0 时最多训练这些 step
+  max_steps: 0
+
+  # 有 CUDA 时启用 bf16 autocast
+  bf16: true
+
+test:
+  # 单图测试：使用 step1 训练输出目录里的 dino_bridge.bin
+  # 推荐：填写 train_ad_llm_step1.py 保存的 epoch_*.pth（含 prototypes）
+  ckpt_path: null
+  # 退化模式：只填目录也可以（会找 dino_bridge_latest.bin / dino_bridge.bin），但没有 prototypes 效果会弱
+  ckpt_dir: null
+  image_path: null
+  device: cuda
+  thr_q: 0.98
+  save_vis: true
+  vis_path: outputs/step1_vis.png
+  heatmap_alpha: 0.45
+

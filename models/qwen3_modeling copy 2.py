@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 from utils.dinov3_utils import dinov3_encode_image
-from models.visual_proto import ResidualVisualProjection, MultiLayerCLSProjection, MultiLayerPatchProjection, infer_square_hw
+from models.visual_proto import ResidualVisualProjection, MultiLayerCLSProjection, MultiLayerPatchProjection
 
 
 def _is_main_process() -> bool:
@@ -30,6 +30,13 @@ def _make_projector(in_dim: int, out_dim: int, use_mlp: bool = True) -> nn.Modul
     return nn.Linear(in_dim, out_dim)
 
 class CrossAttentionTokenCompressor(nn.Module):
+    """
+    不截断 patch，只做软压缩：
+    - 输入全量视觉 token
+    - 用固定数量的 learned latents 对全序列做 cross-attention
+    - 输出固定数量的视觉 token 给 LLM
+    """
+
     def __init__(self, hidden_size: int, num_latents: int, num_heads: int, use_mlp: bool = True):
         super().__init__()
         self.num_latents = num_latents
@@ -60,6 +67,7 @@ class CrossAttentionTokenCompressor(nn.Module):
         latents = latents + attn_out
         latents = latents + self.ffn(self.out_norm(latents))
         return latents
+
 
 class QwenDinoBridgeModel(nn.Module):
     """
@@ -173,6 +181,21 @@ class QwenDinoBridgeModel(nn.Module):
         self.mapped_patch_to_llm = _make_projector(self.clip_hidden, llm_hidden, self.use_mlp)
         self.clip_patch_to_llm = _make_projector(self.clip_hidden, llm_hidden, self.clip_use_mlp)
 
+        self.dino_source_embed = nn.Parameter(torch.zeros(1, 1, llm_hidden))
+        self.mapped_source_embed = nn.Parameter(torch.zeros(1, 1, llm_hidden))
+        self.clip_source_embed = nn.Parameter(torch.zeros(1, 1, llm_hidden))
+
+        # 可选：每个分支内部保留顺序信息
+        self.use_patch_pos_embed = bool(dino_cfg.get("use_patch_pos_embed", False))
+        self.max_patch_pos = int(dino_cfg.get("max_patch_pos", 4096))
+        if self.use_patch_pos_embed:
+            self.dino_patch_pos_embed = nn.Parameter(torch.zeros(1, self.max_patch_pos, llm_hidden))
+            self.mapped_patch_pos_embed = nn.Parameter(torch.zeros(1, self.max_patch_pos, llm_hidden))
+            self.clip_patch_pos_embed = nn.Parameter(torch.zeros(1, self.max_patch_pos, llm_hidden))
+            nn.init.normal_(self.dino_patch_pos_embed, mean=0.0, std=0.02)
+            nn.init.normal_(self.mapped_patch_pos_embed, mean=0.0, std=0.02)
+            nn.init.normal_(self.clip_patch_pos_embed, mean=0.0, std=0.02)
+
         # =========================
         # 7. 拼接后共享融合 MLP + 软压缩器
         # =========================
@@ -248,17 +271,19 @@ class QwenDinoBridgeModel(nn.Module):
             raise ValueError(f"dino_pixel_values 需要 [B,3,H,W]，当前 shape={tuple(x.shape)}")
         if x.shape[-2:] != (self.dino_image_size, self.dino_image_size):
             x = F.interpolate(x, size=(self.dino_image_size, self.dino_image_size), mode="bilinear", align_corners=False)
-        dino_dev = next(self.dino_model.parameters()).device
 
-        # 冻结视觉骨干：显式 no_grad 更稳、更省显存（避免内部实现构建不必要的计算图）
-        with torch.no_grad():
-            dino_out = dinov3_encode_image(
-                x,
-                processor=None,
-                model=self.dino_model,
-                device=device,
-                layer_indices=self.dino_layer_indices,
-            )
+        if next(self.dino_model.parameters()).device != device:
+            self.dino_model.to(device)
+
+        dino_out = dinov3_encode_image(
+            x,
+            processor=None,
+            model=self.dino_model,
+            device=device,
+            layer_indices=self.dino_layer_indices,
+        )
+        if "multi_layer_features" not in dino_out:
+            raise RuntimeError("dinov3_encode_image 必须返回 multi_layer_features")
 
         mlf = dino_out["multi_layer_features"]  # list of [B, 1+P, D]
         cls_stack = torch.stack([feat[:, 0, :] for feat in mlf], dim=0)     # [L, B, D]
@@ -266,66 +291,75 @@ class QwenDinoBridgeModel(nn.Module):
 
         w = F.softmax(self.dino_raw_layer_logits[: patch_stack.shape[0]], dim=0).view(-1, 1, 1, 1)
         dino_patches = (patch_stack * w).sum(dim=0).contiguous()  # [B, P, D]
-        gh, gw = dino_out["grid_size"].tolist()
-        dino_hw = (int(gh), int(gw))
-        return cls_stack, patch_stack, dino_patches, dino_hw
+        return cls_stack, patch_stack, dino_patches
 
     def _encode_clip(self, clip_pixel_values: torch.Tensor, device: torch.device):
         """
         返回：
             clip_patches: [B, P, C]
-            clip_hw:      (H, W)
         """
         x = clip_pixel_values.to(device=device, dtype=torch.float32)
         if x.ndim != 4:
             raise ValueError(f"clip_pixel_values 需要 [B,3,H,W]，当前 shape={tuple(x.shape)}")
         if x.shape[-2:] != (self.clip_image_size, self.clip_image_size):
             x = F.interpolate(x, size=(self.clip_image_size, self.clip_image_size), mode="bilinear", align_corners=False)
-        clip_dev = next(self.clip_model.parameters()).device
 
+        if next(self.clip_model.parameters()).device != device:
+            self.clip_model.to(device)
 
         with torch.no_grad():
-            vision_out = self.clip_model.vision_model(pixel_values=x)
-            patch_tokens = vision_out.last_hidden_state[:, 1:, :]
-            if hasattr(self.clip_model, "visual_projection"):
-                patch_tokens = self.clip_model.visual_projection(patch_tokens)
-            ph, pw = infer_square_hw(int(patch_tokens.shape[1]))
-        
-        return patch_tokens, (int(ph), int(pw))
+            if hasattr(self.clip_model, "vision_model"):
+                vision_out = self.clip_model.vision_model(pixel_values=x)
+                patch_tokens = vision_out.last_hidden_state[:, 1:, :]
+                if hasattr(self.clip_model, "visual_projection"):
+                    patch_tokens = self.clip_model.visual_projection(patch_tokens)
+                return patch_tokens
 
-     
+            if hasattr(self.clip_model, "get_image_features"):
+                feat = self.clip_model.get_image_features(pixel_values=x)
+                return torch.empty((feat.shape[0], 0, feat.shape[-1]), device=feat.device, dtype=feat.dtype)
+
+        raise RuntimeError("当前 CLIP 模型不支持 image-only 特征提取。")
+
+    def _add_branch_pos(self, x: torch.Tensor, branch: str) -> torch.Tensor:
+        if not self.use_patch_pos_embed:
+            return x
+        if x.shape[1] > self.max_patch_pos:
+            raise ValueError(
+                f"{branch} patch token 数 {x.shape[1]} 超过 max_patch_pos={self.max_patch_pos}，"
+                "请调大 dino.max_patch_pos 或关闭 use_patch_pos_embed。"
+            )
+        pos = getattr(self, f"{branch}_patch_pos_embed")[:, : x.shape[1], :]
+        return x + pos
+
     def _build_visual_tokens(
         self,
         dino_pixel_values: torch.Tensor,
         clip_pixel_values: torch.Tensor,
         device: torch.device,
     ):
-        cls_stack, patch_stack, dino_patches, _ = self._encode_dino(dino_pixel_values, device)
-        clip_patches, _ = self._encode_clip(clip_pixel_values, device)
+        cls_stack, patch_stack, dino_patches = self._encode_dino(dino_pixel_values, device)
+        clip_patches = self._encode_clip(clip_pixel_values, device)
 
         # Stage-1 mapper（冻结）
         _ = self.cls_mapper(cls_stack)  # 保留兼容；当前不直接作为 visual token 使用
         mapped_patches = self.patch_mapper(patch_stack)  # [B, P, C]
 
-        # 三路先各自 MLP 到 LLM hidden
-        dino_patch_tokens = self.dino_patch_to_llm(dino_patches)
-        mapped_patch_tokens = self.mapped_patch_to_llm(mapped_patches)
-        clip_patch_tokens = self.clip_patch_to_llm(clip_patches)
+        # 三路先各自 MLP 到 LLM hidden，再拼接
+        dino_patch_tokens = self.dino_patch_to_llm(dino_patches) + self.dino_source_embed
+        mapped_patch_tokens = self.mapped_patch_to_llm(mapped_patches) + self.mapped_source_embed
+        clip_patch_tokens = self.clip_patch_to_llm(clip_patches) + self.clip_source_embed
+
+        dino_patch_tokens = self._add_branch_pos(dino_patch_tokens, "dino")
+        mapped_patch_tokens = self._add_branch_pos(mapped_patch_tokens, "mapped")
+        clip_patch_tokens = self._add_branch_pos(clip_patch_tokens, "clip")
 
         all_patch_tokens = torch.cat(
             [dino_patch_tokens, mapped_patch_tokens, clip_patch_tokens],
             dim=1,
         )
-        # all_patch_tokens = all_patch_tokens + self.post_concat_mlp(all_patch_tokens)
-        # bridge_tokens = self.post_compress_norm(self.visual_compressor(all_patch_tokens))
-
         all_patch_tokens = all_patch_tokens + self.post_concat_mlp(all_patch_tokens)
         bridge_tokens = self.post_compress_norm(self.visual_compressor(all_patch_tokens))
-
-
-        # 骨干输出通道维（进 projector 前）：便于日志核对配置是否一致
-        dino_patch_dim = int(dino_patches.shape[-1])
-        clip_patch_dim = int(clip_patches.shape[-1]) if int(clip_patches.shape[1]) > 0 else 0
 
         aux = {
             "bridge_num_tokens": bridge_tokens.shape[1],
@@ -333,8 +367,6 @@ class QwenDinoBridgeModel(nn.Module):
             "num_mapped_patch_tokens": mapped_patch_tokens.shape[1],
             "num_clip_patch_tokens": clip_patch_tokens.shape[1],
             "raw_visual_tokens": all_patch_tokens.shape[1],
-            "dino_patch_dim": dino_patch_dim,
-            "clip_patch_dim": clip_patch_dim,
         }
         return bridge_tokens, aux
 
@@ -386,8 +418,6 @@ class QwenDinoBridgeModel(nn.Module):
             )
             merged_labels = torch.cat([prefix_labels, merged_labels], dim=1)
 
-        # 不显式构造 position_ids：与 generate() 一致，交给 HF 在 inputs_embeds + attention_mask 下自行推导，
-        # 避免训练/推理两套位置规则（含 cache_position 等）不一致。
         return merged_embeds, merged_mask, merged_labels, aux
 
     def forward(
@@ -401,12 +431,6 @@ class QwenDinoBridgeModel(nn.Module):
         **kwargs,
     ):
         if dino_pixel_values is None:
-            # 兼容调用方误传多模态字段：纯文本 LLM 不接受这些 kwargs
-            kwargs.pop("dino_pixel_values", None)
-            kwargs.pop("clip_pixel_values", None)
-            kwargs.pop("pixel_values", None)
-            kwargs.pop("image_grid_thw", None)
-            kwargs.pop("mask_supervision", None)
             return self.base_model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -432,7 +456,6 @@ class QwenDinoBridgeModel(nn.Module):
         kwargs.pop("input_ids", None)
         kwargs.pop("attention_mask", None)
         kwargs.pop("labels", None)
-        kwargs.pop("position_ids", None)
         kwargs.pop("dino_pixel_values", None)
         kwargs.pop("clip_pixel_values", None)
         kwargs.pop("mask_supervision", None)
@@ -444,24 +467,17 @@ class QwenDinoBridgeModel(nn.Module):
             **kwargs,
         )
 
-        # 桥接统计每步更新（不依赖 loss 是否为 None，便于各类 on_log / 自定义 qwen_train 打印）
-        self.last_loss_stats = {
-            "bridge_tokens": float(aux["bridge_num_tokens"]),
-            "raw_visual_tokens": float(aux["raw_visual_tokens"]),
-            "num_dino_patch_tokens": float(aux["num_dino_patch_tokens"]),
-            "num_mapped_patch_tokens": float(aux["num_mapped_patch_tokens"]),
-            "num_clip_patch_tokens": float(aux["num_clip_patch_tokens"]),
-            "dino_patch_dim": float(aux["dino_patch_dim"]),
-            "clip_patch_dim": float(aux["clip_patch_dim"]),
-            # 短键名，方便与 loss= / bridge_tok= 同一风格拼日志
-            "dino_dim": float(aux["dino_patch_dim"]),
-            "clip_dim": float(aux["clip_patch_dim"]),
-        }
         if getattr(outputs, "loss", None) is not None:
             lm_loss = outputs.loss
-            lv = float(lm_loss.detach().float().item())
-            self.last_loss_stats["loss_total"] = lv
-            self.last_loss_stats["loss_lm"] = lv
+            self.last_loss_stats = {
+                "loss_total": float(lm_loss.detach().float().item()),
+                "loss_lm": float(lm_loss.detach().float().item()),
+                "bridge_tokens": float(aux["bridge_num_tokens"]),
+                "raw_visual_tokens": float(aux["raw_visual_tokens"]),
+                "num_dino_patch_tokens": float(aux["num_dino_patch_tokens"]),
+                "num_mapped_patch_tokens": float(aux["num_mapped_patch_tokens"]),
+                "num_clip_patch_tokens": float(aux["num_clip_patch_tokens"]),
+            }
         return outputs
 
     @torch.no_grad()
@@ -475,12 +491,6 @@ class QwenDinoBridgeModel(nn.Module):
         **kwargs,
     ):
         if dino_pixel_values is None:
-            # 兼容调用方误传多模态字段：纯文本 LLM 不接受这些 kwargs
-            kwargs.pop("dino_pixel_values", None)
-            kwargs.pop("clip_pixel_values", None)
-            kwargs.pop("pixel_values", None)
-            kwargs.pop("image_grid_thw", None)
-            kwargs.pop("mask_supervision", None)
             return self.base_model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -504,11 +514,11 @@ class QwenDinoBridgeModel(nn.Module):
         kwargs.pop("image_grid_thw", None)
         kwargs.pop("input_ids", None)
         kwargs.pop("attention_mask", None)
-        kwargs.pop("position_ids", None)
         kwargs.pop("dino_pixel_values", None)
         kwargs.pop("clip_pixel_values", None)
         kwargs.pop("mask_supervision", None)
         kwargs.pop("labels", None)
+
         return self.base_model.generate(
             inputs_embeds=merged_embeds,
             attention_mask=merged_mask,
@@ -524,10 +534,6 @@ class QwenDinoBridgeModel(nn.Module):
             if _is_main_process():
                 print(f"[bridge][warn] missing bridge checkpoint file: {ckpt_path}", flush=True)
             return
-
-        if _is_main_process():
-            size_mb = os.path.getsize(ckpt_path) / (1024 * 1024)
-            print(f"[bridge] loading bridge checkpoint: {ckpt_path} ({size_mb:.1f} MB)", flush=True)
 
         payload = torch.load(ckpt_path, map_location="cpu")
 
@@ -558,54 +564,10 @@ class QwenDinoBridgeModel(nn.Module):
                 if k2.startswith("cls_mapper.") or k2.startswith("patch_mapper."):
                     picked[k2] = v
             state_dict = picked if picked else {k[7:] if k.startswith("module.") else k: v for k, v in raw.items()}
-
-        # 只对 bridge 子集做匹配与加载，避免把 base_model.* 计入 missing
-        model_sd = self.state_dict()
-        bridge_model_keys = [k for k in model_sd.keys() if not k.startswith("base_model.")]
-        bridge_model_key_set = set(bridge_model_keys)
-
-        filtered_sd: Dict[str, torch.Tensor] = {}
-        unexpected: list[str] = []
-        shape_mismatch: list[str] = []
-
-        for k, v in state_dict.items():
-            if k not in bridge_model_key_set:
-                unexpected.append(k)
-                continue
-            target = model_sd[k]
-            if tuple(target.shape) != tuple(v.shape):
-                shape_mismatch.append(f"{k}: ckpt{tuple(v.shape)} != model{tuple(target.shape)}")
-                continue
-            filtered_sd[k] = v
-
-        with torch.no_grad():
-            for k, v in filtered_sd.items():
-                model_sd[k].copy_(v.to(device=model_sd[k].device, dtype=model_sd[k].dtype))
-
-        missing_bridge = [k for k in bridge_model_keys if k not in filtered_sd]
+        self.load_state_dict(state_dict, strict=False)
 
         if _is_main_process():
-            n_tensors = len(state_dict)
-            print(
-                f"[bridge] loaded: {ckpt_path} | tensors={n_tensors} "
-                f"loaded={len(filtered_sd)} missing_bridge={len(missing_bridge)} "
-                f"unexpected={len(unexpected)} mismatch={len(shape_mismatch)}",
-                flush=True,
-            )
-            if len(unexpected) > 0:
-                print(f"[bridge][warn] unexpected_keys (first 20): {unexpected[:20]}", flush=True)
-            if len(shape_mismatch) > 0:
-                print(f"[bridge][warn] shape_mismatch (first 20): {shape_mismatch[:20]}", flush=True)
-            if len(missing_bridge) > 0 and len(missing_bridge) <= 20:
-                print(
-                    f"[bridge][warn] missing_bridge_keys (first {len(missing_bridge)}): {missing_bridge}",
-                    flush=True,
-                )
-            elif len(missing_bridge) > 20:
-                print(
-                    f"[bridge][warn] missing_bridge_keys (first 20): {missing_bridge[:20]}",
-                    flush=True,
-                )
+            print(f"[bridge] loaded: {ckpt_path}", flush=True)
 
     def save_pretrained(self, save_directory: str, **kwargs):
         os.makedirs(save_directory, exist_ok=True)
@@ -628,11 +590,7 @@ def write_dino_bridge_checkpoint(model: nn.Module, save_directory: str) -> None:
     if not isinstance(model, QwenDinoBridgeModel):
         raise TypeError(f"需要 QwenDinoBridgeModel，实际收到: {type(model)}")
     os.makedirs(save_directory, exist_ok=True)
-    state_dict = {
-        k: v.detach().cpu()
-        for k, v in model.state_dict().items()
-        if not k.startswith("base_model.")
-    }
+    state_dict = {k: v.detach().cpu() for k, v in model.state_dict().items() if not k.startswith("base_model.")}
     torch.save({"state_dict": state_dict}, os.path.join(save_directory, "dino_bridge.bin"))
 
 
@@ -692,8 +650,6 @@ def setup_model_and_processor(
     bridge_ckpt = cfg.get("model", {}).get("bridge_ckpt_path", None)
     if _is_main_process():
         print(f"[bridge] cfg.model.bridge_ckpt_path = {bridge_ckpt}", flush=True)
-        if bridge_ckpt:
-            print(f"[bridge] exists={os.path.isfile(str(bridge_ckpt))}", flush=True)
     if bridge_ckpt:
         model.load_bridge(str(bridge_ckpt))
 

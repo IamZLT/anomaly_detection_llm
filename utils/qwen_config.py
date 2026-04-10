@@ -35,6 +35,8 @@ def apply_runtime_overrides(cfg: Dict[str, Any], args: Any) -> Dict[str, Any]:
         updates.setdefault("paths", {})["output_dir"] = args.output_dir
     if getattr(args, "run_name", None):
         updates.setdefault("runtime", {})["run_name"] = args.run_name
+    if getattr(args, "num_gpu", None) is not None:
+        updates.setdefault("distributed", {})["num_gpu"] = int(args.num_gpu)
 
     return deep_update(cfg, updates)
 

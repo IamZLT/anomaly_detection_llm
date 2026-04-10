@@ -69,6 +69,8 @@ app/static/outputs/
 Anomaly-OneVision-main/
 model_card/
 docs/
+logs/
+logs_step2/
 
 # Notebook checkpoints
 .ipynb_checkpoints/
