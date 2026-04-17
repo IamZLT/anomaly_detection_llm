@@ -1,3 +1,8 @@
+"""
+MVTec AD 专用：从对话 JSON + MVTec 风格路径构建样本列表。
+
+后续其他数据集请单独实现模块（如 ``data/xxx_json_loader.py``），勿与本文件混用。
+"""
 import os
 import json
 import numpy as np
@@ -34,8 +39,7 @@ def extract_bbox_from_mask(mask_path: str) -> Optional[List[int]]:
 
 class MVTecJSONDataset(Dataset):
     """
-    以 JSON 为主索引的数据集：
-    先读 JSON，再解析 image / conversations / mask
+    MVTec 对话 JSON：以 JSON 列表为主索引，解析 image / conversations / mask。
     """
 
     def __init__(
@@ -185,8 +189,8 @@ class MVTecJSONDataset(Dataset):
 
 class MVTecDataManager:
     """
-    兼容 ``utils/qwen_train`` / ``MVTecQwenGroundingDataset`` 的旧接口；
-    数据以 ``MVTecJSONDataset`` 为准（JSON 列表为唯一索引，一条 JSON 一条样本）。
+    MVTec 数据入口：供 ``utils/qwen_train`` / ``data.mvtec_grounding`` 使用。
+    数据以 ``MVTecJSONDataset`` 为准（JSON 列表为唯一索引）。
 
     固定使用整份 JSON：不按路径中的 ``train``/``test`` 过滤（``split=None``）。
 

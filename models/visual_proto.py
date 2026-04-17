@@ -16,6 +16,33 @@ def normalize_feature(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torc
     return x / x.norm(dim=dim, keepdim=True).clamp_min(eps)
 
 
+def mapped_patch_abnormal_prob_hw(
+    mapped_patches: torch.Tensor,
+    dino_grid: Tuple[int, int],
+    proto_normal: torch.Tensor,
+    proto_abnormal: torch.Tensor,
+    temperature: float = 0.07,
+) -> torch.Tensor:
+    """
+    与 Step1 / ``test_ad_llm_step1`` 一致：CLIP 空间 mapped patch 相对 (normal, abnormal) 原型的 softmax 异常概率。
+    ``mapped_patches``: [B, P, C]；``dino_grid``：DINO patch 网格 (H, W)，H*W=P。
+
+    Returns:
+        ``[B, H, W]``，每格为属于 abnormal 原型的概率。
+    """
+    b, p, c = mapped_patches.shape
+    gh, gw = dino_grid
+    if gh * gw != p:
+        raise ValueError(f"DINO grid mismatch: {gh}x{gw} != patch count {p}")
+    patch_map = normalize_feature(mapped_patches).view(b, gh, gw, c)
+    proto_n = normalize_feature(proto_normal.reshape(1, c)).view(c)
+    proto_a = normalize_feature(proto_abnormal.reshape(1, c)).view(c)
+    logit_n = torch.einsum("bhwc,c->bhw", patch_map, proto_n)
+    logit_a = torch.einsum("bhwc,c->bhw", patch_map, proto_a)
+    logits = torch.stack([logit_n, logit_a], dim=1) / max(float(temperature), 1e-8)
+    return torch.softmax(logits, dim=1)[:, 1]
+
+
 def infer_square_hw(num_patches: int) -> Tuple[int, int]:
     side = int(round(math.sqrt(max(1, num_patches))))
     if side * side != num_patches:

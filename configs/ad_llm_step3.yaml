@@ -1,0 +1,102 @@
+paths:
+  dataset_root: /data2/zlt/anomaly_detection_llm/datasets/mvtec_anomaly_detection
+  conversation_json_path: /data2/zlt/anomaly_detection_llm/datasets/mvtec_zero_shot.json
+  output_dir: ./logs_step3
+
+runtime:
+  mode: train
+  run_name: ad_llm_step3
+  auto_create_output_dir: true
+
+tensorboard:
+  auto_start: true
+  host: 0.0.0.0
+  port: 5002
+
+model:
+  random_init_llm: false
+  arch: Qwen3-VL-4B-Instruct
+  # 建议填 Stage-2 的 final_model 或 checkpoint-*（含 pytorch_model.bin），在 Step-2 权重上继续训
+  name: /data2/zlt/anomaly_detection_llm/model_card/Qwen3-VL-4B-Instruct
+  bridge_ckpt_path: null
+  local_files_only: true
+  freeze_vit: true
+
+# Stage-2 微调输出目录下的 dino_bridge.bin（或留空在 model.bridge_ckpt_path 填写）
+step3:
+  bridge_ckpt_path: /path/to/logs_step2/.../checkpoint-xxxx/dino_bridge.bin
+
+dino:
+  model_path: /data2/zlt/anomaly_detection_llm/model_card/dinov3-vitl16-pretrain-lvd1689m
+  image_size: 384
+  layer_indices: [12, 15, 18, 21, 24]
+  use_mlp: true
+  use_patch_pos_embed: true
+  max_patch_pos: 4096
+
+clip:
+  model_path: /data2/zlt/anomaly_detection_llm/model_card/clip-vit-large-patch14
+  image_size: 224
+  use_mlp: true
+
+data:
+  use_grounding_format: true
+  train_anomaly_only: false
+  # Step-3：只训练 metadata 含 GT bbox 的样本（正常/无框样本剔除）
+  train_gt_bbox_only: true
+  max_image_size: 512
+  factor: 28
+  bbox_normalize_01: true
+
+training:
+  num_epochs: 3
+  batch_size: 1
+  gradient_accumulation_steps: 16
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  max_length: 2048
+  logging_steps: 10
+  save_steps: 100
+  save_total_limit: 3
+  fp16: false
+  bf16: true
+  gradient_checkpointing: false
+  num_workers: 0
+  seed: 42
+  resume_from_checkpoint: null
+  # 仅训练用；推理仍只读 LLM 生成的 <bbox>。设为 0 关闭辅助头（日志会显示 loss_bbox=off）。
+  bbox_aux_loss_weight: 0.1
+  data_snapshot_num_samples: 5
+  save_pretrained_on_save: true
+  eval_on_save: true
+  eval_every_n_steps: 100
+  eval_num_samples: 5
+  eval_prompt: "Locate any defective region and output a bounding box as <bbox>x1,y1,x2,y2</bbox> (normalized 0-1)."
+  eval_heatmap_alpha: 0.45
+  step1_visual_debug: false
+
+distributed:
+  num_gpu: 1
+  deepspeed: null
+  local_rank: -1
+  ddp_find_unused_parameters: true
+
+bridge:
+  num_visual_tokens: 256
+  compressor_num_heads: 8
+  use_2d_pos_embed: true
+  prototype_temperature: 0.07
+  proto_modulation_gamma: 0.5
+
+inference:
+  model_path: null
+  image_path: null
+  prompt: >-
+    Locate the anomaly region in this image. Output <bbox>x1,y1,x2,y2</bbox> with coordinates normalized to 0-1 relative to the displayed image.
+  max_new_tokens: 2048
+  temperature: 0.0
+  top_p: 0.9
+  do_sample: false
+  save_visualization: true
+  visual_output_dir: null

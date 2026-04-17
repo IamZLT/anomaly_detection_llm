@@ -47,7 +47,7 @@ data:
   max_image_size: 512
   factor: 28
 
-# 主训练路径（main_qwen3 + qwen3_modeling.setup_model_and_processor）已不使用 LoRA，为全量微调。
+# 主训练路径（main_qwen3 + avNet.setup_model_and_processor）已不使用 LoRA，为全量微调。
 # 保留字段仅作文档/旧脚本兼容；勿再当作会生效的开关。
 lora:
   enabled: false

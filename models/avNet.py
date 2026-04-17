@@ -1,14 +1,23 @@
+"""
+AVNet：Anomaly / defect Vision + Language 大模型（DINO/CLIP 视觉前缀 + 因果 LM）。
+"""
+import json
 import os
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 from utils.dinov3_utils import dinov3_encode_image
-from models.visual_proto import ResidualVisualProjection, MultiLayerCLSProjection, MultiLayerPatchProjection, infer_square_hw
-
+from models.visual_proto import (
+    MultiLayerCLSProjection,
+    MultiLayerPatchProjection,
+    ResidualVisualProjection,
+    infer_square_hw,
+    mapped_patch_abnormal_prob_hw,
+)
 
 def _is_main_process() -> bool:
     r = os.environ.get("RANK")
@@ -18,7 +27,6 @@ def _is_main_process() -> bool:
     if lr is not None:
         return int(lr) == 0
     return True
-
 
 def _make_projector(in_dim: int, out_dim: int, use_mlp: bool = True) -> nn.Module:
     if use_mlp:
@@ -62,19 +70,6 @@ class CrossAttentionTokenCompressor(nn.Module):
         return latents
 
 class QwenDinoBridgeModel(nn.Module):
-    """
-    纯文本 Qwen3（CausalLM）+ DINO/CLIP bridge
-    Stage-2 最终版：
-    1) 冻结 DINO / CLIP / Stage-1 mapper
-    2) 使用三路 patch token：
-       - dino_patches   : 原始精细局部特征（DINO 空间）
-       - mapped_patches : Stage-1 学到的 DINO -> CLIP 桥接特征
-       - clip_patches   : CLIP 局部语义特征
-    3) 三路各自先过 MLP 到 LLM hidden，再拼接
-    4) 不做任何 patch 截断；拼接后通过软压缩模块压成固定长度视觉前缀
-    5) 训练只保留 LM loss
-    """
-
     def __init__(self, base_model: nn.Module, cfg: dict):
         super().__init__()
         self.base_model = base_model
@@ -193,6 +188,19 @@ class QwenDinoBridgeModel(nn.Module):
         )
         self.post_compress_norm = nn.LayerNorm(llm_hidden)
 
+        # Step1 视觉原型：buffer 供热力图等；可选在 forward 中按异常概率调制 mapped 再进 LLM（gamma=0 关闭）
+        st1 = cfg.get("step1", {}) or {}
+        self.proto_modulation_gamma = float(bridge_cfg.get("proto_modulation_gamma", 0.0))
+        self.prototype_temperature = float(
+            bridge_cfg.get("prototype_temperature", st1.get("temperature", 0.07))
+        )
+        self.register_buffer("proto_normal", torch.zeros(self.clip_hidden))
+        self.register_buffer("proto_abnormal", torch.zeros(self.clip_hidden))
+        self.register_buffer("_proto_loaded", torch.tensor(0.0))
+
+        tr = cfg.get("training", {}) or {}
+        self.debug_step1_visual = bool(tr.get("step1_visual_debug", False))
+
         # =========================
         # 8. 训练策略
         # =========================
@@ -202,6 +210,18 @@ class QwenDinoBridgeModel(nn.Module):
             p.requires_grad = False
         for p in self.patch_mapper.parameters():
             p.requires_grad = False
+
+        # Step-3 可选：对视觉前缀池化后回归 0–1 bbox，与 GT 做 Smooth L1（训练 cfg.training.bbox_aux_loss_weight）
+        self.bbox_aux_loss_weight = float(tr.get("bbox_aux_loss_weight", 0.0))
+        if self.bbox_aux_loss_weight > 0.0:
+            self.bbox_head = nn.Sequential(
+                nn.LayerNorm(llm_hidden),
+                nn.Linear(llm_hidden, llm_hidden),
+                nn.GELU(),
+                nn.Linear(llm_hidden, 4),
+            )
+        else:
+            self.bbox_head = None
 
     @property
     def config(self):
@@ -236,12 +256,63 @@ class QwenDinoBridgeModel(nn.Module):
         print(f"可训练参数量: {trainable / 1e6:.2f} M")
         print(f"可训练占比: {100 * trainable / total:.2f}%")
 
+    def visual_prototypes_ready(self) -> bool:
+        return bool(self._proto_loaded.item() > 0.5)
+
+    def _ingest_prototypes_dict(self, p: Any) -> None:
+        if not isinstance(p, dict):
+            return
+        n = p.get("normal")
+        a = p.get("abnormal")
+        if n is None or a is None:
+            return
+        n = n.detach().reshape(-1).float()
+        a = a.detach().reshape(-1).float()
+        if int(n.numel()) != self.clip_hidden or int(a.numel()) != self.clip_hidden:
+            if _is_main_process():
+                print(
+                    f"[proto][warn] prototype dim {int(n.numel())}/{int(a.numel())} "
+                    f"!= clip_hidden {self.clip_hidden}，跳过加载",
+                    flush=True,
+                )
+            return
+        with torch.no_grad():
+            self.proto_normal.copy_(n.to(device=self.proto_normal.device, dtype=self.proto_normal.dtype))
+            self.proto_abnormal.copy_(a.to(device=self.proto_abnormal.device, dtype=self.proto_abnormal.dtype))
+            self._proto_loaded.fill_(1.0)
+        if _is_main_process():
+            print("[proto] 已加载 Step1 normal/abnormal 向量到 AVNet", flush=True)
+
+    def load_step1_visual_prototypes(self, ckpt_path: str) -> None:
+        ckpt_path = str(ckpt_path).strip()
+        if not ckpt_path or ckpt_path.lower() in ("none", "null"):
+            return
+        if not os.path.isfile(ckpt_path):
+            if _is_main_process():
+                print(f"[proto][warn] 文件不存在: {ckpt_path}", flush=True)
+            return
+        try:
+            payload = torch.load(ckpt_path, map_location="cpu")
+        except Exception as e:
+            if _is_main_process():
+                print(f"[proto][warn] torch.load 失败: {e}", flush=True)
+            return
+        if isinstance(payload, dict) and payload.get("prototypes"):
+            self._ingest_prototypes_dict(payload["prototypes"])
+        else:
+            if _is_main_process():
+                print(
+                    "[proto][warn] checkpoint 无 'prototypes' 字段（需 Step1 的 epoch_*.pth / best_*.pth）",
+                    flush=True,
+                )
+
     def _encode_dino(self, dino_pixel_values: torch.Tensor, device: torch.device):
         """
         返回：
             cls_stack   : [L, B, D]
             patch_stack : [L, B, P, D]  (供 Stage-1 patch mapper 使用)
             dino_patches: [B, P, D]     (raw DINO patch，softmax 层融合)
+            dino_hw     : (H, W)        DINO patch 网格高宽
         """
         x = dino_pixel_values.to(device=device, dtype=torch.float32)
         if x.ndim != 4:
@@ -283,7 +354,6 @@ class QwenDinoBridgeModel(nn.Module):
             x = F.interpolate(x, size=(self.clip_image_size, self.clip_image_size), mode="bilinear", align_corners=False)
         clip_dev = next(self.clip_model.parameters()).device
 
-
         with torch.no_grad():
             vision_out = self.clip_model.vision_model(pixel_values=x)
             patch_tokens = vision_out.last_hidden_state[:, 1:, :]
@@ -293,19 +363,58 @@ class QwenDinoBridgeModel(nn.Module):
         
         return patch_tokens, (int(ph), int(pw))
 
-     
+    
     def _build_visual_tokens(
         self,
         dino_pixel_values: torch.Tensor,
         clip_pixel_values: torch.Tensor,
         device: torch.device,
     ):
-        cls_stack, patch_stack, dino_patches, _ = self._encode_dino(dino_pixel_values, device)
+        cls_stack, patch_stack, dino_patches, dino_hw = self._encode_dino(dino_pixel_values, device)
         clip_patches, _ = self._encode_clip(clip_pixel_values, device)
 
         # Stage-1 mapper（冻结）
         _ = self.cls_mapper(cls_stack)  # 保留兼容；当前不直接作为 visual token 使用
         mapped_patches = self.patch_mapper(patch_stack)  # [B, P, C]
+
+        if self.debug_step1_visual and _is_main_process():
+            mp = mapped_patches.detach().float()
+            print(
+                "[avNet._build_visual_tokens] mapped_patches (patch_mapper 输出) "
+                f"shape={tuple(mapped_patches.shape)} mean={mp.mean():.6f} std={mp.std():.6f} "
+                f"min={mp.min():.6f} max={mp.max():.6f}",
+                flush=True,
+            )
+
+        # 用 Step1 原型对每 patch 的「异常概率」调制 mapped 幅度，再进 LLM（与 utils.visualization 里 shell forward 热力图无关）
+        if self.visual_prototypes_ready() and self.proto_modulation_gamma > 0.0:
+            prob_hw = mapped_patch_abnormal_prob_hw(
+                mapped_patches,
+                dino_hw,
+                self.proto_normal,
+                self.proto_abnormal,
+                self.prototype_temperature,
+            )
+            b, p, _ = mapped_patches.shape
+            prob_flat = prob_hw.reshape(b, p, 1)
+            scale = 1.0 + self.proto_modulation_gamma * (prob_flat * 2.0 - 1.0)
+            mapped_patches = mapped_patches * scale.to(dtype=mapped_patches.dtype, device=mapped_patches.device)
+            if self.debug_step1_visual and _is_main_process():
+                sc = scale.detach().float()
+                mp2 = mapped_patches.detach().float()
+                print(
+                    "[avNet._build_visual_tokens] proto 幅度调制已应用 "
+                    f"gamma={self.proto_modulation_gamma} temp={self.prototype_temperature} | "
+                    f"scale mean={sc.mean():.4f} std={sc.std():.4f} | "
+                    f"mapped(after) mean={mp2.mean():.6f} std={mp2.std():.6f}",
+                    flush=True,
+                )
+        elif self.debug_step1_visual and _is_main_process():
+            print(
+                "[avNet._build_visual_tokens] 未做 proto 调制（proto_ready="
+                f"{self.visual_prototypes_ready()} gamma={self.proto_modulation_gamma}）",
+                flush=True,
+            )
 
         # 三路先各自 MLP 到 LLM hidden
         dino_patch_tokens = self.dino_patch_to_llm(dino_patches)
@@ -321,7 +430,6 @@ class QwenDinoBridgeModel(nn.Module):
 
         all_patch_tokens = all_patch_tokens + self.post_concat_mlp(all_patch_tokens)
         bridge_tokens = self.post_compress_norm(self.visual_compressor(all_patch_tokens))
-
 
         # 骨干输出通道维（进 projector 前）：便于日志核对配置是否一致
         dino_patch_dim = int(dino_patches.shape[-1])
@@ -400,6 +508,9 @@ class QwenDinoBridgeModel(nn.Module):
         clip_pixel_values=None,
         **kwargs,
     ):
+        bbox_target = kwargs.pop("bbox_target", None)
+        bbox_loss_mask = kwargs.pop("bbox_loss_mask", None)
+
         if dino_pixel_values is None:
             # 兼容调用方误传多模态字段：纯文本 LLM 不接受这些 kwargs
             kwargs.pop("dino_pixel_values", None)
@@ -437,10 +548,18 @@ class QwenDinoBridgeModel(nn.Module):
         kwargs.pop("clip_pixel_values", None)
         kwargs.pop("mask_supervision", None)
 
+        want_bbox_aux = (
+            self.training
+            and self.bbox_head is not None
+            and bbox_target is not None
+            and bbox_loss_mask is not None
+            and merged_labels is not None
+        )
         outputs = self.base_model(
             inputs_embeds=merged_embeds,
             attention_mask=merged_mask,
             labels=merged_labels,
+            output_hidden_states=want_bbox_aux,
             **kwargs,
         )
 
@@ -459,9 +578,30 @@ class QwenDinoBridgeModel(nn.Module):
         }
         if getattr(outputs, "loss", None) is not None:
             lm_loss = outputs.loss
-            lv = float(lm_loss.detach().float().item())
-            self.last_loss_stats["loss_total"] = lv
-            self.last_loss_stats["loss_lm"] = lv
+            self.last_loss_stats["loss_lm"] = float(lm_loss.detach().float().item())
+            total_loss = lm_loss
+
+            if want_bbox_aux and outputs.hidden_states is not None:
+                prefix_len = int(aux["bridge_num_tokens"])
+                h = outputs.hidden_states[-1]
+                vis_mask = merged_mask[:, :prefix_len].float().unsqueeze(-1)
+                vis_h = h[:, :prefix_len, :]
+                denom = vis_mask.sum(dim=1).clamp(min=1e-6)
+                pooled = (vis_h * vis_mask).sum(dim=1) / denom
+                head_dtype = next(self.bbox_head.parameters()).dtype
+                pred = self.bbox_head(pooled.to(dtype=head_dtype))
+                tgt = bbox_target.to(device=pred.device, dtype=pred.dtype)
+                m = bbox_loss_mask.to(device=pred.device, dtype=pred.dtype).view(-1)
+                per_ex = F.smooth_l1_loss(pred, tgt, reduction="none").mean(dim=-1)
+                if float(m.sum().item()) > 0.0:
+                    loss_bbox = (per_ex * m).sum() / m.sum().clamp(min=1e-6)
+                else:
+                    loss_bbox = pred.new_zeros(())
+                total_loss = lm_loss + self.bbox_aux_loss_weight * loss_bbox
+                outputs.loss = total_loss
+                self.last_loss_stats["loss_bbox"] = float(loss_bbox.detach().float().item())
+
+            self.last_loss_stats["loss_total"] = float(total_loss.detach().float().item())
         return outputs
 
     @torch.no_grad()
@@ -481,6 +621,8 @@ class QwenDinoBridgeModel(nn.Module):
             kwargs.pop("pixel_values", None)
             kwargs.pop("image_grid_thw", None)
             kwargs.pop("mask_supervision", None)
+            kwargs.pop("bbox_target", None)
+            kwargs.pop("bbox_loss_mask", None)
             return self.base_model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -509,6 +651,8 @@ class QwenDinoBridgeModel(nn.Module):
         kwargs.pop("clip_pixel_values", None)
         kwargs.pop("mask_supervision", None)
         kwargs.pop("labels", None)
+        kwargs.pop("bbox_target", None)
+        kwargs.pop("bbox_loss_mask", None)
         return self.base_model.generate(
             inputs_embeds=merged_embeds,
             attention_mask=merged_mask,
@@ -607,6 +751,9 @@ class QwenDinoBridgeModel(nn.Module):
                     flush=True,
                 )
 
+        if isinstance(payload, dict) and payload.get("prototypes"):
+            self._ingest_prototypes_dict(payload["prototypes"])
+
     def save_pretrained(self, save_directory: str, **kwargs):
         os.makedirs(save_directory, exist_ok=True)
         # 默认强制 pytorch_model.bin（避免不同环境 safetensors 差异）
@@ -623,7 +770,6 @@ class QwenDinoBridgeModel(nn.Module):
             self.base_model.save_pretrained(save_directory, **kwargs)
         self.save_bridge_weights(save_directory)
 
-
 def write_dino_bridge_checkpoint(model: nn.Module, save_directory: str) -> None:
     if not isinstance(model, QwenDinoBridgeModel):
         raise TypeError(f"需要 QwenDinoBridgeModel，实际收到: {type(model)}")
@@ -634,6 +780,110 @@ def write_dino_bridge_checkpoint(model: nn.Module, save_directory: str) -> None:
         if not k.startswith("base_model.")
     }
     torch.save({"state_dict": state_dict}, os.path.join(save_directory, "dino_bridge.bin"))
+
+
+def _torch_load_compat(path: str) -> Any:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except Exception:
+        return torch.load(path, map_location="cpu")
+
+
+def _load_raw_state_dict_from_folder(folder: str) -> Dict[str, Any]:
+    """
+    读取 HF Trainer / save_pretrained 目录下的权重字典（支持单文件 bin、分片 index、safetensors）。
+    """
+    folder = os.path.abspath(folder)
+    out: Dict[str, Any] = {}
+
+    bin_path = os.path.join(folder, "pytorch_model.bin")
+    if os.path.isfile(bin_path):
+        blob = _torch_load_compat(bin_path)
+        if isinstance(blob, dict) and "state_dict" in blob and isinstance(blob["state_dict"], dict):
+            return dict(blob["state_dict"])
+        if isinstance(blob, dict):
+            return blob
+        return {}
+
+    idx_torch = os.path.join(folder, "pytorch_model.bin.index.json")
+    if os.path.isfile(idx_torch):
+        with open(idx_torch, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        wm = meta.get("weight_map", {})
+        for shard in sorted(set(wm.values())):
+            sp = os.path.join(folder, shard)
+            if os.path.isfile(sp):
+                chunk = _torch_load_compat(sp)
+                if isinstance(chunk, dict):
+                    out.update(chunk)
+        return out
+
+    st_path = os.path.join(folder, "model.safetensors")
+    if os.path.isfile(st_path):
+        try:
+            from safetensors.torch import load_file
+
+            return dict(load_file(st_path))
+        except Exception:
+            pass
+
+    idx_st = os.path.join(folder, "model.safetensors.index.json")
+    if os.path.isfile(idx_st):
+        try:
+            from safetensors.torch import load_file
+
+            with open(idx_st, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            for shard in sorted(set(meta.get("weight_map", {}).values())):
+                sp = os.path.join(folder, shard)
+                if os.path.isfile(sp):
+                    out.update(load_file(sp))
+            return out
+        except Exception:
+            pass
+
+    return out
+
+
+def _extract_base_model_state_dict(raw: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+    """QwenDinoBridgeModel 存盘键名为 base_model.*，需去掉前缀才能 load 进 AutoModelForCausalLM。"""
+    out: Dict[str, torch.Tensor] = {}
+    for k, v in raw.items():
+        if not isinstance(v, torch.Tensor):
+            continue
+        nk = k
+        if nk.startswith("module."):
+            nk = nk[len("module.") :]
+        if nk.startswith("base_model."):
+            out[nk[len("base_model.") :]] = v
+    return out
+
+
+def _maybe_load_base_from_wrapped_trainer_checkpoint(base_model: nn.Module, folder: str) -> None:
+    """
+    Trainer 保存整个 QwenDinoBridgeModel 时，pytorch_model.bin 里是 base_model.model...；
+    from_pretrained(Qwen3ForCausalLM) 不会消费这些键，导致 LM 仍是随机初始化。
+    这里检测并剥前缀后注入 base_model。
+    """
+    if not folder or not os.path.isdir(folder):
+        return
+    raw = _load_raw_state_dict_from_folder(folder)
+    if not raw:
+        return
+    stripped = _extract_base_model_state_dict(raw)
+    if not stripped:
+        return
+    missing, unexpected = base_model.load_state_dict(stripped, strict=False)
+    if _is_main_process():
+        print(
+            "[setup] 已从含 base_model. 前缀的 checkpoint 注入 Qwen 主干权重（Trainer 包装模型存盘格式）",
+            flush=True,
+        )
+        if missing or unexpected:
+            print(
+                f"[setup] load_state_dict(strict=False): missing_keys={len(missing)} unexpected_keys={len(unexpected)}",
+                flush=True,
+            )
 
 
 def setup_model_and_processor(
@@ -666,16 +916,39 @@ def setup_model_and_processor(
         processor.pad_token_id = processor.eos_token_id
 
     model_cls = AutoModelForCausalLM
-    # 训练/推理统一：始终从预训练/微调目录加载权重（不再支持随机初始化）
-    if _is_main_process():
-        mode_msg = "推理模式" if for_inference else "训练模式"
-        print(f"[setup] {mode_msg}：AutoModelForCausalLM.from_pretrained ← {model_name}")
-    base_model = model_cls.from_pretrained(
-        model_name,
-        trust_remote_code=True,
-        local_files_only=local_files_only,
-        torch_dtype=None if torch_dtype == "auto" else torch_dtype,
-    )
+    model_cfg = cfg.get("model", {}) or {}
+    # 训练可从零随机初始化主干；推理必须从 model_name（含微调 checkpoint 目录）加载权重，否则生成乱码。
+    random_init_llm = bool(model_cfg.get("random_init_llm", False)) and not for_inference
+    if for_inference and bool(model_cfg.get("random_init_llm", False)) and _is_main_process():
+        print(
+            "[setup] 推理模式：已忽略 model.random_init_llm，改为 from_pretrained 加载 LLM 权重",
+            flush=True,
+        )
+
+    if random_init_llm:
+        if _is_main_process():
+            mode_msg = "训练模式"
+            print(f"[setup] {mode_msg}：AutoConfig + from_config（LLM 随机初始化，不加载预训练权重）← {model_name}")
+        llm_config = AutoConfig.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            local_files_only=local_files_only,
+        )
+        base_model = model_cls.from_config(llm_config)
+    else:
+        if _is_main_process():
+            mode_msg = "推理模式" if for_inference else "训练模式"
+            print(f"[setup] {mode_msg}：AutoModelForCausalLM.from_pretrained ← {model_name}", flush=True)
+        base_model = model_cls.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            local_files_only=local_files_only,
+            torch_dtype=None if torch_dtype == "auto" else torch_dtype,
+        )
+
+    # Trainer 保存的 pytorch_model.bin 常为 QwenDinoBridgeModel 全量 state_dict（base_model.*），
+    # CausalLM.from_pretrained 无法对齐这些键；剥前缀后补载，否则推理仍是随机 LM。
+    _maybe_load_base_from_wrapped_trainer_checkpoint(base_model, str(model_name))
 
     if torch_dtype is not None and torch_dtype != "auto":
         try:
@@ -685,17 +958,29 @@ def setup_model_and_processor(
 
     if _is_main_process():
         n_param = sum(p.numel() for p in base_model.parameters())
-        print(f"[setup] 纯文本 Qwen 主干构建完成（权重已加载，参数量约 {n_param / 1e6:.1f}M）")
+        load_msg = "随机初始化" if random_init_llm else "权重已加载"
+        print(f"[setup] 纯文本 Qwen 主干构建完成（{load_msg}，参数量约 {n_param / 1e6:.1f}M）")
 
     model = QwenDinoBridgeModel(base_model, cfg)
 
-    bridge_ckpt = cfg.get("model", {}).get("bridge_ckpt_path", None)
+    bridge_cfg_top = cfg.get("bridge", {}) or {}
+    bridge_ckpt = model_cfg.get("bridge_ckpt_path") or bridge_cfg_top.get("bridge_ckpt_path")
     if _is_main_process():
-        print(f"[bridge] cfg.model.bridge_ckpt_path = {bridge_ckpt}", flush=True)
-        if bridge_ckpt:
-            print(f"[bridge] exists={os.path.isfile(str(bridge_ckpt))}", flush=True)
+        print(
+            f"[bridge] loading from model.bridge_ckpt_path or bridge.bridge_ckpt_path → {bridge_ckpt}",
+            flush=True,
+        )
     if bridge_ckpt:
         model.load_bridge(str(bridge_ckpt))
+
+    # 若 bridge 仅为 dino_bridge.bin（无 prototypes 字段），可单独指定 Step1 的 epoch/best.pth 以对齐 test 热力图
+    proto_ckpt = model_cfg.get("step1_prototypes_ckpt_path") or bridge_cfg_top.get(
+        "step1_prototypes_ckpt_path"
+    )
+    if proto_ckpt and str(proto_ckpt).strip() and str(proto_ckpt).strip().lower() not in ("none", "null"):
+        if _is_main_process():
+            print(f"[proto] cfg.model.step1_prototypes_ckpt_path = {proto_ckpt}", flush=True)
+        model.load_step1_visual_prototypes(str(proto_ckpt).strip())
 
     model.eval() if for_inference else model.train()
     return model, processor

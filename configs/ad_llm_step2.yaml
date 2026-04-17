@@ -16,12 +16,10 @@ tensorboard:
 model:
   # 只用“架构/配置/词表”，不加载任何主干预训练权重（主干权重由你全量训练得到）
   # 指向本地 model_card 目录即可（必须包含 config.json + tokenizer 文件）
+  random_init_llm: true
   arch: Qwen3-VL-4B-Instruct
   name: /data2/zlt/anomaly_detection_llm/model_card/Qwen3-VL-4B-Instruct
-  # Step1 的权重文件路径（二选一）：
-  # - step1 导出的 dino_bridge.bin
-  # - 或 step1 训练的 best_*.pth / epoch_*.pth（会自动抽取 cls_mapper/patch_mapper）
-  bridge_ckpt_path: /path/to/step1/best_pixel_auroc.pth
+  # Step1 桥接权重见下方 bridge.bridge_ckpt_path（或在此写 model.bridge_ckpt_path，二者等价）
   local_files_only: true
   freeze_vit: true
 
@@ -44,6 +42,9 @@ data:
   train_anomaly_only: false
   max_image_size: 512
   factor: 28
+  # true：助手回复里 <bbox> 一律变为相对「当前 smart_resize 后图像」的 0–1。
+  # 有 metadata.bbox 时用 GT 重写；仅有对话内坐标时按原图像素×scale 再归一化。推理侧需同开 bbox_normalize_01。
+  bbox_normalize_01: true
 
 training:
   num_epochs: 5
@@ -74,6 +75,8 @@ training:
   eval_num_samples: 5
   eval_prompt: "Does this image have any anomalies?"
   eval_heatmap_alpha: 0.45
+  # true：eval 热力图与 AVNet forward 时打印 mapped/heat 统计，便于与 test_ad_llm_step1 对照（仅主进程）
+  step1_visual_debug: false
 
 distributed:
   num_gpu: 1
@@ -82,10 +85,17 @@ distributed:
   ddp_find_unused_parameters: true
 
 bridge:
+  # Step1 的 best/epoch_*.pth：含 cls_mapper/patch_mapper；若文件顶层有 prototypes，load_bridge 会一并写入 AVNet（eval 热力图与 test 一致）
+  bridge_ckpt_path: /path/to/step1/best_pixel_auroc.pth
   # 三路 patch token 软压缩成固定长度，再作为视觉前缀拼到文本前
   num_visual_tokens: 256
   compressor_num_heads: 8
-
+  # 每路 MLP 后按各自空间网格加 2D sin-cos PE，再 concat（与旧 checkpoint 不兼容时可设 false）
+  use_2d_pos_embed: true
+  # 与 Step1 softmax 一致的温度；调制与热力图共用同一套 proto 对比逻辑
+  prototype_temperature: 0.07
+  # >0 且已加载 prototypes：进 LLM 前按 patch 异常概率拉伸 mapped（异常 patch 幅度更大）；0 则不调制
+  proto_modulation_gamma: 0.5
 
 inference:
   model_path: logs/grounding_mvtec_20260405_012114/final_model

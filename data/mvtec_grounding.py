@@ -1,3 +1,9 @@
+"""
+MVTec grounding 训练用 Dataset（DINO/CLIP 桥 + HF processor/tokenizer）。
+
+依赖 ``data.mvtec_json_loader.MVTecDataManager`` 提供的样本 dict。
+其他数据集请仿照本模块新建 ``data/<your>_grounding.py``。
+"""
 import os
 
 import numpy as np
@@ -6,8 +12,14 @@ from PIL import Image
 from torch.utils.data import Dataset
 from transformers import AutoImageProcessor, AutoProcessor
 
-from data.load_mvtec_data import MVTecDataManager
-from utils.qwen_common import scale_bbox, smart_resize
+from data.mvtec_json_loader import MVTecDataManager
+from utils.qwen_common import (
+    normalize_bbox_pixels_to_01,
+    rewrite_bbox_tags_original_pixels_to_normalized_01,
+    rewrite_bbox_tags_to_normalized_01,
+    scale_bbox,
+    smart_resize,
+)
 
 
 def _conv_role(conv: dict) -> str:
@@ -98,6 +110,8 @@ class MVTecQwenGroundingDataset(Dataset):
         clip_cfg: dict | None = None,
         local_files_only: bool = True,
         train_anomaly_only: bool = False,
+        normalize_bbox_01: bool = False,
+        train_gt_bbox_only: bool = False,
     ):
         self.manager = manager
         self.processor = processor
@@ -110,6 +124,8 @@ class MVTecQwenGroundingDataset(Dataset):
         self.dino_cfg = dino_cfg or {}
         self.clip_cfg = clip_cfg or {}
         self.local_files_only = local_files_only
+        self.normalize_bbox_01 = bool(normalize_bbox_01)
+        self.train_gt_bbox_only = bool(train_gt_bbox_only)
         self.use_dino_bridge = bool(self.dino_cfg.get("enabled", True))
         self.dino_processor = None
         self.clip_processor = None
@@ -141,6 +157,18 @@ class MVTecQwenGroundingDataset(Dataset):
         if mode == "train":
             self.samples = expand_samples_single_turn_sft(self.samples)
 
+        if mode == "train" and self.train_gt_bbox_only and self.use_grounding_format:
+            def _has_gt_bbox(s: dict) -> bool:
+                bb = (s.get("metadata") or {}).get("bbox")
+                return (
+                    bb is not None
+                    and isinstance(bb, (list, tuple))
+                    and len(bb) == 4
+                    and all(isinstance(x, (int, float)) for x in bb)
+                )
+
+            self.samples = [s for s in self.samples if _has_gt_bbox(s)]
+
     def __len__(self):
         return len(self.samples)
 
@@ -161,17 +189,39 @@ class MVTecQwenGroundingDataset(Dataset):
         if not os.path.isabs(img_path):
             img_path = os.path.join(self.manager.dataset_loader.dataset_root, img_path)
 
+        _scaled_bbox = None
+        image_load_ok = False
+        scale = (1.0, 1.0)
         try:
             image = Image.open(img_path).convert("RGB")
             image, _, scale = smart_resize(image, self.max_image_size, self.factor)
             _scaled_bbox = scale_bbox(original_bbox, scale)
+            image_load_ok = True
         except Exception:
             image = Image.new("RGB", (self.max_image_size, self.max_image_size), "white")
+
+        rw, rh = image.size
+        norm_bbox_01: list[float] | None = None
+        if (
+            self.normalize_bbox_01
+            and _scaled_bbox is not None
+            and len(_scaled_bbox) == 4
+        ):
+            norm_bbox_01 = normalize_bbox_pixels_to_01(list(map(float, _scaled_bbox)), rw, rh)
 
         messages = []
         for conv in conversations:
             role = "user" if conv.get("from") in ("human", "user") or conv.get("role") == "user" else "assistant"
             content = conv.get("value") or conv.get("content", "")
+            is_assistant = conv.get("from") in ("gpt", "assistant") or conv.get("role") == "assistant"
+            # bbox_normalize_01：有 metadata.bbox 时用 GT 统一重写；仅有对话内 <bbox>（原图像素）时按 smart_resize 的 scale 单独归一化
+            if self.normalize_bbox_01 and is_assistant:
+                if norm_bbox_01 is not None:
+                    content = rewrite_bbox_tags_to_normalized_01(str(content), norm_bbox_01)
+                elif image_load_ok:
+                    content = rewrite_bbox_tags_original_pixels_to_normalized_01(
+                        str(content), scale, rw, rh
+                    )
             if "<image>" in str(content):
                 text = str(content).replace("<image>", "").strip()
                 if self.use_dino_bridge:
@@ -278,14 +328,26 @@ class MVTecQwenGroundingDataset(Dataset):
                 },
             )
             out["clip_pixel_values"] = clip_inputs["pixel_values"].squeeze(0)
+
+        # Bbox 回归辅助损失：与 smart_resize 后图像对齐的 0–1 坐标（与 bbox_normalize_01 监督一致）
+        if self.use_dino_bridge:
+            if _scaled_bbox is not None and len(_scaled_bbox) == 4:
+                rw, rh = image.size
+                t01 = normalize_bbox_pixels_to_01(list(map(float, _scaled_bbox)), rw, rh)
+                out["bbox_target"] = torch.tensor(t01, dtype=torch.float32)
+                out["bbox_loss_mask"] = torch.tensor(1.0, dtype=torch.float32)
+            else:
+                out["bbox_target"] = torch.zeros(4, dtype=torch.float32)
+                out["bbox_loss_mask"] = torch.tensor(0.0, dtype=torch.float32)
+        else:
+            out["bbox_target"] = torch.zeros(4, dtype=torch.float32)
+            out["bbox_loss_mask"] = torch.tensor(0.0, dtype=torch.float32)
         return out
 
 
 class MVTecDinoClipAlignDataset(Dataset):
     """
-    Stage-1 dataset：只从 JSON/manager 中读取图片路径，生成 dino_pixel_values / clip_pixel_values。
-    - 不需要 conversations
-    - 不需要 tokenizer / chat template
+    MVTec + Stage-1：只从 JSON/manager 读路径，输出 dino_pixel_values / clip_pixel_values。
     """
 
     def __init__(
@@ -317,8 +379,6 @@ class MVTecDinoClipAlignDataset(Dataset):
             local_files_only=self.local_files_only,
         )
 
-        # 直接用 manager 的 grounding samples（内部会从 conversation_json 解析并补 full_img_path）
-        # 但本 dataset 会忽略 conversations，仅用图像/掩码路径等字段。
         self.samples = manager.get_all_grounding_samples(mode, anomaly_only=anomaly_only and mode == "train")
 
     def __len__(self):
@@ -328,7 +388,7 @@ class MVTecDinoClipAlignDataset(Dataset):
         sample = self.samples[idx]
         img_path = sample.get("full_img_path") or sample["image"]
         meta = sample.get("metadata", {}) or {}
-        full_mask_path = meta.get("full_mask_path")  # 可为空；此阶段通常不用
+        full_mask_path = meta.get("full_mask_path")
 
         if not os.path.isabs(img_path):
             img_path = os.path.join(self.manager.dataset_loader.dataset_root, img_path)
@@ -365,10 +425,8 @@ class MVTecDinoClipAlignDataset(Dataset):
             "clip_pixel_values": clip_inputs["pixel_values"].squeeze(0),
             "img_path": img_path,
         }
-        # DataLoader 默认 collate 要求 batch 内 dict keys 一致；这里总是返回该字段
         out["mask_path"] = full_mask_path or ""
 
-        # 始终返回二值 mask（有缺陷：读 ground_truth；无缺陷：全 0 黑图）
         mask_size = int(self.dino_cfg.get("image_size", 512))
         if full_mask_path and os.path.exists(full_mask_path):
             try:
@@ -381,4 +439,3 @@ class MVTecDinoClipAlignDataset(Dataset):
             mask_np = np.zeros((mask_size, mask_size), dtype=np.float32)
         out["mask_supervision"] = torch.from_numpy(mask_np).unsqueeze(0)
         return out
-

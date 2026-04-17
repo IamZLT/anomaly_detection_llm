@@ -29,6 +29,29 @@ def set_seed(seed: int) -> None:
     random.seed(seed)
 
 
+def step1_train_style_image_batch(
+    img_rs: Image.Image,
+    dino_image_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    与 ``train_ad_llm_step1.MVTecVisualPrototypeDataset`` / ``test_ad_llm_step1`` 一致：
+    对 ``smart_resize`` 后的 PIL 做 ``Resize(dino) → ToTensor → ImageNet``，得到 ``[1,3,H,W]``。
+    DINO 与 CLIP 编码应共用该张量（再由各自 ``encode_*`` 内部按需插值），与单独测 Step1 对齐。
+    """
+    from torchvision import transforms
+
+    h = w = int(dino_image_size)
+    tfm = transforms.Compose(
+        [
+            transforms.Resize((h, w)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+    return tfm(img_rs).unsqueeze(0).to(device)
+
+
 def smart_resize(
     image: Image.Image, max_size: int = 1024, factor: int = 28
 ) -> Tuple[Image.Image, Tuple[int, int], Tuple[float, float]]:
@@ -53,6 +76,85 @@ def scale_bbox(bbox: Optional[List[int]], scale_factor: Tuple[float, float]) -> 
     return [int(x1 * sx), int(y1 * sy), int(x2 * sx), int(y2 * sy)]
 
 
+_BBOX_TAG_RE = re.compile(r"<bbox>\s*([^<]+?)\s*</bbox>", re.IGNORECASE)
+
+
+def normalize_bbox_pixels_to_01(
+    bbox: List[float], width: int, height: int
+) -> List[float]:
+    """将像素框 [x1,y1,x2,y2] 按当前图像宽高归一化到 [0,1]（相对 width/height 各除一次）。"""
+    if width <= 0 or height <= 0:
+        raise ValueError(f"normalize_bbox_pixels_to_01: invalid size ({width}, {height})")
+    x1, y1, x2, y2 = bbox
+    def _c(v: float, denom: int) -> float:
+        return min(1.0, max(0.0, float(v) / float(denom)))
+
+    return [_c(x1, width), _c(y1, height), _c(x2, width), _c(y2, height)]
+
+
+def rewrite_bbox_tags_to_normalized_01(text: str, norm_bbox: List[float], decimals: int = 6) -> str:
+    """将文本中所有 <bbox>...</bbox> 替换为归一化坐标（与训练用 resize 后图像一致）。"""
+    if len(norm_bbox) != 4:
+        return text
+    fmt = ",".join(f"{float(v):.{decimals}f}" for v in norm_bbox)
+    return _BBOX_TAG_RE.sub(f"<bbox>{fmt}</bbox>", text)
+
+
+def rewrite_bbox_tags_original_pixels_to_normalized_01(
+    text: str,
+    scale_factor: Tuple[float, float],
+    resized_width: int,
+    resized_height: int,
+    decimals: int = 6,
+) -> str:
+    """
+    无 metadata.bbox 时：逐个解析 <bbox>...</bbox>，转为相对 smart_resize 后图像的 0–1。
+
+    - 若四个数均在 [0,1] 且最大值 ≤1：视为已相对「当前训练图（resize 后）」的归一化坐标，仅裁剪到 [0,1] 并统一格式。
+    - 否则视为「原图像素」：先按 scale_factor 映射到 resize 后像素，再除以 resized_wh。
+    """
+    if resized_width <= 0 or resized_height <= 0:
+        return text
+    sx, sy = scale_factor
+
+    def repl(m: re.Match) -> str:
+        raw = m.group(1).strip()
+        parts = [p.strip() for p in raw.split(",")]
+        if len(parts) != 4:
+            return m.group(0)
+        try:
+            x1, y1, x2, y2 = (float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]))
+        except ValueError:
+            return m.group(0)
+        vals = [x1, y1, x2, y2]
+        if max(vals) <= 1.0 + 1e-6 and min(vals) >= -1e-6:
+            norm = [min(1.0, max(0.0, v)) for v in vals]
+        else:
+            scaled = [x1 * sx, y1 * sy, x2 * sx, y2 * sy]
+            norm = normalize_bbox_pixels_to_01(scaled, resized_width, resized_height)
+        fmt = ",".join(f"{float(v):.{decimals}f}" for v in norm)
+        return f"<bbox>{fmt}</bbox>"
+
+    return _BBOX_TAG_RE.sub(repl, text)
+
+
+def bbox_to_processed_pixels(
+    bbox: List[float],
+    processed_size: Tuple[int, int],
+    *,
+    normalized_01: bool,
+) -> List[float]:
+    """
+    将模型解析出的框转为「与 smart_resize 后图像一致」的像素坐标。
+    normalized_01=True：bbox 为相对处理后图像的 0–1；否则视为已在处理后图像上的像素坐标。
+    """
+    pw, ph = int(processed_size[0]), int(processed_size[1])
+    x1, y1, x2, y2 = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+    if normalized_01:
+        return [x1 * pw, y1 * ph, x2 * pw, y2 * ph]
+    return [x1, y1, x2, y2]
+
+
 def _strip_markdown_json_fence(text: str) -> str:
     s = text.strip()
     m = re.match(r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", s, re.DOTALL | re.IGNORECASE)
@@ -62,7 +164,7 @@ def _strip_markdown_json_fence(text: str) -> str:
 
 
 def parse_grounding_output(response: str) -> Optional[Dict]:
-    """解析模型输出中的 bbox；支持 ```json 代码块、单对象、数组包对象、[x1,y1,x2,y2]。"""
+    """解析模型输出中的 bbox：JSON（bbox_2d / bbox）、裸四维数组、以及训练常用的 <bbox>x1,y1,x2,y2</bbox> 标签。"""
     stripped = _strip_markdown_json_fence(response)
     try:
         j = json.loads(stripped)
@@ -90,6 +192,18 @@ def parse_grounding_output(response: str) -> Optional[Dict]:
                 return {"bbox_2d": arr}
         except Exception:
             pass
+
+    # 与 generate_data2json / 训练监督一致：<bbox>x1,y1,x2,y2</bbox>（可为小数 0–1）
+    tag_m = _BBOX_TAG_RE.search(response)
+    if tag_m:
+        inner = tag_m.group(1).strip().replace(" ", "")
+        parts = inner.split(",")
+        if len(parts) == 4:
+            try:
+                arr = [float(parts[i]) for i in range(4)]
+                return {"bbox_2d": arr}
+            except ValueError:
+                pass
     return None
 
 

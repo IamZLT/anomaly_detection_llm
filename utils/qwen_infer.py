@@ -7,8 +7,9 @@ import torch
 from PIL import Image
 from transformers import AutoImageProcessor
 
-from models.qwen3_modeling import setup_model_and_processor
+from models.avNet import setup_model_and_processor
 from utils.qwen_common import (
+    bbox_to_processed_pixels,
     draw_bbox_on_image,
     infer_model_compute_device,
     parse_grounding_output,
@@ -188,13 +189,19 @@ def inference_main(cfg: dict) -> None:
     if isinstance(bbox_data, dict):
         bbox = bbox_data.get("bbox_2d") or bbox_data.get("bbox")
     if bbox_data and isinstance(bbox_data, dict) and bbox and len(bbox) == 4:
+        norm01 = bool(cfg.get("data", {}).get("bbox_normalize_01", False))
+        px = bbox_to_processed_pixels(
+            list(map(float, bbox)),
+            image.size,
+            normalized_01=norm01,
+        )
         inv_scale_x = 1.0 / scale_factor[0]
         inv_scale_y = 1.0 / scale_factor[1]
         original_bbox = [
-            int(bbox[0] * inv_scale_x),
-            int(bbox[1] * inv_scale_y),
-            int(bbox[2] * inv_scale_x),
-            int(bbox[3] * inv_scale_y),
+            int(px[0] * inv_scale_x),
+            int(px[1] * inv_scale_y),
+            int(px[2] * inv_scale_x),
+            int(px[3] * inv_scale_y),
         ]
         original_bbox[0] = max(0, min(original_bbox[0], original_size[0]))
         original_bbox[1] = max(0, min(original_bbox[1], original_size[1]))

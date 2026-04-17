@@ -76,4 +76,6 @@ test:
   save_vis: true
   vis_path: outputs/step1_vis.png
   heatmap_alpha: 0.45
+  # true 时 utils.visualization.compute_step1_heat_up 打印 mapped_patches / heat 等调试信息
+  step1_visual_debug: false
 

@@ -23,6 +23,7 @@ from transformers import AutoImageProcessor
 from models.qwen3_text_modeling import setup_model_and_processor
 from utils.qwen_infer import build_generation_inputs, decode_generation_output
 from utils.qwen_common import (
+    bbox_to_processed_pixels,
     draw_bbox_on_image,
     infer_model_compute_device,
     parse_grounding_output,
@@ -227,14 +228,20 @@ def inference():
         if bbox_data:
             bbox = bbox_data.get("bbox_2d") or bbox_data.get("bbox")
             if bbox and len(bbox) == 4:
-                # 将bbox从处理后的尺寸映射回原始尺寸
+                norm01 = bool(cfg.get("data", {}).get("bbox_normalize_01", False))
+                px = bbox_to_processed_pixels(
+                    list(map(float, bbox)),
+                    processed_image.size,
+                    normalized_01=norm01,
+                )
+                # 将 bbox 从处理后的尺寸映射回原始尺寸
                 inv_scale_x = 1.0 / scale_factor[0]
                 inv_scale_y = 1.0 / scale_factor[1]
                 original_bbox = [
-                    int(bbox[0] * inv_scale_x),
-                    int(bbox[1] * inv_scale_y),
-                    int(bbox[2] * inv_scale_x),
-                    int(bbox[3] * inv_scale_y)
+                    int(px[0] * inv_scale_x),
+                    int(px[1] * inv_scale_y),
+                    int(px[2] * inv_scale_x),
+                    int(px[3] * inv_scale_y),
                 ]
                 
                 # 确保bbox在图像范围内
@@ -248,9 +255,10 @@ def inference():
                 annotated_image = draw_bbox_on_image(annotated_image, original_bbox, label)
                 
                 bbox_info = {
-                    'bbox': original_bbox,
-                    'label': label,
-                    'processed_bbox': bbox
+                    "bbox": original_bbox,
+                    "label": label,
+                    "processed_bbox": px,
+                    "model_bbox_raw": bbox,
                 }
         
         # 保存标注后的图像

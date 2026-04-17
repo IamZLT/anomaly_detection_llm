@@ -1,6 +1,7 @@
 import os
 import json
 import random
+from contextlib import nullcontext
 import shutil
 import socket
 import subprocess
@@ -20,13 +21,21 @@ except ImportError:
 from PIL import Image
 from transformers import AutoImageProcessor
 
-from data.load_mvtec_data import MVTecDataManager
-from data.qwen_grounding_dataset import MVTecQwenGroundingDataset
-from models.qwen3_modeling import (
+from data.mvtec_json_loader import MVTecDataManager
+from data.mvtec_grounding import MVTecQwenGroundingDataset
+from models.avNet import (
     QwenDinoBridgeModel,
     setup_model_and_processor,
 )
-from models.visual_proto import infer_square_hw
+from utils.visualization import (
+    attach_avnet_to_step1_shell,
+    build_step1_shell,
+    compute_step1_heat_up,
+    heatmap_overlay,
+    prepare_step1_image_tensor,
+    restore_avnet_bridge_from_step1_shell,
+    visual_prototypes_from_avnet,
+)
 from utils.qwen_common import prepare_output_dir, set_seed
 from utils.qwen_infer import decode_generation_output
 
@@ -100,6 +109,9 @@ class BridgeAndProcessorCheckpointCallback(TrainerCallback):
         self.manager = manager
         self._last_eval_step: int | None = None
         self._seen_batches: int = 0
+        # 与 test_ad_llm_step1 共用 DinoClipVisualPrototypeModel.forward；壳子懒加载后挂 avNet 子模块
+        self._step1_vis_shell = None
+        self._warned_eval_heatmap_no_proto = False
 
     def on_save(self, args, state, control, model=None, **kwargs):
         if not _is_main_process() or model is None:
@@ -181,6 +193,20 @@ class BridgeAndProcessorCheckpointCallback(TrainerCallback):
         was_training = model.training
         model.eval()
 
+        if (
+            _is_main_process()
+            and not model.visual_prototypes_ready()
+            and not self._warned_eval_heatmap_no_proto
+        ):
+            self._warned_eval_heatmap_no_proto = True
+            _train_log(
+                "[eval][heatmap] AVNet 未加载 Step1 visual prototypes，热力图为 cosdiff，"
+                "与 test_ad_llm_step1 使用含 prototypes 的 ckpt 时不一致。"
+                "请配置 bridge.bridge_ckpt_path 或 model.bridge_ckpt_path 为 Step1 的 epoch/best.pth（顶层含 prototypes），"
+                "或另设 model/bridge.step1_prototypes_ckpt_path 指向该文件。",
+                main_only=True,
+            )
+
         results = []
         for j, s in enumerate(picks):
             img_path = s.get("full_img_path") or s.get("image")
@@ -210,69 +236,49 @@ class BridgeAndProcessorCheckpointCallback(TrainerCallback):
             dino_hm_path = None
             mapped_hm_path = None
             clip_hm_path = None
+            mapped_vis_mode = None
             if dino_pv is not None and clip_pv is not None:
-                cls_stack, patch_stack, dino_patches = model._encode_dino(dino_pv, device)
-                clip_patches = model._encode_clip(clip_pv, device)
-                mapped_patches = model.patch_mapper(patch_stack)
-
-                def _heatmap_overlay(image: Image.Image, heat: np.ndarray, alpha: float = 0.45) -> Image.Image:
-                    heat = np.clip(heat, 0.0, 1.0)
-                    r = np.clip(1.5 * heat - 0.5, 0.0, 1.0)
-                    g = np.clip(1.5 - np.abs(2.0 * heat - 1.0), 0.0, 1.0)
-                    b = np.clip(0.5 - 1.5 * (heat - 1.0), 0.0, 1.0)
-                    cm = np.stack([r, g, b], axis=-1)
-                    cm_u8 = (cm * 255.0).astype(np.uint8)
-                    hm = Image.fromarray(cm_u8, mode="RGB")
-                    if hm.size != image.size:
-                        hm = hm.resize(image.size, Image.Resampling.BILINEAR)
-                    return Image.blend(image.convert("RGB"), hm, float(alpha))
-
-                def _save_patch_norm_overlay(patches: torch.Tensor, name: str) -> str:
-                    # patches: [1, P, C]
-                    p = int(patches.shape[1])
-                    h, w = infer_square_hw(p)
-                    norms = patches[0].float().norm(dim=-1).view(h, w)
-                    norms = (norms - norms.min()) / (norms.max() - norms.min() + 1e-8)
-                    heat = norms.detach().cpu().numpy()
-                    alpha = float(tr.get("eval_heatmap_alpha", 0.45))
-                    overlay = _heatmap_overlay(img_rs, heat, alpha=alpha)
-                    path = os.path.join(out_dir, f"{global_step:08d}_{j:02d}_{name}.png")
-                    overlay.save(path)
-                    return path
-
-                def _save_mapped_clip_cosdiff_overlay(mapped: torch.Tensor, clip: torch.Tensor, name: str) -> str:
-                    # mapped: [1, Pd, C], clip: [1, Pc, C]
-                    pd = int(mapped.shape[1])
-                    hd, wd = infer_square_hw(pd)
-                    pc = int(clip.shape[1])
-                    hc, wc = infer_square_hw(pc)
-
-                    # resize clip patch grid -> dino grid
-                    c = int(clip.shape[-1])
-                    clip_map = clip.view(1, hc, wc, c).permute(0, 3, 1, 2)  # [1,C,Hc,Wc]
-                    clip_map = torch.nn.functional.interpolate(
-                        clip_map, size=(hd, wd), mode="bilinear", align_corners=False
+                # 与 test_ad_llm_step1 同一套 forward；attach 会暂时把子模块挂到 shell，必须在 generate 前 restore
+                if self._step1_vis_shell is None:
+                    self._step1_vis_shell = build_step1_shell(self.cfg)
+                    self._step1_vis_shell.eval()
+                _attached = False
+                try:
+                    attach_avnet_to_step1_shell(model, self._step1_vis_shell)
+                    _attached = True
+                    protos = visual_prototypes_from_avnet(model)
+                    amp_ctx = (
+                        torch.amp.autocast("cuda", enabled=False)
+                        if device.type == "cuda"
+                        else nullcontext()
                     )
-                    clip_map = clip_map.permute(0, 2, 3, 1).reshape(1, pd, c)
-
-                    mp = torch.nn.functional.normalize(mapped.float(), dim=-1)
-                    cp = torch.nn.functional.normalize(clip_map.float(), dim=-1)
-                    cos = (mp * cp).sum(dim=-1)[0].view(hd, wd)
-                    heat = (1.0 - cos)
-                    heat = (heat - heat.min()) / (heat.max() - heat.min() + 1e-8)
-                    heat_np = heat.detach().cpu().numpy()
-
+                    with torch.no_grad():
+                        with amp_ctx:
+                            img_t = prepare_step1_image_tensor(
+                                img_rs, int(self.cfg["dino"]["image_size"]), device
+                            )
+                            heat_up, mapped_vis_mode = compute_step1_heat_up(
+                                model=self._step1_vis_shell,
+                                img_t=img_t,
+                                img_rs=img_rs,
+                                cfg=self.cfg,
+                                prototypes=protos,
+                                device=device,
+                            )
                     alpha = float(tr.get("eval_heatmap_alpha", 0.45))
-                    overlay = _heatmap_overlay(img_rs, heat_np, alpha=alpha)
-                    path = os.path.join(out_dir, f"{global_step:08d}_{j:02d}_{name}.png")
-                    overlay.save(path)
-                    return path
-
-                dino_hm_path = _save_patch_norm_overlay(dino_patches, "dino_norm_overlay")
-                mapped_hm_path = _save_mapped_clip_cosdiff_overlay(
-                    mapped_patches, clip_patches, "mapped_clip_cosdiff_overlay"
-                )
-                clip_hm_path = _save_patch_norm_overlay(clip_patches, "clip_norm_overlay")
+                    vis = heatmap_overlay(img_rs, heat_up, alpha=alpha)
+                    fname = (
+                        "mapped_proto_abn_overlay"
+                        if mapped_vis_mode == "prototype"
+                        else "mapped_clip_cosdiff_overlay"
+                    )
+                    mapped_hm_path = os.path.join(out_dir, f"{global_step:08d}_{j:02d}_{fname}.png")
+                    vis.save(mapped_hm_path)
+                    dino_hm_path = None
+                    clip_hm_path = None
+                finally:
+                    if _attached:
+                        restore_avnet_bridge_from_step1_shell(model, self._step1_vis_shell)
 
             outputs = model.generate(
                 **inputs,
@@ -292,7 +298,9 @@ class BridgeAndProcessorCheckpointCallback(TrainerCallback):
                 "answer": str(answer),
                 "dino_feature_vis": dino_hm_path,
                 "mapped_feature_vis": mapped_hm_path,
+                "mapped_vis_mode": mapped_vis_mode,
                 "clip_feature_vis": clip_hm_path,
+                "heatmap_backend": "utils.visualization" if mapped_vis_mode is not None else None,
             }
             results.append(rec)
 
@@ -405,6 +413,14 @@ class PrettyTrainLogCallback(TrainerCallback):
             parts.append(f"loss={float(loss_total):.4f}")
         if extra.get("loss_lm") is not None:
             parts.append(f"loss_lm={float(extra['loss_lm']):.4f}")
+        # bbox 辅助头：w=0 时不建 head、不算 loss_bbox；日志里仍打出状态避免误以为漏打
+        bbox_w = float(getattr(m, "bbox_aux_loss_weight", 0.0) or 0.0)
+        if extra.get("loss_bbox") is not None:
+            parts.append(f"loss_bbox={float(extra['loss_bbox']):.4f}")
+        elif bbox_w > 0.0 and getattr(m, "bbox_head", None) is not None:
+            parts.append("loss_bbox=n/a")
+        else:
+            parts.append("loss_bbox=off")
         # helpful bridge stats
         if extra.get("bridge_tokens") is not None:
             parts.append(f"bridge_tok={int(extra['bridge_tokens'])}")
@@ -506,6 +522,16 @@ def train_main(cfg: dict) -> None:
     _train_log("正在 setup_model_and_processor（全量 Qwen + DINO/CLIP 桥接；DINO/CLIP 骨干冻结，可能数分钟无输出）…")
     model, processor = setup_model_and_processor(cfg, for_inference=False)
     _train_log("模型与 processor 构建完成")
+    if isinstance(model, QwenDinoBridgeModel):
+        if model.visual_prototypes_ready():
+            g = float(getattr(model, "proto_modulation_gamma", 0.0) or 0.0)
+            _train_log(
+                "bridge：Step1 visual prototypes 已加载；eval 热力图走 "
+                "DinoClipVisualPrototypeModel.forward + compute_step1_heat_up（与 test_ad_llm_step1 相同，"
+                "仍为未调制的 mapped 打分）。"
+                f"AVNet._build_visual_tokens：若 bridge.proto_modulation_gamma>0，进 LLM 前会对 mapped 做 proto 幅度调制（当前 gamma={g}）。"
+                "对照排查可设 training.step1_visual_debug: true。"
+            )
     train_dataset = MVTecQwenGroundingDataset(
         manager=manager,
         processor=processor,
@@ -518,8 +544,17 @@ def train_main(cfg: dict) -> None:
         clip_cfg=cfg.get("clip", {}),
         local_files_only=cfg.get("model", {}).get("local_files_only", True),
         train_anomaly_only=bool(cfg["data"].get("train_anomaly_only", False)),
+        normalize_bbox_01=bool(cfg["data"].get("bbox_normalize_01", False)),
+        train_gt_bbox_only=bool(cfg["data"].get("train_gt_bbox_only", False)),
     )
     _train_log(f"训练集样本数 len(dataset)={len(train_dataset)}")
+    if bool(cfg["data"].get("train_gt_bbox_only", False)):
+        _train_log("data.train_gt_bbox_only=true：仅保留 metadata 含 bbox 的 grounding 样本")
+    bw = float(cfg.get("training", {}).get("bbox_aux_loss_weight", 0.0))
+    if bw > 0.0:
+        _train_log(f"training.bbox_aux_loss_weight={bw}：除 LM 外叠加视觉前缀 bbox 回归 Smooth L1（推理仍走 LLM 文本）")
+    else:
+        _train_log("training.bbox_aux_loss_weight=0：无 bbox 辅助头，终端每步会显示 loss_bbox=off；需要数值请设 >0")
 
     # Save a small snapshot of random training samples + resized images for sanity check (configurable)
     if is_world_process_zero:

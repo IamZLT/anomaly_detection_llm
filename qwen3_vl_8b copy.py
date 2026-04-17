@@ -42,7 +42,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 # 导入自定义的数据加载器
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from data.load_mvtec_data import MVTecDataManager
+from data.mvtec_json_loader import MVTecDataManager
 
 
 def smart_resize(image: Image.Image, max_size: int = 1024, factor: int = 28) -> Tuple[Image.Image, Tuple[int, int], Tuple[float, float]]:
