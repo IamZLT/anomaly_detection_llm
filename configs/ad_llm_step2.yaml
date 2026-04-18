@@ -92,6 +92,15 @@ bridge:
   compressor_num_heads: 8
   # 每路 MLP 后按各自空间网格加 2D sin-cos PE，再 concat（与旧 checkpoint 不兼容时可设 false）
   use_2d_pos_embed: true
+  # CoME-VL inspired：异构网格跨路对齐
+  enable_hetero_align: true
+  align_num_layers: 3
+  align_num_heads: 8
+  align_dropout: 0.0
+  use_rope_like_bias: true
+  mapped_gate_scale: 1.0
+  max_2d_pos_h: 64
+  max_2d_pos_w: 64
   # 与 Step1 softmax 一致的温度；调制与热力图共用同一套 proto 对比逻辑
   prototype_temperature: 0.07
   # >0 且已加载 prototypes：进 LLM 前按 patch 异常概率拉伸 mapped（异常 patch 幅度更大）；0 则不调制

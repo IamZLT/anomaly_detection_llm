@@ -2,6 +2,7 @@
 AVNet：Anomaly / defect Vision + Language 大模型（DINO/CLIP 视觉前缀 + 因果 LM）。
 """
 import json
+import math
 import os
 from typing import Any, Dict, Optional, Tuple
 
@@ -68,6 +69,215 @@ class CrossAttentionTokenCompressor(nn.Module):
         latents = latents + attn_out
         latents = latents + self.ffn(self.out_norm(latents))
         return latents
+
+
+def _resolve_hw(num_tokens: int, hw: Tuple[int, int]) -> Tuple[int, int]:
+    h, w = int(hw[0]), int(hw[1])
+    if h > 0 and w > 0 and h * w == int(num_tokens):
+        return h, w
+    rh, rw = infer_square_hw(int(num_tokens))
+    return int(rh), int(rw)
+
+
+def _normalized_grid(hw: Tuple[int, int], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    h, w = int(hw[0]), int(hw[1])
+    ys = torch.linspace(-1.0, 1.0, h, device=device, dtype=dtype)
+    xs = torch.linspace(-1.0, 1.0, w, device=device, dtype=dtype)
+    gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+    return torch.stack([gx, gy], dim=-1).reshape(h * w, 2)
+
+
+class Learned2DPosEmbedding(nn.Module):
+    def __init__(self, hidden_size: int, max_h: int = 64, max_w: int = 64, dropout: float = 0.0):
+        super().__init__()
+        self.max_h = int(max_h)
+        self.max_w = int(max_w)
+        self.row_embed = nn.Parameter(torch.randn(self.max_h, hidden_size) * 0.02)
+        self.col_embed = nn.Parameter(torch.randn(self.max_w, hidden_size) * 0.02)
+        self.dropout = nn.Dropout(dropout)
+
+    def _build_pos(self, hw: Tuple[int, int], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        h, w = int(hw[0]), int(hw[1])
+        if h <= self.max_h and w <= self.max_w:
+            pos = self.row_embed[:h].unsqueeze(1) + self.col_embed[:w].unsqueeze(0)
+            return pos.reshape(1, h * w, -1).to(device=device, dtype=dtype)
+        base = self.row_embed.unsqueeze(1) + self.col_embed.unsqueeze(0)  # [max_h, max_w, D]
+        base = base.permute(2, 0, 1).unsqueeze(0)  # [1, D, H, W]
+        resized = F.interpolate(base, size=(h, w), mode="bilinear", align_corners=False)
+        return resized.squeeze(0).permute(1, 2, 0).reshape(1, h * w, -1).to(device=device, dtype=dtype)
+
+    def forward(self, tokens: torch.Tensor, hw: Tuple[int, int]) -> torch.Tensor:
+        h, w = _resolve_hw(int(tokens.shape[1]), hw)
+        pos = self._build_pos((h, w), tokens.device, tokens.dtype)
+        return self.dropout(tokens + pos)
+
+
+class RoPELikeHeteroCrossAttention(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        use_rope_like_bias: bool = True,
+    ):
+        super().__init__()
+        if hidden_size % num_heads != 0:
+            raise ValueError(f"hidden_size={hidden_size} 必须能被 num_heads={num_heads} 整除")
+        self.hidden_size = int(hidden_size)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.hidden_size // self.num_heads
+        self.scale = self.head_dim ** -0.5
+        self.use_rope_like_bias = bool(use_rope_like_bias)
+        self.q_proj = nn.Linear(hidden_size, hidden_size)
+        self.k_proj = nn.Linear(hidden_size, hidden_size)
+        self.v_proj = nn.Linear(hidden_size, hidden_size)
+        self.out_proj = nn.Linear(hidden_size, hidden_size)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.proj_dropout = nn.Dropout(dropout)
+        half_dim = max(2, self.head_dim // 2)
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, half_dim, dtype=torch.float32) / float(half_dim)))
+        self.register_buffer("rope_inv_freq", inv_freq, persistent=False)
+        self.rope_bias_scale = nn.Parameter(torch.tensor(1.0))
+
+    def _rope_like_bias(
+        self,
+        query_hw: Tuple[int, int],
+        kv_hw: Tuple[int, int],
+        q_len: int,
+        kv_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        qh, qw = _resolve_hw(q_len, query_hw)
+        kh, kw = _resolve_hw(kv_len, kv_hw)
+        q_xy = _normalized_grid((qh, qw), device=device, dtype=dtype)  # [Q,2]
+        k_xy = _normalized_grid((kh, kw), device=device, dtype=dtype)  # [K,2]
+        inv = self.rope_inv_freq.to(device=device, dtype=dtype)
+        qx = q_xy[:, 0:1] * inv.view(1, -1) * math.pi
+        qy = q_xy[:, 1:2] * inv.view(1, -1) * math.pi
+        kx = k_xy[:, 0:1] * inv.view(1, -1) * math.pi
+        ky = k_xy[:, 1:2] * inv.view(1, -1) * math.pi
+        q_feat = torch.cat([torch.sin(qx), torch.cos(qx), torch.sin(qy), torch.cos(qy)], dim=-1)
+        k_feat = torch.cat([torch.sin(kx), torch.cos(kx), torch.sin(ky), torch.cos(ky)], dim=-1)
+        denom = float(q_feat.shape[-1]) ** 0.5
+        bias = torch.matmul(q_feat, k_feat.transpose(-1, -2)) / denom
+        return self.rope_bias_scale.to(device=device, dtype=dtype) * bias
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key_value: torch.Tensor,
+        query_hw: Tuple[int, int],
+        kv_hw: Tuple[int, int],
+    ) -> torch.Tensor:
+        bsz, q_len, _ = query.shape
+        kv_len = int(key_value.shape[1])
+        q = self.q_proj(query).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(key_value).view(bsz, kv_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(key_value).view(bsz, kv_len, self.num_heads, self.head_dim).transpose(1, 2)
+        attn_logits = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        if self.use_rope_like_bias:
+            bias = self._rope_like_bias(
+                query_hw=query_hw,
+                kv_hw=kv_hw,
+                q_len=q_len,
+                kv_len=kv_len,
+                device=query.device,
+                dtype=query.dtype,
+            )
+            attn_logits = attn_logits + bias.unsqueeze(0).unsqueeze(0)
+        attn = F.softmax(attn_logits, dim=-1)
+        attn = self.attn_dropout(attn)
+        out = torch.matmul(attn, v).transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
+        out = self.proj_dropout(self.out_proj(out))
+        return out
+
+
+class HeteroCrossAlignBlock(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        use_rope_like_bias: bool = True,
+        mapped_gate_scale: float = 1.0,
+    ):
+        super().__init__()
+        self.mapped_gate_scale = float(mapped_gate_scale)
+        self.dino_norm = nn.LayerNorm(hidden_size)
+        self.clip_norm = nn.LayerNorm(hidden_size)
+        self.mapped_norm = nn.LayerNorm(hidden_size)
+        self.dino_to_clip = RoPELikeHeteroCrossAttention(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            dropout=dropout,
+            use_rope_like_bias=use_rope_like_bias,
+        )
+        self.clip_to_dino = RoPELikeHeteroCrossAttention(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            dropout=dropout,
+            use_rope_like_bias=use_rope_like_bias,
+        )
+        self.gate_proj = nn.Linear(hidden_size, 1)
+        self.dino_ffn = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.GELU(),
+            nn.Linear(hidden_size * 4, hidden_size),
+        )
+        self.clip_ffn = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.GELU(),
+            nn.Linear(hidden_size * 4, hidden_size),
+        )
+        self.mapped_ffn = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size * 2),
+            nn.GELU(),
+            nn.Linear(hidden_size * 2, hidden_size),
+        )
+
+    @staticmethod
+    def _resize_gate(gate: torch.Tensor, src_hw: Tuple[int, int], dst_hw: Tuple[int, int]) -> torch.Tensor:
+        bsz, p, _ = gate.shape
+        sh, sw = _resolve_hw(p, src_hw)
+        dh, dw = _resolve_hw(dst_hw[0] * dst_hw[1], dst_hw)
+        g = gate.transpose(1, 2).reshape(bsz, 1, sh, sw)
+        g = F.interpolate(g, size=(dh, dw), mode="bilinear", align_corners=False)
+        return g.flatten(2).transpose(1, 2)
+
+    def forward(
+        self,
+        dino_tokens: torch.Tensor,
+        mapped_tokens: torch.Tensor,
+        clip_tokens: torch.Tensor,
+        dino_hw: Tuple[int, int],
+        clip_hw: Tuple[int, int],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mapped_gate = torch.sigmoid(self.gate_proj(self.mapped_norm(mapped_tokens)))
+        clip_gate = self._resize_gate(mapped_gate, dino_hw, clip_hw)
+
+        dino_delta = self.dino_to_clip(
+            query=self.dino_norm(dino_tokens),
+            key_value=self.clip_norm(clip_tokens),
+            query_hw=dino_hw,
+            kv_hw=clip_hw,
+        )
+        clip_delta = self.clip_to_dino(
+            query=self.clip_norm(clip_tokens),
+            key_value=self.dino_norm(dino_tokens),
+            query_hw=clip_hw,
+            kv_hw=dino_hw,
+        )
+        dino_tokens = dino_tokens + dino_delta * (1.0 + self.mapped_gate_scale * mapped_gate)
+        clip_tokens = clip_tokens + clip_delta * (1.0 + self.mapped_gate_scale * clip_gate)
+        mapped_tokens = mapped_tokens + self.mapped_ffn(mapped_tokens) + mapped_gate * dino_tokens
+        dino_tokens = dino_tokens + self.dino_ffn(dino_tokens)
+        clip_tokens = clip_tokens + self.clip_ffn(clip_tokens)
+        return dino_tokens, mapped_tokens, clip_tokens
+
 
 class QwenDinoBridgeModel(nn.Module):
     def __init__(self, base_model: nn.Module, cfg: dict):
@@ -169,7 +379,50 @@ class QwenDinoBridgeModel(nn.Module):
         self.clip_patch_to_llm = _make_projector(self.clip_hidden, llm_hidden, self.clip_use_mlp)
 
         # =========================
-        # 7. 拼接后共享融合 MLP + 软压缩器
+        # 7. 异构网格位置编码 + 多层跨路对齐（CoME-VL inspired）
+        # =========================
+        self.use_2d_pos_embed = bool(bridge_cfg.get("use_2d_pos_embed", True))
+        self.enable_hetero_align = bool(bridge_cfg.get("enable_hetero_align", True))
+        self.align_num_layers = int(bridge_cfg.get("align_num_layers", 3))
+        self.align_num_heads = int(bridge_cfg.get("align_num_heads", 8))
+        self.align_dropout = float(bridge_cfg.get("align_dropout", 0.0))
+        self.use_rope_like_bias = bool(bridge_cfg.get("use_rope_like_bias", True))
+        self.mapped_gate_scale = float(bridge_cfg.get("mapped_gate_scale", 1.0))
+        max_2d_pos_h = int(bridge_cfg.get("max_2d_pos_h", 64))
+        max_2d_pos_w = int(bridge_cfg.get("max_2d_pos_w", 64))
+        self.dino_pos_embed = Learned2DPosEmbedding(
+            hidden_size=llm_hidden,
+            max_h=max_2d_pos_h,
+            max_w=max_2d_pos_w,
+            dropout=self.align_dropout,
+        )
+        self.mapped_pos_embed = Learned2DPosEmbedding(
+            hidden_size=llm_hidden,
+            max_h=max_2d_pos_h,
+            max_w=max_2d_pos_w,
+            dropout=self.align_dropout,
+        )
+        self.clip_pos_embed = Learned2DPosEmbedding(
+            hidden_size=llm_hidden,
+            max_h=max_2d_pos_h,
+            max_w=max_2d_pos_w,
+            dropout=self.align_dropout,
+        )
+        self.hetero_align_blocks = nn.ModuleList(
+            [
+                HeteroCrossAlignBlock(
+                    hidden_size=llm_hidden,
+                    num_heads=self.align_num_heads,
+                    dropout=self.align_dropout,
+                    use_rope_like_bias=self.use_rope_like_bias,
+                    mapped_gate_scale=self.mapped_gate_scale,
+                )
+                for _ in range(self.align_num_layers)
+            ]
+        )
+
+        # =========================
+        # 8. 拼接后共享融合 MLP + 软压缩器
         # =========================
         self.post_concat_mlp = nn.Sequential(
             nn.LayerNorm(llm_hidden),
@@ -202,7 +455,7 @@ class QwenDinoBridgeModel(nn.Module):
         self.debug_step1_visual = bool(tr.get("step1_visual_debug", False))
 
         # =========================
-        # 8. 训练策略
+        # 9. 训练策略
         # =========================
         for p in self.base_model.parameters():
             p.requires_grad = True
@@ -371,7 +624,7 @@ class QwenDinoBridgeModel(nn.Module):
         device: torch.device,
     ):
         cls_stack, patch_stack, dino_patches, dino_hw = self._encode_dino(dino_pixel_values, device)
-        clip_patches, _ = self._encode_clip(clip_pixel_values, device)
+        clip_patches, clip_hw = self._encode_clip(clip_pixel_values, device)
 
         # Stage-1 mapper（冻结）
         _ = self.cls_mapper(cls_stack)  # 保留兼容；当前不直接作为 visual token 使用
@@ -421,6 +674,21 @@ class QwenDinoBridgeModel(nn.Module):
         mapped_patch_tokens = self.mapped_patch_to_llm(mapped_patches)
         clip_patch_tokens = self.clip_patch_to_llm(clip_patches)
 
+        if self.use_2d_pos_embed:
+            dino_patch_tokens = self.dino_pos_embed(dino_patch_tokens, dino_hw)
+            mapped_patch_tokens = self.mapped_pos_embed(mapped_patch_tokens, dino_hw)
+            clip_patch_tokens = self.clip_pos_embed(clip_patch_tokens, clip_hw)
+
+        if self.enable_hetero_align and len(self.hetero_align_blocks) > 0:
+            for blk in self.hetero_align_blocks:
+                dino_patch_tokens, mapped_patch_tokens, clip_patch_tokens = blk(
+                    dino_tokens=dino_patch_tokens,
+                    mapped_tokens=mapped_patch_tokens,
+                    clip_tokens=clip_patch_tokens,
+                    dino_hw=dino_hw,
+                    clip_hw=clip_hw,
+                )
+
         all_patch_tokens = torch.cat(
             [dino_patch_tokens, mapped_patch_tokens, clip_patch_tokens],
             dim=1,
@@ -443,6 +711,7 @@ class QwenDinoBridgeModel(nn.Module):
             "raw_visual_tokens": all_patch_tokens.shape[1],
             "dino_patch_dim": dino_patch_dim,
             "clip_patch_dim": clip_patch_dim,
+            "align_num_layers": self.align_num_layers if self.enable_hetero_align else 0,
         }
         return bridge_tokens, aux
 
