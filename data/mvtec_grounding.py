@@ -1,7 +1,7 @@
 """
 MVTec grounding 训练用 Dataset（DINO/CLIP 桥 + HF processor/tokenizer）。
 
-依赖 ``data.mvtec_json_loader.MVTecDataManager`` 提供的样本 dict。
+依赖 manager（实现 ``get_all_grounding_samples`` 等接口）提供样本 dict。
 其他数据集请仿照本模块新建 ``data/<your>_grounding.py``。
 """
 import os
@@ -12,8 +12,8 @@ from PIL import Image
 from torch.utils.data import Dataset
 from transformers import AutoImageProcessor, AutoProcessor
 
-from data.mvtec_json_loader import MVTecDataManager
-from utils.qwen_common import (
+# manager uses duck-typing: must provide get_all_grounding_samples/get_all_train_samples/get_all_test_samples
+from utils.common import (
     normalize_bbox_pixels_to_01,
     rewrite_bbox_tags_original_pixels_to_normalized_01,
     rewrite_bbox_tags_to_normalized_01,
@@ -99,7 +99,7 @@ def _labels_assistant_tokens_only(
 class MVTecQwenGroundingDataset(Dataset):
     def __init__(
         self,
-        manager: MVTecDataManager,
+        manager,
         processor: AutoProcessor,
         mode: str,
         max_length: int,
@@ -187,7 +187,8 @@ class MVTecQwenGroundingDataset(Dataset):
             full_mask_path = sample.get("full_mask_path")
 
         if not os.path.isabs(img_path):
-            img_path = os.path.join(self.manager.dataset_loader.dataset_root, img_path)
+            dataset_root = sample.get("dataset_root") or self.manager.dataset_loader.dataset_root
+            img_path = os.path.join(dataset_root, img_path)
 
         _scaled_bbox = None
         image_load_ok = False
@@ -352,7 +353,7 @@ class MVTecDinoClipAlignDataset(Dataset):
 
     def __init__(
         self,
-        manager: MVTecDataManager,
+        manager,
         mode: str,
         max_image_size: int,
         factor: int,
@@ -390,10 +391,11 @@ class MVTecDinoClipAlignDataset(Dataset):
         meta = sample.get("metadata", {}) or {}
         full_mask_path = meta.get("full_mask_path")
 
+        dataset_root = sample.get("dataset_root") or self.manager.dataset_loader.dataset_root
         if not os.path.isabs(img_path):
-            img_path = os.path.join(self.manager.dataset_loader.dataset_root, img_path)
+            img_path = os.path.join(dataset_root, img_path)
         if full_mask_path and (not os.path.isabs(full_mask_path)):
-            full_mask_path = os.path.join(self.manager.dataset_loader.dataset_root, full_mask_path)
+            full_mask_path = os.path.join(dataset_root, full_mask_path)
 
         try:
             image = Image.open(img_path).convert("RGB")

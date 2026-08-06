@@ -35,7 +35,7 @@ def step1_train_style_image_batch(
     device: torch.device,
 ) -> torch.Tensor:
     """
-    与 ``train_ad_llm_step1.MVTecVisualPrototypeDataset`` / ``test_ad_llm_step1`` 一致：
+    与 ``train_ad_llm_step1.VisualPrototypeImageDataset`` / ``test_ad_llm_step1`` 一致：
     对 ``smart_resize`` 后的 PIL 做 ``Resize(dino) → ToTensor → ImageNet``，得到 ``[1,3,H,W]``。
     DINO 与 CLIP 编码应共用该张量（再由各自 ``encode_*`` 内部按需插值），与单独测 Step1 对齐。
     """

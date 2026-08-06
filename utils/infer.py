@@ -8,7 +8,7 @@ from PIL import Image
 from transformers import AutoImageProcessor
 
 from models.avNet import setup_model_and_processor
-from utils.qwen_common import (
+from utils.common import (
     bbox_to_processed_pixels,
     draw_bbox_on_image,
     infer_model_compute_device,

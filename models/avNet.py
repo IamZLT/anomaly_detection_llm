@@ -200,26 +200,55 @@ class HeteroCrossAlignBlock(nn.Module):
         num_heads: int,
         dropout: float = 0.0,
         use_rope_like_bias: bool = True,
-        mapped_gate_scale: float = 1.0,
+        residual_scale_init: float = 0.1,
     ):
         super().__init__()
-        self.mapped_gate_scale = float(mapped_gate_scale)
+        self.residual_scale_init = float(residual_scale_init)
         self.dino_norm = nn.LayerNorm(hidden_size)
         self.clip_norm = nn.LayerNorm(hidden_size)
         self.mapped_norm = nn.LayerNorm(hidden_size)
-        self.dino_to_clip = RoPELikeHeteroCrossAttention(
+        self.dino_from_clip = RoPELikeHeteroCrossAttention(
             hidden_size=hidden_size,
             num_heads=num_heads,
             dropout=dropout,
             use_rope_like_bias=use_rope_like_bias,
         )
-        self.clip_to_dino = RoPELikeHeteroCrossAttention(
+        self.dino_from_mapped = RoPELikeHeteroCrossAttention(
             hidden_size=hidden_size,
             num_heads=num_heads,
             dropout=dropout,
             use_rope_like_bias=use_rope_like_bias,
         )
-        self.gate_proj = nn.Linear(hidden_size, 1)
+        self.clip_from_dino = RoPELikeHeteroCrossAttention(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            dropout=dropout,
+            use_rope_like_bias=use_rope_like_bias,
+        )
+        self.clip_from_mapped = RoPELikeHeteroCrossAttention(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            dropout=dropout,
+            use_rope_like_bias=use_rope_like_bias,
+        )
+        self.mapped_from_dino = RoPELikeHeteroCrossAttention(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            dropout=dropout,
+            use_rope_like_bias=use_rope_like_bias,
+        )
+        self.mapped_from_clip = RoPELikeHeteroCrossAttention(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            dropout=dropout,
+            use_rope_like_bias=use_rope_like_bias,
+        )
+        self.scale_dino_from_clip = nn.Parameter(torch.tensor(self.residual_scale_init, dtype=torch.float32))
+        self.scale_dino_from_mapped = nn.Parameter(torch.tensor(self.residual_scale_init, dtype=torch.float32))
+        self.scale_clip_from_dino = nn.Parameter(torch.tensor(self.residual_scale_init, dtype=torch.float32))
+        self.scale_clip_from_mapped = nn.Parameter(torch.tensor(self.residual_scale_init, dtype=torch.float32))
+        self.scale_mapped_from_dino = nn.Parameter(torch.tensor(self.residual_scale_init, dtype=torch.float32))
+        self.scale_mapped_from_clip = nn.Parameter(torch.tensor(self.residual_scale_init, dtype=torch.float32))
         self.dino_ffn = nn.Sequential(
             nn.LayerNorm(hidden_size),
             nn.Linear(hidden_size, hidden_size * 4),
@@ -239,15 +268,6 @@ class HeteroCrossAlignBlock(nn.Module):
             nn.Linear(hidden_size * 2, hidden_size),
         )
 
-    @staticmethod
-    def _resize_gate(gate: torch.Tensor, src_hw: Tuple[int, int], dst_hw: Tuple[int, int]) -> torch.Tensor:
-        bsz, p, _ = gate.shape
-        sh, sw = _resolve_hw(p, src_hw)
-        dh, dw = _resolve_hw(dst_hw[0] * dst_hw[1], dst_hw)
-        g = gate.transpose(1, 2).reshape(bsz, 1, sh, sw)
-        g = F.interpolate(g, size=(dh, dw), mode="bilinear", align_corners=False)
-        return g.flatten(2).transpose(1, 2)
-
     def forward(
         self,
         dino_tokens: torch.Tensor,
@@ -256,26 +276,57 @@ class HeteroCrossAlignBlock(nn.Module):
         dino_hw: Tuple[int, int],
         clip_hw: Tuple[int, int],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        mapped_gate = torch.sigmoid(self.gate_proj(self.mapped_norm(mapped_tokens)))
-        clip_gate = self._resize_gate(mapped_gate, dino_hw, clip_hw)
+        dino_norm = self.dino_norm(dino_tokens)
+        mapped_norm = self.mapped_norm(mapped_tokens)
+        clip_norm = self.clip_norm(clip_tokens)
 
-        dino_delta = self.dino_to_clip(
-            query=self.dino_norm(dino_tokens),
-            key_value=self.clip_norm(clip_tokens),
+        dino_delta_clip = self.dino_from_clip(
+            query=dino_norm,
+            key_value=clip_norm,
             query_hw=dino_hw,
             kv_hw=clip_hw,
         )
-        clip_delta = self.clip_to_dino(
-            query=self.clip_norm(clip_tokens),
-            key_value=self.dino_norm(dino_tokens),
+        dino_delta_mapped = self.dino_from_mapped(
+            query=dino_norm,
+            key_value=mapped_norm,
+            query_hw=dino_hw,
+            kv_hw=dino_hw,
+        )
+        clip_delta_dino = self.clip_from_dino(
+            query=clip_norm,
+            key_value=dino_norm,
             query_hw=clip_hw,
             kv_hw=dino_hw,
         )
-        dino_tokens = dino_tokens + dino_delta * (1.0 + self.mapped_gate_scale * mapped_gate)
-        clip_tokens = clip_tokens + clip_delta * (1.0 + self.mapped_gate_scale * clip_gate)
-        mapped_tokens = mapped_tokens + self.mapped_ffn(mapped_tokens) + mapped_gate * dino_tokens
+        clip_delta_mapped = self.clip_from_mapped(
+            query=clip_norm,
+            key_value=mapped_norm,
+            query_hw=clip_hw,
+            kv_hw=dino_hw,
+        )
+        mapped_delta_dino = self.mapped_from_dino(
+            query=mapped_norm,
+            key_value=dino_norm,
+            query_hw=dino_hw,
+            kv_hw=dino_hw,
+        )
+        mapped_delta_clip = self.mapped_from_clip(
+            query=mapped_norm,
+            key_value=clip_norm,
+            query_hw=dino_hw,
+            kv_hw=clip_hw,
+        )
+
+        dino_tokens = dino_tokens + self.scale_dino_from_clip.to(dtype=dino_tokens.dtype) * dino_delta_clip
+        dino_tokens = dino_tokens + self.scale_dino_from_mapped.to(dtype=dino_tokens.dtype) * dino_delta_mapped
+        clip_tokens = clip_tokens + self.scale_clip_from_dino.to(dtype=clip_tokens.dtype) * clip_delta_dino
+        clip_tokens = clip_tokens + self.scale_clip_from_mapped.to(dtype=clip_tokens.dtype) * clip_delta_mapped
+        mapped_tokens = mapped_tokens + self.scale_mapped_from_dino.to(dtype=mapped_tokens.dtype) * mapped_delta_dino
+        mapped_tokens = mapped_tokens + self.scale_mapped_from_clip.to(dtype=mapped_tokens.dtype) * mapped_delta_clip
+
         dino_tokens = dino_tokens + self.dino_ffn(dino_tokens)
         clip_tokens = clip_tokens + self.clip_ffn(clip_tokens)
+        mapped_tokens = mapped_tokens + self.mapped_ffn(mapped_tokens)
         return dino_tokens, mapped_tokens, clip_tokens
 
 
@@ -387,7 +438,7 @@ class QwenDinoBridgeModel(nn.Module):
         self.align_num_heads = int(bridge_cfg.get("align_num_heads", 8))
         self.align_dropout = float(bridge_cfg.get("align_dropout", 0.0))
         self.use_rope_like_bias = bool(bridge_cfg.get("use_rope_like_bias", True))
-        self.mapped_gate_scale = float(bridge_cfg.get("mapped_gate_scale", 1.0))
+        self.align_residual_scale = float(bridge_cfg.get("align_residual_scale", 0.1))
         max_2d_pos_h = int(bridge_cfg.get("max_2d_pos_h", 64))
         max_2d_pos_w = int(bridge_cfg.get("max_2d_pos_w", 64))
         self.dino_pos_embed = Learned2DPosEmbedding(
@@ -415,7 +466,7 @@ class QwenDinoBridgeModel(nn.Module):
                     num_heads=self.align_num_heads,
                     dropout=self.align_dropout,
                     use_rope_like_bias=self.use_rope_like_bias,
-                    mapped_gate_scale=self.mapped_gate_scale,
+                    residual_scale_init=self.align_residual_scale,
                 )
                 for _ in range(self.align_num_layers)
             ]

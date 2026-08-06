@@ -30,8 +30,8 @@ from PIL import Image
 
 from models.visual_proto import DinoClipVisualPrototypeModel, VisualPrototypes
 from utils.visualization import bbox_from_map, compute_step1_heat_up, heatmap_overlay, prepare_step1_image_tensor
-from utils.qwen_common import smart_resize
-from utils.qwen_config import load_yaml_config
+from utils.common import smart_resize
+from utils.config import load_yaml_config
 
 
 def _load_state(path: str) -> Dict[str, torch.Tensor]:

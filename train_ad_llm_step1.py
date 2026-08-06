@@ -1,13 +1,11 @@
 import os
-import glob
-import math
 import time
 import random
 import argparse
-from typing import Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 import torch
 import torch.nn as nn
@@ -26,13 +24,53 @@ from models.visual_proto import (
     normalize_feature,
     update_visual_prototypes,
 )
-from utils.qwen_common import prepare_output_dir
-from utils.qwen_config import apply_runtime_overrides, load_yaml_config
+from data.visual_proto_data import build_samples_from_specs
+from utils.metrics import pixel_level_metrics
+from utils.common import prepare_output_dir, smart_resize
+from utils.config import apply_runtime_overrides, load_yaml_config
 
 
 # =========================
 # Utils
 # =========================
+def _gt_mask_overlay_on_rgb(img_rgb: Image.Image, mask_l: Image.Image, blend: float = 0.45) -> Image.Image:
+    """在 RGB 图上用半透明红色标出 GT mask（便于看缺陷位置）。"""
+    w, h = img_rgb.size
+    m = np.array(mask_l.convert("L").resize((w, h), Image.NEAREST)) > 127
+    arr = np.array(img_rgb.convert("RGB")).astype(np.float32)
+    red = np.array([255.0, 0.0, 0.0], dtype=np.float32)
+    b = float(blend)
+    for c in range(3):
+        arr[..., c] = np.where(m, (1.0 - b) * arr[..., c] + b * red[c], arr[..., c])
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+
+def _eval_vis_caption_bar(total_w: int, caption: str, bar_h: int = 32) -> Image.Image:
+    bar = Image.new("RGB", (max(total_w, 1), bar_h), (245, 245, 245))
+    dr = ImageDraw.Draw(bar)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 15)
+    except OSError:
+        try:
+            font = ImageFont.truetype("DejaVuSans.ttf", 15)
+        except OSError:
+            font = ImageFont.load_default()
+    dr.text((6, 6), caption, fill=(20, 20, 20), font=font)
+    return bar
+
+
+def _hstack_panels(panels: List[Image.Image]) -> Image.Image:
+    if not panels:
+        raise ValueError("panels empty")
+    w0, h0 = panels[0].size
+    out = Image.new("RGB", (w0 * len(panels), h0))
+    for i, p in enumerate(panels):
+        if p.size != (w0, h0):
+            p = p.resize((w0, h0), Image.Resampling.BILINEAR)
+        out.paste(p, (i * w0, 0))
+    return out
+
+
 def setup_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -42,21 +80,12 @@ def setup_seed(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
-def build_mask_paths(mask_dir: str, img_path: str) -> List[str]:
-    img_name = os.path.basename(img_path)
-    stem, ext = os.path.splitext(img_name)
-    return [
-        os.path.join(mask_dir, f"{stem}_mask{ext}"),
-        os.path.join(mask_dir, img_name),
-        os.path.join(mask_dir, f"{stem}_mask.png"),
-        os.path.join(mask_dir, f"{stem}.png"),
-    ]
-
-
 # =========================
 # Dataset
 # =========================
-class MVTecVisualPrototypeDataset(Dataset):
+class VisualPrototypeImageDataset(Dataset):
+    """JSON 样本列表上的图像级 Dataset（任意 benchmark，不限 MVTec）。"""
+
     def __init__(
         self,
         samples: List[Dict],
@@ -90,73 +119,10 @@ class MVTecVisualPrototypeDataset(Dataset):
             "mask": torch.from_numpy(mask_np).unsqueeze(0),
             "anomaly": torch.tensor(item["anomaly"], dtype=torch.long),
             "img_path": item["img_path"],
+            "dataset_name": item.get("dataset_name", "unknown"),
             "cls_name": item["cls_name"],
             "defect_type": item["defect_type"],
         }
-
-
-def build_mvtec_splits(data_path: str, seed: int = 42, val_ratio: float = 0.2) -> Tuple[List[Dict], List[Dict]]:
-    mvtec_classes = [
-        "bottle", "cable", "capsule", "carpet", "grid",
-        "hazelnut", "leather", "metal_nut", "pill", "screw",
-        "tile", "toothbrush", "transistor", "wood", "zipper",
-    ]
-
-    train_samples: List[Dict] = []
-    val_samples: List[Dict] = []
-    rng = random.Random(seed)
-
-    for cls_name in mvtec_classes:
-        cls_train: List[Dict] = []
-        cls_val: List[Dict] = []
-
-        # normal: train/good
-        normal_dir = os.path.join(data_path, cls_name, "train", "good")
-        if os.path.exists(normal_dir):
-            normal_files = sorted(glob.glob(os.path.join(normal_dir, "*.png")))
-            rng.shuffle(normal_files)
-            split_idx = max(1, int(len(normal_files) * (1 - val_ratio))) if len(normal_files) > 1 else len(normal_files)
-            for i, img_path in enumerate(normal_files):
-                sample = {
-                    "img_path": img_path,
-                    "mask_path": None,
-                    "anomaly": 0,
-                    "cls_name": cls_name,
-                    "defect_type": "good",
-                }
-                (cls_train if i < split_idx else cls_val).append(sample)
-
-        # abnormal: test/<defect>
-        test_root = os.path.join(data_path, cls_name, "test")
-        if os.path.exists(test_root):
-            for defect_type in sorted(os.listdir(test_root)):
-                defect_dir = os.path.join(test_root, defect_type)
-                if defect_type == "good" or not os.path.isdir(defect_dir):
-                    continue
-                defect_files = sorted(glob.glob(os.path.join(defect_dir, "*.png")))
-                rng.shuffle(defect_files)
-                split_idx = max(1, int(len(defect_files) * (1 - val_ratio))) if len(defect_files) > 1 else len(defect_files)
-                mask_dir = os.path.join(data_path, cls_name, "ground_truth", defect_type)
-                alt_mask_dir = os.path.join(data_path, cls_name, "groundtruth", defect_type)
-                for i, img_path in enumerate(defect_files):
-                    mask_path = None
-                    for cand in build_mask_paths(mask_dir, img_path) + build_mask_paths(alt_mask_dir, img_path):
-                        if os.path.exists(cand):
-                            mask_path = cand
-                            break
-                    sample = {
-                        "img_path": img_path,
-                        "mask_path": mask_path,
-                        "anomaly": 1,
-                        "cls_name": cls_name,
-                        "defect_type": defect_type,
-                    }
-                    (cls_train if i < split_idx else cls_val).append(sample)
-
-        train_samples.extend(cls_train)
-        val_samples.extend(cls_val)
-
-    return train_samples, val_samples
 
 
 # =========================
@@ -265,26 +231,160 @@ def compute_consistency_loss(img_logits: torch.Tensor, patch_prob_abnormal: torc
 # Validation
 # =========================
 @torch.no_grad()
+def _save_step1_eval_vis_for_leaf(
+    model: DinoClipVisualPrototypeModel,
+    device: torch.device,
+    prototypes: VisualPrototypes,
+    val_samples: List[Dict],
+    args: argparse.Namespace,
+    epoch_idx: int,
+    ds_name: str,
+    cls_name: str,
+) -> None:
+    """每类验证指标完成后保存若干张热力图（与 epoch 目录结构一致）。"""
+    from utils.visualization import (
+        compute_step1_heat_up,
+        heatmap_overlay,
+        prepare_step1_image_tensor,
+    )
+
+    k = int(getattr(args, "eval_vis_num_samples", 0) or 0)
+    if k <= 0 or not prototypes.ready():
+        return
+    pool = [
+        s
+        for s in val_samples
+        if str(s.get("dataset_name", "")) == str(ds_name)
+        and str(s.get("cls_name", "")) == str(cls_name)
+        and s.get("img_path")
+        and os.path.isfile(str(s.get("img_path")))
+    ]
+    if not pool:
+        tqdm.write(f"[eval_vis] skip {ds_name}/{cls_name}: no local img_path in val set")
+        return
+    rng = random.Random(
+        (int(args.seed) + int(epoch_idx)) * 1_000_003 + abs(hash((ds_name, cls_name))) % 1_000_000_007
+    )
+    picks = rng.sample(pool, k=min(k, len(pool)))
+    vis_root = os.path.join(args.output_dir, f"epoch_{epoch_idx + 1:03d}", "eval_vis")
+    ds_safe = str(ds_name).replace("/", "_")
+    cls_safe = str(cls_name).replace("/", "_")
+    vis_dir = os.path.join(vis_root, ds_safe, cls_safe)
+    os.makedirs(vis_dir, exist_ok=True)
+    alpha = float(getattr(args, "eval_heatmap_alpha", 0.45))
+    cfg_vis = {
+        "dino": {"image_size": int(args.image_size)},
+        "step1": {"temperature": float(args.temperature)},
+        "training": {"step1_visual_debug": bool(getattr(args, "step1_visual_debug", False))},
+        "test": {"step1_visual_debug": bool(getattr(args, "step1_visual_debug", False))},
+    }
+    n_ok = 0
+    for j, s in enumerate(picks):
+        img_path = str(s["img_path"])
+        try:
+            img = Image.open(img_path).convert("RGB")
+            img_rs, _, _ = smart_resize(
+                img.copy(),
+                max_size=int(getattr(args, "max_image_size", 512)),
+                factor=int(getattr(args, "resize_factor", 28)),
+            )
+            img_t = prepare_step1_image_tensor(img_rs, int(args.image_size), device)
+            heat_up, mode = compute_step1_heat_up(
+                model=model,
+                img_t=img_t,
+                img_rs=img_rs,
+                cfg=cfg_vis,
+                prototypes=prototypes,
+                device=device,
+            )
+            anomaly = int(s.get("anomaly", 0) or 0)
+            defect = str(s.get("defect_type") or "unknown")
+            tag = "ABNORMAL" if anomaly else "NORMAL"
+            cap = (
+                f"{tag} (y={anomaly}) | defect={defect} | heat={mode} | "
+                f"左:原图 中:GT(红) 右:预测 | {os.path.basename(img_path)}"
+            )
+            mp = s.get("mask_path")
+            if mp and os.path.isfile(str(mp)):
+                mask_l = Image.open(str(mp)).convert("L")
+            else:
+                mask_l = Image.new("L", img_rs.size, 0)
+            gt_vis = _gt_mask_overlay_on_rgb(img_rs, mask_l, blend=min(0.55, alpha + 0.1))
+            pred_vis = heatmap_overlay(img_rs, heat_up, alpha=alpha)
+            row = _hstack_panels([img_rs.convert("RGB"), gt_vis, pred_vis])
+            cap_bar = _eval_vis_caption_bar(row.width, cap)
+            vis = Image.new("RGB", (row.width, cap_bar.height + row.height))
+            vis.paste(cap_bar, (0, 0))
+            vis.paste(row, (0, cap_bar.height))
+            stem = "abn" if anomaly else "ok"
+            out_path = os.path.join(vis_dir, f"{j:02d}_{stem}_{mode}.png")
+            vis.save(out_path)
+            n_ok += 1
+        except Exception as e:
+            tqdm.write(f"[eval_vis][{ds_name}/{cls_name}] skip {img_path}: {e}")
+    tqdm.write(f"[eval_vis] {ds_name}/{cls_name}: saved {n_ok}/{len(picks)} -> {vis_dir}")
+
+
+@torch.no_grad()
 def validate(
     model: DinoClipVisualPrototypeModel,
     dataloader: DataLoader,
     prototypes: VisualPrototypes,
     device: torch.device,
     temperature: float,
+    on_leaf_eval_visuals: Optional[Callable[[str, str, Dict[str, float]], None]] = None,
 ) -> Dict[str, float]:
     model.eval()
 
     if not prototypes.ready():
         return {
             "image_auroc": 0.0,
+            "image_ap": 0.0,
+            "pixel_aupro": 0.0,
             "pixel_auroc": 0.0,
-            "pixel_ap": 0.0,
+            "per_dataset": {},
+            "per_dataset_class": {},
         }
 
-    image_scores = []
-    image_labels = []
-    pixel_scores = []
-    pixel_labels = []
+    # Single accumulation: (dataset, class). Pooled metrics per leaf, then dataset / overall
+    # as arithmetic mean over leaves — same convention as main_mvtec.py (per-object metrics,
+    # then `mean` row over objects).
+    per_dataset_class: Dict[str, Dict[str, Dict[str, list]]] = {}
+
+    def _mean_leaf_metrics(rows: List[Dict[str, float]]) -> Dict[str, float]:
+        keys = ("image_auroc", "image_ap", "pixel_aupro", "pixel_auroc")
+        if not rows:
+            return {k: 0.0 for k in keys}
+        return {k: float(np.mean([r[k] for r in rows])) for k in keys}
+
+    def _compute_metrics(
+        image_scores_list: list,
+        image_labels_list: list,
+        pixel_scores_list: list,
+        pixel_labels_list: list,
+    ) -> Dict[str, float]:
+        m = {"image_auroc": 0.0, "image_ap": 0.0, "pixel_aupro": 0.0, "pixel_auroc": 0.0}
+        if len(image_scores_list) == 0:
+            return m
+        image_scores_np_local = np.asarray(image_scores_list)
+        image_labels_np_local = np.asarray(image_labels_list)
+        if len(np.unique(image_labels_np_local)) > 1:
+            m["image_auroc"] = float(roc_auc_score(image_labels_np_local, image_scores_np_local))
+            m["image_ap"] = float(average_precision_score(image_labels_np_local, image_scores_np_local))
+        pixel_scores_np_local = np.concatenate(pixel_scores_list, axis=0).reshape(-1)
+        pixel_labels_np_local = np.concatenate(pixel_labels_list, axis=0).reshape(-1)
+        if len(np.unique(pixel_labels_np_local)) > 1:
+            results_local = {
+                "step1_eval": {
+                    "gt_sp": image_labels_np_local,
+                    "pr_sp": image_scores_np_local,
+                    "imgs_masks": np.concatenate(pixel_labels_list, axis=0),
+                    "anomaly_maps": np.concatenate(pixel_scores_list, axis=0),
+                }
+            }
+            m["pixel_auroc"] = float(pixel_level_metrics(results_local, "step1_eval", "pixel-auroc"))
+            m["pixel_aupro"] = float(pixel_level_metrics(results_local, "step1_eval", "pixel-aupro"))
+        return m
 
     for batch in tqdm(dataloader, desc="Validating", leave=False):
         image = batch["img"].to(device)
@@ -309,23 +409,59 @@ def validate(
 
         patch_map_up = F.interpolate(patch_map, size=mask.shape[-2:], mode="bilinear", align_corners=False)
 
-        image_scores.extend(img_score.detach().cpu().numpy().tolist())
-        image_labels.extend(anomaly.detach().cpu().numpy().tolist())
-        pixel_scores.append(patch_map_up.detach().cpu().numpy())
-        pixel_labels.append(mask.detach().cpu().numpy())
+        patch_map_np = patch_map_up.detach().cpu().numpy()
+        mask_np = mask.detach().cpu().numpy()
 
-    metrics = {"image_auroc": 0.0, "pixel_auroc": 0.0, "pixel_ap": 0.0}
+        ds_names = batch.get("dataset_name", ["unknown"] * len(img_score))
+        cls_names = batch.get("cls_name", ["unknown"] * len(img_score))
+        img_score_np = img_score.detach().cpu().numpy()
+        anomaly_np = anomaly.detach().cpu().numpy()
+        for bi, ds in enumerate(ds_names):
+            ds_key = str(ds)
+            cls_key = str(cls_names[bi]) if bi < len(cls_names) else "unknown"
+            ds_rec = per_dataset_class.setdefault(ds_key, {})
+            cls_rec = ds_rec.setdefault(
+                cls_key,
+                {"image_scores": [], "image_labels": [], "pixel_scores": [], "pixel_labels": []},
+            )
+            cls_rec["image_scores"].append(float(img_score_np[bi]))
+            cls_rec["image_labels"].append(int(anomaly_np[bi]))
+            cls_rec["pixel_scores"].append(patch_map_np[bi : bi + 1])
+            cls_rec["pixel_labels"].append(mask_np[bi : bi + 1])
 
-    image_scores_np = np.asarray(image_scores)
-    image_labels_np = np.asarray(image_labels)
-    if len(np.unique(image_labels_np)) > 1:
-        metrics["image_auroc"] = float(roc_auc_score(image_labels_np, image_scores_np))
-
-    pixel_scores_np = np.concatenate(pixel_scores, axis=0).reshape(-1)
-    pixel_labels_np = np.concatenate(pixel_labels, axis=0).reshape(-1)
-    if len(np.unique(pixel_labels_np)) > 1:
-        metrics["pixel_auroc"] = float(roc_auc_score(pixel_labels_np, pixel_scores_np))
-        metrics["pixel_ap"] = float(average_precision_score(pixel_labels_np, pixel_scores_np))
+    leaf_items: List[Tuple[str, str, Dict[str, list]]] = [
+        (ds, cls, v)
+        for ds, cls_dict in sorted(per_dataset_class.items())
+        for cls, v in sorted(cls_dict.items(), key=lambda x: x[0])
+    ]
+    metrics_pdc: Dict[str, Dict[str, Dict[str, float]]] = {}
+    if leaf_items:
+        print(f"[validate] pixel/image metrics: {len(leaf_items)} (dataset, class) group(s)", flush=True)
+    pbar_m = tqdm(
+        leaf_items,
+        desc="Val metrics (per class)",
+        leave=True,
+        dynamic_ncols=True,
+        unit="cls",
+    )
+    for ds, cls, v in pbar_m:
+        pbar_m.set_postfix_str(f"{ds}/{cls}", refresh=False)
+        mrow = _compute_metrics(v["image_scores"], v["image_labels"], v["pixel_scores"], v["pixel_labels"])
+        metrics_pdc.setdefault(ds, {})[cls] = mrow
+        n_img = len(v["image_scores"])
+        tqdm.write(
+            f"[validate] {ds} / {cls} (n={n_img}) | "
+            f"image_auroc={mrow['image_auroc']:.4f} image_ap={mrow['image_ap']:.4f} | "
+            f"pixel_auroc={mrow['pixel_auroc']:.4f} pixel_aupro={mrow['pixel_aupro']:.4f}",
+        )
+        if on_leaf_eval_visuals is not None:
+            on_leaf_eval_visuals(ds, cls, mrow)
+    leaf_rows = [m for cls_dict in metrics_pdc.values() for m in cls_dict.values()]
+    metrics = _mean_leaf_metrics(leaf_rows)
+    metrics["per_dataset_class"] = metrics_pdc
+    metrics["per_dataset"] = {
+        ds: _mean_leaf_metrics(list(cls_dict.values())) for ds, cls_dict in metrics_pdc.items()
+    }
 
     model.train()
     return metrics
@@ -343,7 +479,8 @@ def train(args: argparse.Namespace) -> None:
     print("DINO -> CLIP Visual Prototype Training (Image-only)")
     print("=" * 80)
     print(f"device: {device}")
-    print(f"data_path: {args.data_path}")
+    dataset_root = getattr(args, "dataset_root", None)
+    print(f"dataset_root: {dataset_root}")
     print(f"output_dir: {args.output_dir}")
     print(f"epochs: {args.epochs}")
     print(f"batch_size: {args.batch_size}")
@@ -351,12 +488,15 @@ def train(args: argparse.Namespace) -> None:
     print(f"temperature: {args.temperature}")
     print("=" * 80)
 
-    train_samples, val_samples = build_mvtec_splits(args.data_path, seed=args.seed, val_ratio=args.val_ratio)
+    train_specs = list(getattr(args, "train_datasets", []) or [])
+    test_specs = list(getattr(args, "test_datasets", []) or [])
+    train_samples = build_samples_from_specs(str(dataset_root), train_specs)
+    val_samples = build_samples_from_specs(str(dataset_root), test_specs)
     print(f"train samples: {len(train_samples)}")
-    print(f"val samples:   {len(val_samples)}")
+    print(f"test samples:  {len(val_samples)}")
 
-    train_dataset = MVTecVisualPrototypeDataset(train_samples, image_size=args.image_size)
-    val_dataset = MVTecVisualPrototypeDataset(val_samples, image_size=args.image_size)
+    train_dataset = VisualPrototypeImageDataset(train_samples, image_size=args.image_size)
+    val_dataset = VisualPrototypeImageDataset(val_samples, image_size=args.image_size)
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -401,6 +541,20 @@ def train(args: argparse.Namespace) -> None:
     best_pixel_auroc = 0.0
 
     for epoch in range(args.epochs):
+        ep = epoch
+
+        def _on_leaf_eval_vis(ds: str, cls: str, _mrow: Dict[str, float], _ep: int = ep) -> None:
+            _save_step1_eval_vis_for_leaf(
+                model=model,
+                device=device,
+                prototypes=prototypes,
+                val_samples=val_samples,
+                args=args,
+                epoch_idx=_ep,
+                ds_name=ds,
+                cls_name=cls,
+            )
+
         t0 = time.time()
         meter_total = []
         meter_global = []
@@ -506,12 +660,18 @@ def train(args: argparse.Namespace) -> None:
                 t2i=f"{float(loss_global_parts['loss_t2i']):.3f}",
             )
 
+        _vis_cb = (
+            _on_leaf_eval_vis
+            if int(getattr(args, "eval_vis_num_samples", 0) or 0) > 0
+            else None
+        )
         metrics = validate(
             model=model,
             dataloader=val_loader,
             prototypes=prototypes,
             device=device,
             temperature=args.temperature,
+            on_leaf_eval_visuals=_vis_cb,
         )
 
         epoch_time = time.time() - t0
@@ -528,9 +688,41 @@ def train(args: argparse.Namespace) -> None:
         )
         print(
             f"Val | image_auroc={metrics['image_auroc']:.4f} | "
-            f"pixel_auroc={metrics['pixel_auroc']:.4f} | "
-            f"pixel_ap={metrics['pixel_ap']:.4f}"
+            f"image_ap={metrics['image_ap']:.4f} | "
+            f"pixel_aupro={metrics['pixel_aupro']:.4f} | "
+            f"pixel_auroc={metrics['pixel_auroc']:.4f}"
         )
+        per_ds = metrics.get("per_dataset", {}) or {}
+        if per_ds:
+            print("Val per-dataset:")
+            print(f"{'dataset':>24} | {'image_auroc':>11} | {'image_ap':>9} | {'pixel_aupro':>12} | {'pixel_auroc':>12}")
+            for ds_name in sorted(per_ds.keys()):
+                mds = per_ds[ds_name]
+                print(
+                    f"{ds_name:>24} | "
+                    f"{mds['image_auroc']:11.4f} | "
+                    f"{mds['image_ap']:9.4f} | "
+                    f"{mds['pixel_aupro']:12.4f} | "
+                    f"{mds['pixel_auroc']:12.4f}"
+                )
+        per_ds_cls = metrics.get("per_dataset_class", {}) or {}
+        if per_ds_cls:
+            print("Val per-dataset per-class:")
+            print(
+                f"{'dataset':>20} | {'class':>16} | {'image_auroc':>11} | {'image_ap':>9} | {'pixel_aupro':>12} | {'pixel_auroc':>12}"
+            )
+            for ds_name in sorted(per_ds_cls.keys()):
+                cls_dict = per_ds_cls[ds_name]
+                for cls_name in sorted(cls_dict.keys()):
+                    mdc = cls_dict[cls_name]
+                    print(
+                        f"{ds_name:>20} | "
+                        f"{cls_name:>16} | "
+                        f"{mdc['image_auroc']:11.4f} | "
+                        f"{mdc['image_ap']:9.4f} | "
+                        f"{mdc['pixel_aupro']:12.4f} | "
+                        f"{mdc['pixel_auroc']:12.4f}"
+                    )
         print("-" * 80)
 
         checkpoint = {
@@ -586,7 +778,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-gpu", type=int, default=None, help="覆盖 distributed.num_gpu（仅当 --config 提供时）")
 
     # paths
-    parser.add_argument("--data_path", type=str, default=None, help="MVTec root path（无 --config 时必填）")
+    parser.add_argument("--dataset_root", type=str, default=None, help="dataset root path")
     parser.add_argument("--dino_model_path", type=str, default=None, help="DINO 模型路径（无 --config 时必填）")
     parser.add_argument("--clip_model_path", type=str, default=None, help="CLIP 模型路径（无 --config 时必填）")
     parser.add_argument("--local_files_only", action="store_true")
@@ -605,7 +797,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight_decay", type=float, default=1e-2)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--val_ratio", type=float, default=0.2)
 
     # loss / prototype
     parser.add_argument("--temperature", type=float, default=0.07)
@@ -639,15 +830,18 @@ if __name__ == "__main__":
         dino = cfg.get("dino", {}) or {}
         clip = cfg.get("clip", {}) or {}
         tr = cfg.get("training", {}) or {}
+        data_cfg = cfg.get("data", {}) or {}
         model_cfg = cfg.get("model", {}) or {}
 
         args = argparse.Namespace(
             # paths
-            data_path=str(cfg["paths"]["dataset_root"]),
+            dataset_root=str(cfg["paths"]["dataset_root"]),
             output_dir=out_dir,
             dino_model_path=str(dino["model_path"]),
             clip_model_path=str(clip["model_path"]),
             local_files_only=bool(model_cfg.get("local_files_only", False)),
+            train_datasets=[],
+            test_datasets=[],
             # model
             features_list=[int(x) for x in dino.get("layer_indices", [12, 16, 20, 24])],
             image_size=int(dino.get("image_size", 512)),
@@ -661,7 +855,11 @@ if __name__ == "__main__":
             weight_decay=float(step1.get("weight_decay", 1e-2)),
             grad_clip=float(step1.get("grad_clip", 1.0)),
             seed=int(tr.get("seed", 42)),
-            val_ratio=float(step1.get("val_ratio", 0.2)),
+            max_image_size=int(data_cfg.get("max_image_size", 512)),
+            resize_factor=int(data_cfg.get("factor", 28)),
+            eval_vis_num_samples=int(step1.get("eval_vis_num_samples", 0)),
+            eval_heatmap_alpha=float(step1.get("eval_heatmap_alpha", 0.45)),
+            step1_visual_debug=bool(tr.get("step1_visual_debug", False)),
             # loss / prototype
             temperature=float(step1.get("temperature", 0.07)),
             patch_pos_weight=float(step1.get("patch_pos_weight", 4.0)),
@@ -674,13 +872,18 @@ if __name__ == "__main__":
             lambda_img_cls=float(step1.get("lambda_img_cls", 0.5)),
             lambda_consistency=float(step1.get("lambda_consistency", 0.25)),
         )
+        ds_cfg = cfg.get("datasets", []) or []
+        if isinstance(ds_cfg, dict):
+            args.train_datasets = list(ds_cfg.get("train", []) or [])
+            args.test_datasets = list(ds_cfg.get("test", []) or [])
+        else:
+            # backward compatibility: old list format => use same list for train/test
+            args.train_datasets = list(ds_cfg)
+            args.test_datasets = list(ds_cfg)
+        if not args.train_datasets:
+            raise SystemExit("step1 config requires datasets.train list")
+        if not args.test_datasets:
+            raise SystemExit("step1 config requires datasets.test list")
         train(args)
     else:
-        # legacy CLI mode
-        if not cli.data_path or not cli.dino_model_path or not cli.clip_model_path:
-            raise SystemExit("无 --config 时，必须提供 --data_path --dino_model_path --clip_model_path")
-
-        # keep old behavior: output_dir default if not provided
-        if cli.output_dir is None:
-            cli.output_dir = "./outputs/dino_clip_visual_proto"
-        train(cli)
+        raise SystemExit("step1 现在仅支持 --config 模式，请在配置中提供 datasets.train / datasets.test。")

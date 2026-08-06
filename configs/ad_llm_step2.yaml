@@ -1,7 +1,12 @@
 paths:
-  dataset_root: /data2/zlt/anomaly_detection_llm/datasets/mvtec_anomaly_detection
-  conversation_json_path: /data2/zlt/anomaly_detection_llm/datasets/mvtec_zero_shot.json
+  # 数据根目录：包含 datasets 列表中的 json 文件以及这些 json 引用的图像相对路径根目录
+  dataset_root: /data2/zlt/anomaly_detection_llm/datasets
   output_dir: ./logs_step2
+
+datasets:
+  - bmad_zero_shot.json:100%
+  - anomaly_shapenet_zero_shot2.json:100%
+
 
 runtime:
   mode: train
@@ -38,6 +43,7 @@ clip:
   use_mlp: true
 
 data:
+  # 数据集由顶层 datasets: [*.json] 控制；每个 json 中 image/mask 为相对 paths.dataset_root 的路径
   use_grounding_format: true
   train_anomaly_only: false
   max_image_size: 512
@@ -98,7 +104,7 @@ bridge:
   align_num_heads: 8
   align_dropout: 0.0
   use_rope_like_bias: true
-  mapped_gate_scale: 1.0
+  align_residual_scale: 0.1
   max_2d_pos_h: 64
   max_2d_pos_w: 64
   # 与 Step1 softmax 一致的温度；调制与热力图共用同一套 proto 对比逻辑

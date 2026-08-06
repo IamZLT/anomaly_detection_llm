@@ -17,8 +17,8 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from utils.qwen_config import apply_runtime_overrides, load_yaml_config
-from utils.qwen_infer import inference_main
+from utils.config import apply_runtime_overrides, load_yaml_config
+from utils.infer import inference_main
 
 
 def build_parser() -> argparse.ArgumentParser:

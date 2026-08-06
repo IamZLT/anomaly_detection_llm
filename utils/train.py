@@ -21,7 +21,7 @@ except ImportError:
 from PIL import Image
 from transformers import AutoImageProcessor
 
-from data.mvtec_json_loader import MVTecDataManager
+from data.dataset_factory import build_data_manager
 from data.mvtec_grounding import MVTecQwenGroundingDataset
 from models.avNet import (
     QwenDinoBridgeModel,
@@ -36,8 +36,8 @@ from utils.visualization import (
     restore_avnet_bridge_from_step1_shell,
     visual_prototypes_from_avnet,
 )
-from utils.qwen_common import prepare_output_dir, set_seed
-from utils.qwen_infer import decode_generation_output
+from utils.common import prepare_output_dir, set_seed
+from utils.infer import decode_generation_output
 
 
 def _build_generation_inputs_for_eval(
@@ -47,7 +47,7 @@ def _build_generation_inputs_for_eval(
     prompt: str,
 ) -> dict:
     """
-    Minimal copy of utils.qwen_infer.build_generation_inputs to avoid circular imports during training.
+    Minimal copy of utils.infer.build_generation_inputs to avoid circular imports during training.
     """
     use_dino_bridge = bool(cfg.get("dino", {}).get("enabled", True))
     local_files_only = cfg.get("model", {}).get("local_files_only", True)
@@ -103,7 +103,7 @@ class BridgeAndProcessorCheckpointCallback(TrainerCallback):
     因此缺 dino_bridge.bin；也不会自动 save processor。在 on_save 里补全，使中间 checkpoint 与 final_model 一样可推理。
     """
 
-    def __init__(self, cfg: dict, processor, manager: MVTecDataManager):
+    def __init__(self, cfg: dict, processor, manager):
         self.cfg = cfg
         self.processor = processor
         self.manager = manager
@@ -219,7 +219,7 @@ class BridgeAndProcessorCheckpointCallback(TrainerCallback):
                 continue
 
             # match inference preprocessing: smart_resize inside build_generation_inputs expects resized image
-            from utils.qwen_common import smart_resize
+            from utils.common import smart_resize
 
             img_rs, orig_size, _ = smart_resize(
                 img.copy(),
@@ -511,13 +511,32 @@ def train_main(cfg: dict) -> None:
     if is_world_process_zero:
         _train_log(f"输出目录: {output_dir}", main_only=True)
 
-    manager = MVTecDataManager(
-        dataset_root=cfg["paths"]["dataset_root"],
-        conversation_json_path=cfg["paths"]["conversation_json_path"],
-    )
-    _train_log("正在加载 MVTec 元数据 …")
+    manager = build_data_manager(cfg)
+    selected = cfg.get("datasets") or ["mvtec_anomaly_detection"]
+    _train_log(f"正在加载数据集元数据 … selected={selected}")
     manager.load_all()
-    _train_log("MVTec 元数据加载完成")
+    _train_log("数据集元数据加载完成")
+    try:
+        stats = manager.get_json_stats() if hasattr(manager, "get_json_stats") else []
+        if stats:
+            total_samples = 0
+            total_images = 0
+            for st in stats:
+                total_samples += int(st.get("num_samples", 0))
+                total_images += int(st.get("num_images", 0))
+                _train_log(
+                    "[data] "
+                    f"json={st.get('json_path')} "
+                    f"sampling={st.get('sampling_strategy', 'all')} "
+                    f"samples={int(st.get('num_samples', 0))} "
+                    f"images={int(st.get('num_images', 0))}"
+                )
+            _train_log(
+                "[data] "
+                f"total_json={len(stats)} total_samples={total_samples} total_images={total_images}"
+            )
+    except Exception as e:
+        _train_log(f"[data] 统计样本数失败: {e}")
 
     _train_log("正在 setup_model_and_processor（全量 Qwen + DINO/CLIP 桥接；DINO/CLIP 骨干冻结，可能数分钟无输出）…")
     model, processor = setup_model_and_processor(cfg, for_inference=False)
@@ -578,7 +597,7 @@ def train_main(cfg: dict) -> None:
             if img_path and os.path.isfile(str(img_path)):
                 try:
                     img = Image.open(str(img_path)).convert("RGB")
-                    from utils.qwen_common import smart_resize
+                    from utils.common import smart_resize
 
                     img_rs, orig_size, _ = smart_resize(
                         img.copy(),

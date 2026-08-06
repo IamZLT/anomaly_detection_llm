@@ -6,9 +6,9 @@ import os
 import subprocess
 import sys
 
-from utils.qwen_config import apply_runtime_overrides, load_yaml_config
-from utils.qwen_infer import inference_main
-from utils.qwen_train import train_main
+from utils.config import apply_runtime_overrides, load_yaml_config
+from utils.infer import inference_main
+from utils.train import train_main
 
 
 def _in_distributed_worker() -> bool:

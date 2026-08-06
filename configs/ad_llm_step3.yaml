@@ -91,7 +91,7 @@ bridge:
   align_num_heads: 8
   align_dropout: 0.0
   use_rope_like_bias: true
-  mapped_gate_scale: 1.0
+  align_residual_scale: 0.1
   max_2d_pos_h: 64
   max_2d_pos_w: 64
   prototype_temperature: 0.07

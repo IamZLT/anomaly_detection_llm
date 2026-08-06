@@ -77,7 +77,7 @@ def format_train_log_line(
 ) -> str:
     """
     与 ``EnhancedLoggingCallback`` 终端行一致的一行字符串（含 dino_dim / clip_dim）。
-    供 ``utils.qwen_train`` 等在自定义 ``on_log`` 里 ``tqdm.write`` 时调用。
+    供 ``utils.train`` 等在自定义 ``on_log`` 里 ``tqdm.write`` 时调用。
 
     ``add_rank_prefix=False``：只返回 ``step=... epoch=... | ...``，用于外层已带
     ``[train rank=...]`` 前缀的 ``_train_log``，避免重复。
@@ -149,7 +149,7 @@ class EnhancedLoggingCallback(TrainerCallback):
             os.makedirs(self.log_dir, exist_ok=True)
             self.writer = SummaryWriter(log_dir=self.log_dir)
             print(
-                f"[EnhancedLoggingCallback] utils.qwen_logging loaded from {__file__}",
+                f"[EnhancedLoggingCallback] utils.logging_utils loaded from {__file__}",
                 file=sys.stderr,
                 flush=True,
             )

@@ -32,8 +32,8 @@ from models.visual_proto import DinoClipVisualPrototypeModel, infer_square_hw
 from loss.FocalLoss import FocalLoss
 from loss.BinaryDiceLoss import BinaryDiceLoss
 from train_ad_llm_step1 import compute_patch_cls_loss, VisualPrototypes
-from utils.qwen_common import smart_resize
-from utils.qwen_config import load_yaml_config
+from utils.common import smart_resize
+from utils.config import load_yaml_config
 
 
 def _heatmap_overlay(image: Image.Image, heat: np.ndarray, alpha: float = 0.45) -> Image.Image:

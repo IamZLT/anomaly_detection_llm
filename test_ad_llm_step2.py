@@ -1,12 +1,3 @@
-#!/usr/bin/env python3
-"""
-单张图片测试 Stage-2（读取 configs/ad_llm_step2.yaml 的 inference 段，走 utils.qwen_infer.inference_main）。
-
-用法:
-  python test_ad_llm_step2.py
-  python test_ad_llm_step2.py --config configs/ad_llm_step2.yaml
-"""
-
 import argparse
 import os
 import sys
@@ -15,8 +6,8 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from utils.qwen_config import apply_runtime_overrides, load_yaml_config
-from utils.qwen_infer import inference_main
+from utils.config import apply_runtime_overrides, load_yaml_config
+from utils.infer import inference_main
 
 
 def build_parser() -> argparse.ArgumentParser:

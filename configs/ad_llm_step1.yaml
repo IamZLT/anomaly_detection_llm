@@ -1,7 +1,14 @@
 paths:
-  dataset_root: /data2/zlt/anomaly_detection_llm/datasets/mvtec_anomaly_detection
-  conversation_json_path: /data2/zlt/anomaly_detection_llm/datasets/mvtec_zero_shot.json
-  output_dir: ./logs
+  # 数据根目录：包含 datasets 列表中的 json 文件以及这些 json 引用的图像相对路径根目录
+  dataset_root: /data2/zlt/anomaly_detection_llm/datasets
+  output_dir: ./logs_step2
+
+datasets:
+  train:
+    - bmad_zero_shot.json:100%
+    - anomaly_shapenet_zero_shot2.json:100%
+  test:
+    - mvtec_zero_shot.json:100%
 
 runtime:
   mode: train
@@ -63,6 +70,9 @@ step1:
 
   # 有 CUDA 时启用 bf16 autocast
   bf16: true
+  # 每个 epoch 测试后随机可视化多少张测试图（0=关闭）
+  eval_vis_num_samples: 5
+  eval_heatmap_alpha: 0.45
 
 test:
   # 单图测试：使用 step1 训练输出目录里的 dino_bridge.bin

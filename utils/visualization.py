@@ -1,17 +1,3 @@
-"""
-与 ``test_ad_llm_step1.py`` 完全一致的可视化 / 热力图逻辑（供单测与训练 eval 共用）。
-
-训练侧将 ``QwenDinoBridgeModel`` 的视觉子模块挂到 ``DinoClipVisualPrototypeModel`` 上，再调用本模块，
-即可与 ``python test_ad_llm_step1.py`` 得到同一套 ``img_t → forward → heat → upsample → overlay``。
-
-重要：``attach_avnet_to_step1_shell`` 会把 ``dino_model`` / ``clip_model`` / mapper 从 AVNet **挪到**
-shell 上（PyTorch 单父模块规则）。算完热力图后若不 ``restore_avnet_bridge_from_step1_shell``，
-AVNet 上不再挂这些子模块，后续 ``generate`` 与训练 forward 的特征会错。
-
-排查与 test 热力图差异：在 YAML 中设 ``training.step1_visual_debug: true``（训练），或
-``test.step1_visual_debug: true``（``test_ad_llm_step1.py`` 使用的 ``ad_llm_step1.yaml`` 的 ``test:`` 段），
-本模块会在 ``compute_step1_heat_up`` 内打印 ``mapped_patches`` / ``heat`` 等统计。
-"""
 from __future__ import annotations
 
 from typing import List, Tuple

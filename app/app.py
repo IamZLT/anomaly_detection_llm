@@ -21,15 +21,15 @@ from flask import Flask, render_template, request, jsonify, send_file
 from transformers import AutoImageProcessor
 
 from models.qwen3_text_modeling import setup_model_and_processor
-from utils.qwen_infer import build_generation_inputs, decode_generation_output
-from utils.qwen_common import (
+from utils.infer import build_generation_inputs, decode_generation_output
+from utils.common import (
     bbox_to_processed_pixels,
     draw_bbox_on_image,
     infer_model_compute_device,
     parse_grounding_output,
     smart_resize,
 )
-from utils.qwen_config import load_yaml_config, apply_runtime_overrides
+from utils.config import load_yaml_config, apply_runtime_overrides
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size

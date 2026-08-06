@@ -16,8 +16,8 @@ from PIL import Image
 from tqdm import tqdm
 
 from data.mvtec_json_loader import MVTecDataManager, MVTecJSONDataset
-from utils.qwen_common import infer_model_compute_device, smart_resize
-from utils.qwen_config import load_yaml_config
+from utils.common import infer_model_compute_device, smart_resize
+from utils.config import load_yaml_config
 
 
 def _json_safe(obj: Any) -> Any:
