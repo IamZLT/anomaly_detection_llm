@@ -47,18 +47,26 @@ def strip_think(text: str) -> str:
 
 
 def extract_tag_blocks(text: str) -> Dict[str, str]:
+    """Strict parser: only accept explicitly closed XML blocks."""
     out: Dict[str, str] = {}
     for m in TAG_BLOCK_RE.finditer(text):
         out[m.group(1).lower()] = m.group(2).strip()
-    # Fallback: the model often terminates its turn (EOS) right after the JSON in
-    # <answer> without emitting the closing </answer>. Recover such trailing
-    # unclosed tags so well-formed content is not silently dropped.
-    for name in TAG_NAMES:
-        if name in out:
-            continue
-        m = re.search(rf"<{name}\s*>(.*)$", text, re.IGNORECASE | re.DOTALL)
+    return out
+
+
+def extract_tag_blocks_tolerant(text: str) -> Dict[str, str]:
+    """Diagnostics/demo only: recover a trailing unclosed <answer>."""
+    out = extract_tag_blocks(text)
+
+    if "answer" not in out:
+        m = re.search(
+            r"<answer\s*>(.*)$",
+            text,
+            re.IGNORECASE | re.DOTALL,
+        )
         if m:
-            out[name] = m.group(1).strip()
+            out["answer"] = m.group(1).strip()
+
     return out
 
 
@@ -221,11 +229,19 @@ def _trajectory_valid(
     )
     desc_ok = _answer_description_ok(answer)
     if pred_cls is False:
+        candidate_ok = (
+            candidate_state == BOX_STATE_NULL
+            or (
+                candidate_state == BOX_STATE_BOX
+                and _valid_bbox_1000(candidate_bbox)
+            )
+        )
+
         return (
             has_tags
             and prose_ok
             and desc_ok
-            and candidate_state == BOX_STATE_NULL
+            and candidate_ok
             and answer.get("answer_state") == "ok"
             and answer.get("final_bbox_state") == BOX_STATE_NULL
         )
@@ -253,7 +269,14 @@ def _pack_parsed(
     strict: bool,
     extra: Optional[dict] = None,
 ) -> Dict[str, Any]:
-    has_tags = all(n in tags for n in TAG_NAMES)
+    if strict:
+        tag_sequence = [
+            m.group(1).lower()
+            for m in TAG_BLOCK_RE.finditer(raw)
+        ]
+        has_tags = tag_sequence == list(TAG_NAMES)
+    else:
+        has_tags = all(n in tags for n in TAG_NAMES)
     cand = candidate_bbox if candidate_state == BOX_STATE_BOX else None
     out = {
         "raw": tags if tags else raw,
@@ -319,6 +342,16 @@ def rollout_protocol_stats(parsed_list: Sequence[dict], texts: Optional[Sequence
             and p.get("candidate_bbox_state") == BOX_STATE_NULL
             and p.get("final_bbox_state") == BOX_STATE_NULL
         ),
+        "normal_final_null_rate": rate(
+            lambda p: p.get("is_anomaly") is False
+            and p.get("final_bbox_state") == BOX_STATE_NULL
+        ),
+        "normal_candidate_rejection_rate": rate(
+            lambda p: p.get("is_anomaly") is False
+            and p.get("candidate_bbox_state") == BOX_STATE_BOX
+            and _valid_bbox_1000(p.get("candidate_bbox_2d"))
+            and p.get("final_bbox_state") == BOX_STATE_NULL
+        ),
     }
     if texts is not None:
         stats["unique_response_rate"] = float(len(set(texts))) / max(len(texts), 1)
@@ -344,7 +377,7 @@ def parse_cot_output(text: str) -> Dict[str, Any]:
 def parse_cot_output_tolerant(text: str) -> Dict[str, Any]:
     """Demo / legacy fallback: also search whole text and JSON if tags are missing."""
     raw = strip_think(text)
-    tags = extract_tag_blocks(raw)
+    tags = extract_tag_blocks_tolerant(raw)
     ground_txt = tags.get("ground", "")
     answer_txt = tags.get("answer", "")
     json_obj: Dict[str, Any] = {}

@@ -62,13 +62,19 @@ def _mean(xs: Sequence[float]) -> float:
 
 
 def summarize_detection_metrics(rows: List[dict]) -> Dict[str, float]:
-    """rows: is_anomaly, pred_cls, class_name, iou_f, iou_c, a_gt, rec_ok."""
+    """rows: is_anomaly, pred_cls, class_name, iou_f, iou_c, a_gt, rec_ok, trajectory_valid."""
     n = max(len(rows), 1)
     rec = sum(1 for r in rows if r.get("rec_ok"))
     anom = [r for r in rows if r.get("is_anomaly")]
     raw_ious = [float(r.get("iou_f") or 0.0) for r in anom]
     gated_ious = [
         float(r.get("iou_f") or 0.0) if r.get("pred_cls") is True else 0.0
+        for r in anom
+    ]
+    strict_gated_ious = [
+        float(r.get("iou_f") or 0.0)
+        if (r.get("pred_cls") is True and r.get("trajectory_valid"))
+        else 0.0
         for r in anom
     ]
     cand_ious = [float(r.get("iou_c") or 0.0) for r in anom]
@@ -95,11 +101,19 @@ def summarize_detection_metrics(rows: List[dict]) -> Dict[str, float]:
         "rec_acc": rec / n,
         "mean_iou": _mean(raw_ious),
         "mean_iou_gated": _mean(gated_ious),
+        "mean_iou_strict_gated": _mean(strict_gated_ious),
         "mean_iou_c": _mean(cand_ious),
         "acc_at_01": acc_at(0.1, gated_ious),
         "acc_at_03": acc_at(0.3, gated_ious),
         "acc_at_05": acc_at(0.5, gated_ious),
+        "strict_acc_at_01": acc_at(0.1, strict_gated_ious),
+        "strict_acc_at_03": acc_at(0.3, strict_gated_ious),
+        "strict_acc_at_05": acc_at(0.5, strict_gated_ious),
         "iou_at_03": acc_at(0.3, raw_ious),
+        "trajectory_valid_rate": (
+            sum(bool(r.get("trajectory_valid")) for r in rows)
+            / n
+        ),
         "macro_miou": _mean([_mean(v) for v in by_cls.values()]),
         "n_anom": float(len(anom)),
     }

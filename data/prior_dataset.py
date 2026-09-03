@@ -139,7 +139,8 @@ def build_user_prompt(cfg: dict, class_name: str) -> str:
             "or {\"is_anomaly\": false, \"bbox_2d\": null, "
             "\"description\": \"One concise sentence stating that no clear defect is observed.\"}. "
             "If anomalous, candidate_bbox_2d and final bbox_2d must both be valid boxes; "
-            "if normal, both must be null. Do not add extra JSON fields. "
+            "if is_anomaly is false, final bbox_2d must be null while candidate_bbox_2d may be "
+            "null or a valid box rejected during verification. Do not add extra JSON fields. "
             "All bbox coordinates are integers in the 0-1000 system of Image 2."
         )
     return tmpl.replace("{class_name}", class_name)
@@ -361,36 +362,41 @@ class PriorCollator:
             heat = overlay_heatmap_on_image(test_rs, hmap, alpha=self.overlay_alpha)
         else:
             heat = heatmap_to_pil(hmap, test_rs.size)
-        user_text = item["prompt"].rstrip() + "\n\n" + format_prior_hint(points)
+
         images = [ref_rs, test_rs]
-        user = {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": images[0]},
-                {"type": "image", "image": images[1]},
-                {"type": "text", "text": user_text},
-            ],
-        }
-        messages = [user]
-        text = apply_chat_template_safe(self.processor, messages, True, self.enable_thinking)
         max_length = int(self.cfg.get("training", {}).get("max_length", 2048))
-        try:
-            full = self.processor(
-                text=[text],
-                images=images,
-                return_tensors="pt",
-                truncation=True,
-                max_length=max_length,
-            )
-        except TypeError:
-            full = self.processor(text=[text], images=images, return_tensors="pt")
-        full = self._clip_text_tensors(full, max_length)
+
+        def _build_full(points_now):
+            user_text = item["prompt"].rstrip() + "\n\n" + format_prior_hint(points_now)
+            user = {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": images[0]},
+                    {"type": "image", "image": images[1]},
+                    {"type": "text", "text": user_text},
+                ],
+            }
+            messages = [user]
+            text = apply_chat_template_safe(self.processor, messages, True, self.enable_thinking)
+            try:
+                enc = self.processor(
+                    text=[text],
+                    images=images,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=max_length,
+                )
+            except TypeError:
+                enc = self.processor(text=[text], images=images, return_tensors="pt")
+            return self._clip_text_tensors(enc, max_length)
+
+        full = _build_full(points)
         proc_grid = full.get("image_grid_thw")
+        merge = max(int(getattr(self.prior, "spatial_merge_size", 2) or 2), 1)
         if proc_grid is not None:
             g = proc_grid.detach()
             if g.ndim == 3:
                 g = g.squeeze(0)
-            merge = max(int(getattr(self.prior, "spatial_merge_size", 2) or 2), 1)
             n_tok = int((g.prod(dim=-1) // (merge * merge)).sum().item())
             if n_tok != int(merged.shape[0]):
                 fallback_triggered = True
@@ -405,6 +411,16 @@ class PriorCollator:
                     heat = overlay_heatmap_on_image(test_rs, hmap, alpha=self.overlay_alpha)
                 else:
                     heat = heatmap_to_pil(hmap, test_rs.size)
+                full = _build_full(points)
+                g2 = full["image_grid_thw"].detach()
+                if g2.ndim == 3:
+                    g2 = g2.squeeze(0)
+                n_tok2 = int((g2.prod(dim=-1) // (merge * merge)).sum().item())
+                if n_tok2 != int(merged.shape[0]):
+                    raise RuntimeError(
+                        f"vision cache mismatch after fallback: "
+                        f"processor={n_tok2}, cache={merged.shape[0]}"
+                    )
         out = {k: v.squeeze(0) if isinstance(v, torch.Tensor) and v.shape[0] == 1 else v for k, v in full.items()}
         prompt_ids = out["input_ids"]
         out["prompt_len"] = torch.tensor(int(prompt_ids.numel()), dtype=torch.long)

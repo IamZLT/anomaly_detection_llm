@@ -166,6 +166,7 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
     log_every = int(gcfg.get("logging_steps", 1))
     alpha = float((cfg.get("prior") or {}).get("overlay_alpha", 0.45))
     adv_eps = float(gcfg.get("adv_eps", 1e-6))
+    fmt_mix = float(gcfg.get("format_advantage_weight", 0.20))
 
     from torch.utils.data.distributed import DistributedSampler
 
@@ -340,7 +341,8 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
             std_g = group_std([float(d.get("R_ground", 0.0)) for d in details])
             std_r = group_std([float(d.get("R_reason", 0.0)) for d in details])
             std_f = group_std([float(d.get("R_final", 0.0)) for d in details])
-            if max(std_g, std_r, std_f) >= min_std:
+            std_fmt = group_std([float(d.get("R_fmt", 0.0)) for d in details])
+            if max(std_g, std_r, std_f, std_fmt) >= min_std:
                 resample_n = attempt
                 skipped = False
                 break
@@ -353,9 +355,11 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
         r_ground = torch.tensor([float(d.get("R_ground", 0.0)) for d in details], device=device, dtype=torch.float32)
         r_reason = torch.tensor([float(d.get("R_reason", 0.0)) for d in details], device=device, dtype=torch.float32)
         r_final = torch.tensor([float(d.get("R_final", 0.0)) for d in details], device=device, dtype=torch.float32)
+        r_fmt = torch.tensor([float(d.get("R_fmt", 0.0)) for d in details], device=device, dtype=torch.float32)
         a_ground = grpo_advantages(r_ground, group, adv_eps)
         a_reason = grpo_advantages(r_reason, group, adv_eps)
         a_final = grpo_advantages(r_final, group, adv_eps)
+        a_fmt = grpo_advantages(r_fmt, group, adv_eps)
 
         use_ddp = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
         active = torch.tensor([0 if skipped else 1], device=device, dtype=torch.int64)
@@ -399,8 +403,10 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                 a_ground,
                 a_reason,
                 a_final,
+                a_fmt,
                 bool(meta.get("is_anomaly")),
                 device,
+                fmt_mix=fmt_mix,
             )
             if skipped:
                 adv_tok = torch.zeros_like(adv_tok)
@@ -569,7 +575,38 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                 )
 
         if is_main_process() and vis_every > 0 and step % vis_every == 0:
-            best_i = int(torch.argmax(r_final).item())
+            def _vis_key(i):
+                p = parsed_list[i]
+                d = details[i]
+                is_anom = bool(meta.get("is_anomaly"))
+
+                cls_ok = (
+                    p.get("is_anomaly") is not None
+                    and bool(p.get("is_anomaly")) == is_anom
+                )
+
+                if is_anom:
+                    spatial_ok = (
+                        p.get("candidate_bbox_state") == "box"
+                        and p.get("final_bbox_state") == "box"
+                    )
+                else:
+                    spatial_ok = (
+                        p.get("is_anomaly") is False
+                        and p.get("final_bbox_state") == "null"
+                    )
+
+                return (
+                    int(bool(p.get("trajectory_valid"))),
+                    int(cls_ok),
+                    int(spatial_ok),
+                    float(d.get("R_final", -1.0)),
+                    float(d.get("R_reason", 0.0)),
+                    float(d.get("R_ground", 0.0)),
+                    float(d.get("R_fmt", 0.0)),
+                )
+
+            best_i = max(range(len(texts)), key=_vis_key)
             log_heatmap_and_case(
                 writer,
                 step=step,

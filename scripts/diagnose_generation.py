@@ -175,6 +175,8 @@ def main() -> None:
         f"final_valid_rate      = {proto.get('final_valid_rate', 0.0):.3f}",
         f"box_pair_valid_rate   = {proto.get('box_pair_valid_rate', 0.0):.3f}",
         f"normal_null_rate      = {proto.get('normal_null_consistency_rate', 0.0):.3f}",
+        f"normal_final_null_rate= {proto.get('normal_final_null_rate', 0.0):.3f}",
+        f"normal_cand_reject_rate={proto.get('normal_candidate_rejection_rate', 0.0):.3f}",
         f"unique_response_rate  = {proto.get('unique_response_rate', 0.0):.3f}",
         f"mean_R_ground         = {_mean('R_ground'):.3f}",
         f"mean_R_reason         = {_mean('R_reason'):.3f}",

@@ -116,10 +116,12 @@ prompt:
     Wrong:     bbox_2d=[540,350,790,620]
     A candidate bbox must contain four integer coordinates in the 0-1000 coordinate system of Image 2.
     Do not output only a point.
+    candidate_bbox_2d represents a suspicious proposal, not necessarily a confirmed defect.
 
     In <verify>:
     Re-check the candidate region against the normal reference.
     Decide whether the difference is a true defect or normal variation.
+    Verification may either refine a true anomaly candidate or reject it as normal variation.
     If it is a true defect, refine the candidate region into the most accurate final defect boundary.
 
     In <answer>:
@@ -135,7 +137,11 @@ prompt:
 
     Consistency rules:
     - If the sample is anomalous, candidate_bbox_2d and final bbox_2d must both be valid boxes.
-    - If the sample is normal, candidate_bbox_2d and final bbox_2d must both be null.
+    - If no suspicious region is found, candidate_bbox_2d may be null.
+    - If a suspicious region is found but is rejected during verification as normal variation,
+      candidate_bbox_2d may be a valid box while final bbox_2d must be null.
+    - If is_anomaly is false, final bbox_2d must always be null.
+    - If is_anomaly is true, final bbox_2d must always be a valid box.
     - The final bbox may refine the candidate bbox after verification.
     - Do not add extra JSON fields.
 
@@ -157,19 +163,19 @@ prompt:
     {"is_anomaly": true, "bbox_2d": [574,382,760,590], "description": "A localized missing region is present on the object and is absent from the normal reference."}
     </answer>
 
-    Example 2 (normal):
+    Example 2 (normal variation rejected after verification):
     <compare>
-    Image 1 and Image 2 match in shape, texture, and surface appearance.
+    Image 2 contains a localized appearance difference relative to Image 1.
     </compare>
     <ground>
-    No localized difference provides sufficient evidence of a defect.
-    candidate_bbox_2d=null
+    A small region differs from the reference and requires verification.
+    candidate_bbox_2d=[280,420,410,560]
     </ground>
     <verify>
-    The observed variations are consistent with normal appearance.
+    After comparison with the normal reference, the candidate is consistent with normal appearance variation rather than a true defect.
     </verify>
     <answer>
-    {"is_anomaly": false, "bbox_2d": null, "description": "No clear defect is observed relative to the normal reference."}
+    {"is_anomaly": false, "bbox_2d": null, "description": "The localized difference is consistent with normal variation and no true defect is observed."}
     </answer>
 
 training:
@@ -207,6 +213,7 @@ grpo:
   max_resample_attempts: 2
   hard_resample_attempts: 4
   small_area_thresh: 0.02
+  format_advantage_weight: 0.20
   reward:
     w_cov: 0.60
     w_cand_iou: 0.40
@@ -218,7 +225,6 @@ grpo:
     normal_correct: 1.0
     wrong_decision: -1.0
     invalid_output: -1.0
-    format_reward_scale: 0.5
     format_weights:
       compare: 0.2
       ground: 0.3

@@ -9,6 +9,7 @@ from reasoning.parser import TAG_BLOCK_RE
 # Method-defined mix (not yaml hyperparameters).
 _GROUND_AG, _GROUND_AF = 0.8, 0.2
 _REASON_AR, _REASON_AF = 0.7, 0.3
+_ANSWER_AR, _ANSWER_AF = 0.3, 0.7
 
 
 def _seg_role(tag: str) -> str:
@@ -53,12 +54,19 @@ def mix_segment_advantage(
     a_ground: float,
     a_reason: float,
     a_final: float,
+    a_fmt: float,
     is_anomaly: bool,
+    fmt_mix: float = 0.20,
 ) -> float:
     if not is_anomaly:
-        return a_final
-    if seg == "ground":
-        return _GROUND_AG * a_ground + _GROUND_AF * a_final
-    if seg == "reason":
-        return _REASON_AR * a_reason + _REASON_AF * a_final
-    return a_final
+        base = a_final
+    elif seg == "ground":
+        base = _GROUND_AG * a_ground + _GROUND_AF * a_final
+    elif seg == "reason":
+        base = _REASON_AR * a_reason + _REASON_AF * a_final
+    else:
+        base = _ANSWER_AR * a_reason + _ANSWER_AF * a_final
+
+    lam = max(0.0, min(float(fmt_mix), 1.0))
+
+    return (1.0 - lam) * base + lam * a_fmt

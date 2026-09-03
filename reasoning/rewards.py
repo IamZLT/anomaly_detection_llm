@@ -97,6 +97,74 @@ def _to_px(box, orig_wh: Tuple[int, int]) -> Optional[List[float]]:
     return qwen1000_to_pixels_strict(box, orig_wh)
 
 
+def format_reward(parsed: Dict[str, Any], fmt_weights: Dict[str, float]) -> float:
+    tags = parsed.get("tags") or {}
+
+    compare_ok = (
+        "compare" in tags
+        and bool(str(tags.get("compare", "")).strip())
+    )
+
+    cand_state = parsed.get("candidate_bbox_state")
+    cand = parsed.get("candidate_bbox_2d")
+
+    ground_ok = (
+        "ground" in tags
+        and (
+            cand_state == "null"
+            or (
+                cand_state == "box"
+                and valid_bbox_1000(cand)
+            )
+        )
+    )
+
+    verify_ok = (
+        "verify" in tags
+        and bool(str(tags.get("verify", "")).strip())
+    )
+
+    pred = parsed.get("is_anomaly")
+    final_state = parsed.get("final_bbox_state")
+    final_box = parsed.get("bbox_2d")
+
+    answer_schema_ok = (
+        parsed.get("answer_state") == "ok"
+        and isinstance(pred, bool)
+    )
+
+    if pred is True:
+        answer_box_ok = (
+            final_state == "box"
+            and valid_bbox_1000(final_box)
+        )
+    elif pred is False:
+        answer_box_ok = final_state == "null"
+    else:
+        answer_box_ok = False
+
+    answer_ok = (
+        "answer" in tags
+        and answer_schema_ok
+        and answer_box_ok
+    )
+
+    components = {
+        "compare": compare_ok,
+        "ground": ground_ok,
+        "verify": verify_ok,
+        "answer": answer_ok,
+    }
+
+    return float(
+        sum(
+            float(fmt_weights.get(name, 0.0))
+            for name, ok in components.items()
+            if ok
+        )
+    )
+
+
 def compute_rewards(
     parsed: Dict[str, Any],
     gt_box_px: Optional[List[float]],
@@ -115,7 +183,6 @@ def compute_rewards(
     r_wrong = float(rew_cfg.get("wrong_decision", -1.0))
     r_invalid = float(rew_cfg.get("invalid_output", -1.0))
     edge_min_frac = float(rew_cfg.get("edge_min_frac", 0.05))
-    fmt_scale = float(rew_cfg.get("format_reward_scale", 0.5))
     fmt_weights = rew_cfg.get("format_weights") or {
         "compare": 0.2,
         "ground": 0.3,
@@ -134,8 +201,7 @@ def compute_rewards(
     cand_px = _to_px(cand, orig_wh)
     final_px = _to_px(final_box, orig_wh)
 
-    tags = parsed.get("tags") or {}
-    r_fmt = sum(float(fmt_weights.get(tag, 0.0)) for tag in tags)
+    r_fmt = format_reward(parsed, fmt_weights)
 
     def _pack(
         *,
@@ -181,16 +247,22 @@ def compute_rewards(
         elif pred_cls is False and traj_ok:
             r_final = r_ok
         else:
-            r_final = r_invalid + fmt_scale * r_fmt
-        return _pack(r_ground=0.0, r_reason=0.0, r_final=r_final, r_fmt=r_fmt)
+            r_final = r_invalid
+
+        return _pack(
+            r_ground=0.0,
+            r_reason=0.0,
+            r_final=r_final,
+            r_fmt=r_fmt,
+        )
 
     # Classification error beats protocol: explicit false on an anomaly is -1, not -0.5.
     if pred_cls is False:
         r_final_gate = r_wrong
     elif pred_cls is None:
-        r_final_gate = r_invalid + fmt_scale * r_fmt
+        r_final_gate = r_invalid
     elif not traj_ok:
-        r_final_gate = r_invalid + fmt_scale * r_fmt
+        r_final_gate = r_invalid
     else:
         r_final_gate = None
 

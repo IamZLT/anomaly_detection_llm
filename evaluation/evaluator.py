@@ -143,6 +143,9 @@ def run_simple_eval(
                 "a_gt": a_gt,
                 "size_bin": size_bin,
                 "rec_ok": ok,
+                "trajectory_valid": bool(
+                    parsed.get("trajectory_valid")
+                ),
             }
         )
         rollout_log(
@@ -197,8 +200,12 @@ def run_simple_eval(
         writer.add_scalar("eval/mean_iou_c", mean_iou_c, global_step)
         writer.add_scalar("eval/mean_iou", mean_iou, global_step)
         writer.add_scalar("eval/mean_iou_gated", extra.get("mean_iou_gated", 0.0), global_step)
+        writer.add_scalar("eval/mean_iou_strict_gated", extra.get("mean_iou_strict_gated", 0.0), global_step)
+        writer.add_scalar("eval/trajectory_valid_rate", extra.get("trajectory_valid_rate", 0.0), global_step)
         writer.add_scalar("eval/acc_at_03", extra.get("acc_at_03", 0.0), global_step)
         writer.add_scalar("eval/acc_at_05", extra.get("acc_at_05", 0.0), global_step)
+        writer.add_scalar("eval/strict_acc_at_03", extra.get("strict_acc_at_03", 0.0), global_step)
+        writer.add_scalar("eval/strict_acc_at_05", extra.get("strict_acc_at_05", 0.0), global_step)
         writer.flush()
     model.train()
     force_vision_eval(model)

@@ -8,7 +8,12 @@ from data.prior_dataset import build_train_ref_pool, build_user_prompt, pick_ref
 from evaluation.metrics import defect_size_bin, gt_relative_area, summarize_detection_metrics
 from models.qwen35 import apply_processor_geometry
 from models.vision_cache import expand_cached_image_feats, format_prior_hint, topk_spatial_points
-from reasoning.parser import parse_answer_block, parse_cot_output, parse_bbox_field
+from reasoning.parser import (
+    parse_answer_block,
+    parse_bbox_field,
+    parse_cot_output,
+    parse_cot_output_tolerant,
+)
 from reasoning.rewards import (
     compute_rewards,
     edge_precision_reward,
@@ -47,6 +52,22 @@ The observed variations are consistent with normal appearance.
 </verify>
 <answer>
 {"is_anomaly": false, "bbox_2d": null, "description": "The inspection image is consistent with the normal reference, with no clear defect observed."}
+</answer>
+"""
+
+NORM_REJECT = """
+<compare>
+Image 2 contains a localized appearance difference relative to Image 1.
+</compare>
+<ground>
+A small region differs from the reference and requires verification.
+candidate_bbox_2d=[280,420,410,560]
+</ground>
+<verify>
+After comparison with the normal reference, the candidate is consistent with normal appearance variation rather than a true defect.
+</verify>
+<answer>
+{"is_anomaly": false, "bbox_2d": null, "description": "The localized difference is consistent with normal variation and no true defect is observed."}
 </answer>
 """
 
@@ -158,7 +179,7 @@ def test_ground_bbox_only_fails_trajectory():
 
 
 def test_invalid_not_cheaper_than_wrong():
-    cfg = {"grpo": {"reward": {"invalid_output": -1.0, "wrong_decision": -1.0, "format_reward_scale": 0.5}}}
+    cfg = {"grpo": {"reward": {"invalid_output": -1.0, "wrong_decision": -1.0}}}
     orig = (1000, 1000)
     gt = [410, 190, 750, 760]
     broken = ANOM.replace(
@@ -167,29 +188,68 @@ def test_invalid_not_cheaper_than_wrong():
     )
     rb = compute_rewards(parse_cot_output(broken), gt, orig, True, cfg)
     rw = compute_rewards(parse_cot_output(NORM), gt, orig, True, cfg)
-    # format reward bootstraps invalid-but-well-formed above a hard wrong decision, but stays negative
-    assert rb["R_final"] < 0.0
-    assert rb["R_final"] > rw["R_final"]
+    # R_final is decoupled from R_fmt: an invalid output and a hard wrong decision both -1.
+    assert rb["R_final"] == -1.0
     assert rw["R_final"] == -1.0
     assert rb["R_ground"] > 0.0
     rn = compute_rewards(parse_cot_output(NORM), None, orig, False, cfg)
     assert rn["R_final"] == 1.0
 
 
-def test_unclosed_trailing_answer_is_recovered():
+def test_unclosed_answer_is_invalid_in_strict_parser():
     # Model commonly ends its turn (EOS) right after the JSON, dropping </answer>.
     unclosed = ANOM.rsplit("</answer>", 1)[0]
+
     p = parse_cot_output(unclosed)
-    assert "answer" in p["tags"]
-    assert p["has_tags"]
-    assert p["answer_state"] == "ok"
-    assert p["is_anomaly"] is True
-    assert p["bbox_2d"] == [410.0, 190.0, 750.0, 760.0]
+    assert not p["has_tags"]
+    assert not p["trajectory_valid"]
+
+    pt = parse_cot_output_tolerant(unclosed)
+    assert pt["answer_state"] == "ok"
+    assert pt["bbox_2d"] == [410.0, 190.0, 750.0, 760.0]
+
+
+def test_misspelled_candidate_gets_partial_format_reward():
+    cfg = {"grpo": {"reward": {"invalid_output": -1.0, "wrong_decision": -1.0}}}
+    bad = ANOM.replace(
+        "candidate_bbox_2d=",
+        "Candidate bbox 2d=",
+    )
+
+    det = compute_rewards(
+        parse_cot_output(bad),
+        [410, 190, 750, 760],
+        (1000, 1000),
+        True,
+        cfg,
+    )
+
+    assert abs(det["R_fmt"] - 0.7) < 1e-6
+    assert det["R_final"] == -1.0
+
+
+def test_normal_candidate_can_be_rejected():
+    cfg = {"grpo": {"reward": {}}}
+    p = parse_cot_output(NORM_REJECT)
+
+    assert p["candidate_bbox_state"] == "box"
+    assert p["is_anomaly"] is False
+    assert p["final_bbox_state"] == "null"
     assert p["trajectory_valid"]
+
+    det = compute_rewards(
+        p,
+        None,
+        (1000, 1000),
+        False,
+        cfg,
+    )
+
+    assert det["R_final"] == 1.0
 
 
 def test_format_reward_monotonic():
-    cfg = {"grpo": {"reward": {"invalid_output": -1.0, "wrong_decision": -1.0, "format_reward_scale": 0.5}}}
+    cfg = {"grpo": {"reward": {"invalid_output": -1.0, "wrong_decision": -1.0}}}
     orig = (1000, 1000)
     gt = [410, 190, 750, 760]
     full = compute_rewards(parse_cot_output(ANOM), gt, orig, True, cfg)
@@ -199,15 +259,15 @@ def test_format_reward_monotonic():
     p_only = parse_cot_output(only_compare)
     det_only = compute_rewards(p_only, gt, orig, True, cfg)
     assert det_only["R_fmt"] == 0.2
-    assert det_only["R_final"] == -1.0 + 0.5 * 0.2
+    assert det_only["R_final"] == -1.0
     three_blocks = (
         "<compare>\nImage 2 differs from Image 1.\n</compare>\n"
-        "<ground>\nThe region is suspicious.\n</ground>\n"
+        "<ground>\nThe region is suspicious.\ncandidate_bbox_2d=null\n</ground>\n"
         "<verify>\nIt is a defect.\n</verify>\n"
     )
     det_three = compute_rewards(parse_cot_output(three_blocks), gt, orig, True, cfg)
     assert det_three["R_fmt"] == 0.7
-    assert det_three["R_final"] > det_only["R_final"]
+    assert det_three["R_fmt"] > det_only["R_fmt"]
 
 
 def test_scale_aware_edge():
