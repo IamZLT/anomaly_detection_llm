@@ -50,6 +50,15 @@ def extract_tag_blocks(text: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
     for m in TAG_BLOCK_RE.finditer(text):
         out[m.group(1).lower()] = m.group(2).strip()
+    # Fallback: the model often terminates its turn (EOS) right after the JSON in
+    # <answer> without emitting the closing </answer>. Recover such trailing
+    # unclosed tags so well-formed content is not silently dropped.
+    for name in TAG_NAMES:
+        if name in out:
+            continue
+        m = re.search(rf"<{name}\s*>(.*)$", text, re.IGNORECASE | re.DOTALL)
+        if m:
+            out[name] = m.group(1).strip()
     return out
 
 

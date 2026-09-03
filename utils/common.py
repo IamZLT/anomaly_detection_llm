@@ -47,6 +47,45 @@ def train_log(msg: str, main_only: bool = False) -> None:
     print(f"[train rank={rank} local={lr}] {msg}", flush=True)
 
 
+_ROLLOUT_LOG_FILE = None
+
+
+def open_rollout_log(path: str) -> None:
+    """Open (append) the plain-text rollout log; only the main process should call this."""
+    global _ROLLOUT_LOG_FILE
+    if _ROLLOUT_LOG_FILE is not None:
+        try:
+            _ROLLOUT_LOG_FILE.close()
+        except Exception:
+            pass
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    _ROLLOUT_LOG_FILE = open(path, "a", encoding="utf-8")
+
+
+def rollout_log(msg: str) -> None:
+    """Append a line to the rollout log (no-op if never opened or on a non-main rank)."""
+    global _ROLLOUT_LOG_FILE
+    if _ROLLOUT_LOG_FILE is None:
+        return
+    try:
+        _ROLLOUT_LOG_FILE.write(msg + "\n")
+        _ROLLOUT_LOG_FILE.flush()
+    except Exception:
+        pass
+
+
+def close_rollout_log() -> None:
+    global _ROLLOUT_LOG_FILE
+    if _ROLLOUT_LOG_FILE is not None:
+        try:
+            _ROLLOUT_LOG_FILE.close()
+        except Exception:
+            pass
+        _ROLLOUT_LOG_FILE = None
+
+
 def qwen_smart_hw(
     height: int,
     width: int,

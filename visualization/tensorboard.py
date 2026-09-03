@@ -200,6 +200,7 @@ def format_grpo_group_text(
             f"--- τ[{i}]  Rf={det.get('R_final', 0):.3f} Rg={det.get('R_ground', 0):.3f} "
             f"Rr={det.get('R_reason', 0):.3f} cov={det.get('R_cov', 0):.3f} "
             f"dir={det.get('R_dir', 0):.3f} iou_f={det.get('R_iou', 0):.3f} iou_c={det.get('R_iou_c', 0):.3f} "
+            f"fmt={det.get('R_fmt', 0):.3f} "
             f"edge={det.get('R_edge', 0):.3f}{adv}{lp}"
         )
         lines.append((text or "")[:1800])
@@ -349,6 +350,9 @@ def log_grpo_scalars(
     writer.add_scalar("grpo/R_iou", mean("R_iou"), step)
     writer.add_scalar("grpo/delta_iou", mean("delta_iou"), step)
     writer.add_scalar("grpo/R_dir", mean("R_dir"), step)
+    writer.add_scalar("grpo/raw_iou_f", mean("raw_iou_f"), step)
+    writer.add_scalar("grpo/raw_iou_c", mean("raw_iou_c"), step)
+    writer.add_scalar("grpo/R_fmt", mean("R_fmt"), step)
 
     writer.add_scalar("grpo/protocol_rate", float(proto.get("protocol_rate", 0.0)), step)
     writer.add_scalar("grpo/trajectory_valid_rate", float(proto.get("trajectory_valid_rate", 0.0)), step)

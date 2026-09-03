@@ -22,7 +22,7 @@ from models.vision_cache import bind_cached_image_features
 from reasoning.parser import parse_cot_output
 from reasoning.rewards import box_iou, qwen1000_to_pixels_strict, valid_bbox_1000
 from rl.grpo import model_inputs, move_batch, unwrap_model
-from utils.common import train_log
+from utils.common import train_log, rollout_log
 from visualization.tensorboard import log_heatmap_and_case
 
 
@@ -99,6 +99,12 @@ def run_simple_eval(
         parsed = parse_cot_output(text)
         if parsed.get("has_tags"):
             parse_ok += 1
+        prompt_text = ""
+        if "input_ids" in batch:
+            try:
+                prompt_text = tok.decode(batch["input_ids"][0][:prompt_len].cpu(), skip_special_tokens=True)
+            except Exception:
+                prompt_text = "<prompt decode failed>"
         orig = tuple(meta["orig_size"])
         is_anom = bool(meta["is_anomaly"])
         pred_cls = parsed.get("is_anomaly", None)
@@ -138,6 +144,14 @@ def run_simple_eval(
                 "size_bin": size_bin,
                 "rec_ok": ok,
             }
+        )
+        rollout_log(
+            f"===== [eval] step={global_step} image={meta.get('image_path')} class={meta.get('class_name')} "
+            f"is_anomaly={is_anom} gt={meta.get('gt_box_px')} iou_f={iou_v:.3f} iou_c={iou_c:.3f} "
+            f"pred={pred_cls} valid={parsed.get('trajectory_valid')} cand={parsed.get('candidate_bbox_2d')} "
+            f"bbox={parsed.get('bbox_2d')} =====\n"
+            f"[PROMPT]\n{prompt_text}\n[/PROMPT]\n"
+            f"response_repr: {text!r}"
         )
         if writer is not None and log_images and seen < vis_n:
             vis_dir = os.path.join(

@@ -115,6 +115,13 @@ def compute_rewards(
     r_wrong = float(rew_cfg.get("wrong_decision", -1.0))
     r_invalid = float(rew_cfg.get("invalid_output", -1.0))
     edge_min_frac = float(rew_cfg.get("edge_min_frac", 0.05))
+    fmt_scale = float(rew_cfg.get("format_reward_scale", 0.5))
+    fmt_weights = rew_cfg.get("format_weights") or {
+        "compare": 0.2,
+        "ground": 0.3,
+        "verify": 0.2,
+        "answer": 0.3,
+    }
 
     pred_cls = parsed.get("is_anomaly")
     protocol_ok = bool(parsed.get("has_tags", False))
@@ -127,6 +134,9 @@ def compute_rewards(
     cand_px = _to_px(cand, orig_wh)
     final_px = _to_px(final_box, orig_wh)
 
+    tags = parsed.get("tags") or {}
+    r_fmt = sum(float(fmt_weights.get(tag, 0.0)) for tag in tags)
+
     def _pack(
         *,
         r_ground: float,
@@ -138,6 +148,9 @@ def compute_rewards(
         r_iou: float = 0.0,
         r_edge: float = 0.0,
         delta_iou: float = 0.0,
+        raw_iou_f: float = 0.0,
+        raw_iou_c: float = 0.0,
+        r_fmt: float = 0.0,
         d_star: Optional[dict] = None,
     ) -> Dict[str, Any]:
         return {
@@ -151,6 +164,9 @@ def compute_rewards(
             "R_iou": float(r_iou),
             "R_edge": float(r_edge),
             "delta_iou": float(delta_iou),
+            "raw_iou_f": float(raw_iou_f),
+            "raw_iou_c": float(raw_iou_c),
+            "R_fmt": float(r_fmt),
             "pred_box_px": final_px,
             "cand_box_px": cand_px,
             "pred_cls": pred_cls,
@@ -165,16 +181,16 @@ def compute_rewards(
         elif pred_cls is False and traj_ok:
             r_final = r_ok
         else:
-            r_final = r_invalid
-        return _pack(r_ground=0.0, r_reason=0.0, r_final=r_final)
+            r_final = r_invalid + fmt_scale * r_fmt
+        return _pack(r_ground=0.0, r_reason=0.0, r_final=r_final, r_fmt=r_fmt)
 
     # Classification error beats protocol: explicit false on an anomaly is -1, not -0.5.
     if pred_cls is False:
         r_final_gate = r_wrong
     elif pred_cls is None:
-        r_final_gate = r_invalid
+        r_final_gate = r_invalid + fmt_scale * r_fmt
     elif not traj_ok:
-        r_final_gate = r_invalid
+        r_final_gate = r_invalid + fmt_scale * r_fmt
     else:
         r_final_gate = None
 
@@ -183,6 +199,7 @@ def compute_rewards(
             r_ground=0.0,
             r_reason=0.0,
             r_final=r_invalid if r_final_gate is None else r_final_gate,
+            r_fmt=r_fmt,
         )
 
     cand_ok = cand_state == "box" and cand_px is not None
@@ -224,5 +241,8 @@ def compute_rewards(
         r_iou=r_iou,
         r_edge=r_edge,
         delta_iou=delta_iou,
+        raw_iou_f=float(iou_f_diag),
+        raw_iou_c=float(r_iou_c),
+        r_fmt=r_fmt,
         d_star=d_star,
     )

@@ -124,8 +124,12 @@ def build_user_prompt(cfg: dict, class_name: str) -> str:
             "Verify them by comparing Image 1 and Image 2. "
             "Return exactly four XML blocks in order: <compare>, <ground>, <verify>, <answer>. "
             "Do not copy instruction text. Always output all four blocks. "
+            "Close every block with its matching closing tag, for example </compare>. "
+            "Do not add a colon after a tag name: write <answer>, never <answer>:. "
             "In <compare> write 1-2 concise sentences of concrete visual differences. "
             "In <ground> write one sentence then candidate_bbox_2d=[x1,y1,x2,y2] or candidate_bbox_2d=null. "
+            "The field name must be written literally as candidate_bbox_2d (lowercase, underscores, no spaces): "
+            "correct candidate_bbox_2d=[540,350,790,620]; wrong Candidate bbox 2d=..., candidate bbox=..., bbox_2d=.... "
             "A candidate bbox must contain four integer coordinates in the 0-1000 system of Image 2. "
             "In <verify> re-check the candidate against Image 1 and, if it is a true defect, "
             "refine it into the most accurate final defect boundary. "
@@ -351,6 +355,8 @@ class PriorCollator:
         hmap = vis["heatmap"]
         points = vis["prior_points"]
         merged = vis["merged_embeddings"].detach()
+        points_before = points
+        fallback_triggered = False
         if self.render == "overlay":
             heat = overlay_heatmap_on_image(test_rs, hmap, alpha=self.overlay_alpha)
         else:
@@ -387,6 +393,7 @@ class PriorCollator:
             merge = max(int(getattr(self.prior, "spatial_merge_size", 2) or 2), 1)
             n_tok = int((g.prod(dim=-1) // (merge * merge)).sum().item())
             if n_tok != int(merged.shape[0]):
+                fallback_triggered = True
                 pv2 = full["pixel_values"]
                 if pv2.ndim == 3:
                     pv2 = pv2.reshape(-1, pv2.shape[-1])
@@ -415,6 +422,8 @@ class PriorCollator:
             "hmap_tensor": hmap.detach().cpu(),
             "prior_points": points,
             "vision_size": test_rs.size,
+            "fallback_triggered": fallback_triggered,
+            "points_before": points_before,
         }
         return out
 

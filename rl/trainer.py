@@ -50,7 +50,15 @@ from rl.grpo import (
     token_logprobs_nograd,
     unwrap_model,
 )
-from utils.common import is_main_process, prepare_output_dir, set_seed, train_log
+from utils.common import (
+    close_rollout_log,
+    is_main_process,
+    open_rollout_log,
+    prepare_output_dir,
+    rollout_log,
+    set_seed,
+    train_log,
+)
 from visualization.tensorboard import (
     auto_start_tensorboard,
     format_grpo_group_text,
@@ -74,9 +82,58 @@ def disable_hf_datasets_check() -> None:
         pass
 
 
+def _dump_parser_debug(text: str, parsed: dict) -> None:
+    block = (
+        "\n===== PARSER DEBUG =====\n"
+        f"RAW_REPR: {text!r}\n"
+        f"tags: {list((parsed.get('tags') or {}).keys())}\n"
+        f"has_tags: {parsed.get('has_tags')}\n"
+        f"candidate_state: {parsed.get('candidate_bbox_state')}\n"
+        f"candidate: {parsed.get('candidate_bbox_2d')}\n"
+        f"answer_state: {parsed.get('answer_state')}\n"
+        f"final_state: {parsed.get('final_bbox_state')}\n"
+        f"pred: {parsed.get('is_anomaly')}\n"
+        f"bbox: {parsed.get('bbox_2d')}\n"
+        f"description_ok: {parsed.get('description_ok')}\n"
+        f"prose_ok: {parsed.get('prose_ok')}\n"
+        f"trajectory_valid: {parsed.get('trajectory_valid')}\n"
+        "========================\n"
+    )
+    if is_main_process():
+        print(block, flush=True)
+    rollout_log(block)
+
+
+def _log_rollout_txt(tok, input_ids, prompt_len: int, meta: dict, step: int, texts, details, parsed_list) -> None:
+    try:
+        prompt = tok.decode(input_ids[0][:prompt_len].cpu(), skip_special_tokens=True)
+    except Exception:
+        prompt = "<prompt decode failed>"
+    lines = [
+        f"===== step={step} image={meta.get('image_path')} class={meta.get('class_name')} "
+        f"is_anomaly={meta.get('is_anomaly')} gt={meta.get('gt_box_px')} =====",
+        "[PROMPT]",
+        prompt,
+        "[/PROMPT]",
+    ]
+    for i, (text, det, p) in enumerate(zip(texts, details, parsed_list)):
+        lines.append(
+            f"--- tau[{i}] valid={p.get('trajectory_valid')} pred={p.get('is_anomaly')} "
+            f"Rf={det.get('R_final', 0):.3f} Rg={det.get('R_ground', 0):.3f} "
+            f"Rr={det.get('R_reason', 0):.3f} raw_iou_f={det.get('raw_iou_f', 0):.3f} "
+            f"raw_iou_c={det.get('raw_iou_c', 0):.3f} cand={p.get('candidate_bbox_2d')} "
+            f"bbox={p.get('bbox_2d')}"
+        )
+        lines.append(f"response_repr: {text!r}")
+        lines.append("")
+    rollout_log("\n".join(lines))
+
+
 def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, output_dir: str, writer: Optional[SummaryWriter]) -> None:
     gcfg = cfg.get("grpo") or {}
     inf = cfg.get("inference") or {}
+    if is_main_process():
+        open_rollout_log(os.path.join(output_dir, "logs", "rollouts.txt"))
     group = int(gcfg.get("group_size", 8))
     policy_epochs = int(gcfg.get("policy_epochs", 3))
     lr = float(gcfg.get("learning_rate", 5.0e-6))
@@ -250,6 +307,8 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                     cfg,
                 )
             )
+            if not parsed.get("trajectory_valid"):
+                _dump_parser_debug(text, parsed)
         return details, parsed_list
 
     while step < max_steps:
@@ -460,6 +519,7 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
         step += 1
 
         if is_main_process():
+            _log_rollout_txt(tok, batch["input_ids"], prompt_len, meta, step, texts, details, parsed_list)
             log_grpo_scalars(
                 writer,
                 step=step,
@@ -500,6 +560,7 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                     f"uniq={proto_avg.get('unique_response_rate', 0.0):.2f} "
                     f"dIoU={sum(d.get('delta_iou', 0.0) for d in details)/n:.3f} "
                     f"dir={sum(d.get('R_dir', 0.0) for d in details)/n:.2f} "
+                    f"Rfmt={sum(d.get('R_fmt', 0.0) for d in details)/n:.2f} "
                     f"sz={size_bin} a={a_gt:.4f} "
                     f"trunc={truncation_rate:.2f} fmt={parse_rate:.2f} rs={resample_n}{skip_s} "
                     f"gen={t_roll:.1f}s upd={t_upd:.1f}s"
@@ -593,6 +654,7 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
     mins = (time.time() - t0) / 60.0
     if is_main_process():
         train_log(f"GRPO 完成，耗时 {mins:.2f} 分钟", main_only=True)
+        close_rollout_log()
 
 
 def setup_prior_model(cfg: dict):

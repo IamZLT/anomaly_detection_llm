@@ -158,7 +158,7 @@ def test_ground_bbox_only_fails_trajectory():
 
 
 def test_invalid_not_cheaper_than_wrong():
-    cfg = {"grpo": {"reward": {"invalid_output": -1.0, "wrong_decision": -1.0}}}
+    cfg = {"grpo": {"reward": {"invalid_output": -1.0, "wrong_decision": -1.0, "format_reward_scale": 0.5}}}
     orig = (1000, 1000)
     gt = [410, 190, 750, 760]
     broken = ANOM.replace(
@@ -167,11 +167,47 @@ def test_invalid_not_cheaper_than_wrong():
     )
     rb = compute_rewards(parse_cot_output(broken), gt, orig, True, cfg)
     rw = compute_rewards(parse_cot_output(NORM), gt, orig, True, cfg)
-    assert rb["R_final"] == -1.0
+    # format reward bootstraps invalid-but-well-formed above a hard wrong decision, but stays negative
+    assert rb["R_final"] < 0.0
+    assert rb["R_final"] > rw["R_final"]
     assert rw["R_final"] == -1.0
     assert rb["R_ground"] > 0.0
     rn = compute_rewards(parse_cot_output(NORM), None, orig, False, cfg)
     assert rn["R_final"] == 1.0
+
+
+def test_unclosed_trailing_answer_is_recovered():
+    # Model commonly ends its turn (EOS) right after the JSON, dropping </answer>.
+    unclosed = ANOM.rsplit("</answer>", 1)[0]
+    p = parse_cot_output(unclosed)
+    assert "answer" in p["tags"]
+    assert p["has_tags"]
+    assert p["answer_state"] == "ok"
+    assert p["is_anomaly"] is True
+    assert p["bbox_2d"] == [410.0, 190.0, 750.0, 760.0]
+    assert p["trajectory_valid"]
+
+
+def test_format_reward_monotonic():
+    cfg = {"grpo": {"reward": {"invalid_output": -1.0, "wrong_decision": -1.0, "format_reward_scale": 0.5}}}
+    orig = (1000, 1000)
+    gt = [410, 190, 750, 760]
+    full = compute_rewards(parse_cot_output(ANOM), gt, orig, True, cfg)
+    assert full["R_fmt"] == 1.0
+    assert full["R_final"] > 0.0  # ANOM is a fully valid anomaly -> positive IoU reward
+    only_compare = "<compare>\nImage 2 differs from Image 1.\n</compare>\n"
+    p_only = parse_cot_output(only_compare)
+    det_only = compute_rewards(p_only, gt, orig, True, cfg)
+    assert det_only["R_fmt"] == 0.2
+    assert det_only["R_final"] == -1.0 + 0.5 * 0.2
+    three_blocks = (
+        "<compare>\nImage 2 differs from Image 1.\n</compare>\n"
+        "<ground>\nThe region is suspicious.\n</ground>\n"
+        "<verify>\nIt is a defect.\n</verify>\n"
+    )
+    det_three = compute_rewards(parse_cot_output(three_blocks), gt, orig, True, cfg)
+    assert det_three["R_fmt"] == 0.7
+    assert det_three["R_final"] > det_only["R_final"]
 
 
 def test_scale_aware_edge():
@@ -373,6 +409,9 @@ def test_tb_grpo_scalars_are_allowlisted():
         "grpo/R_iou",
         "grpo/delta_iou",
         "grpo/R_dir",
+        "grpo/raw_iou_f",
+        "grpo/raw_iou_c",
+        "grpo/R_fmt",
         "grpo/protocol_rate",
         "grpo/trajectory_valid_rate",
         "grpo/candidate_valid_rate",

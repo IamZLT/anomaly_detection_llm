@@ -107,6 +107,8 @@ prompt:
     <compare>, <ground>, <verify>, <answer>.
 
     Always output all four blocks.
+    Close every block with its matching closing tag, for example </compare>.
+    Do not add a colon after a tag name: write <answer>, never <answer>:.
     Do not copy or repeat the instructions.
 
     In <compare>:
@@ -117,6 +119,11 @@ prompt:
     Then output exactly one of:
     candidate_bbox_2d=[x1,y1,x2,y2]
     candidate_bbox_2d=null
+    The field name must be written literally as candidate_bbox_2d (lowercase, with underscores, no spaces).
+    Correct:   candidate_bbox_2d=[540,350,790,620]
+    Wrong:     Candidate bbox 2d=[540,350,790,620]
+    Wrong:     candidate bbox=[540,350,790,620]
+    Wrong:     bbox_2d=[540,350,790,620]
     A candidate bbox must contain four integer coordinates in the 0-1000 coordinate system of Image 2.
     Do not output only a point.
 
@@ -126,7 +133,9 @@ prompt:
     If it is a true defect, refine the candidate region into the most accurate final defect boundary.
 
     In <answer>:
-    Output exactly one JSON object.
+    Output exactly one JSON object, then close the block with </answer>.
+    End your entire response with </answer> as the very last token.
+    Do not emit any end-of-turn marker after </answer>.
 
     For an anomalous sample:
     {"is_anomaly": true, "bbox_2d": [x1,y1,x2,y2], "description": "One concise sentence describing the defect and its location relative to the normal reference."}
@@ -139,6 +148,39 @@ prompt:
     - If the sample is normal, candidate_bbox_2d and final bbox_2d must both be null.
     - The final bbox may refine the candidate bbox after verification.
     - Do not add extra JSON fields.
+
+    Two illustrative examples (anomalous, then normal). Their coordinates and sentences are examples only:
+    do not copy them; always write coordinates and sentences for the actual Image 1 and Image 2.
+
+    Example 1 (anomalous):
+    <compare>
+    Image 2 has a missing region on the object that is absent from the normal reference.
+    </compare>
+    <ground>
+    The most suspicious region is the damaged area on the object.
+    candidate_bbox_2d=[540,350,790,620]
+    </ground>
+    <verify>
+    The region is missing only in Image 2, so the candidate is refined to tightly cover the damage.
+    </verify>
+    <answer>
+    {"is_anomaly": true, "bbox_2d": [574,382,760,590], "description": "A localized missing region is present on the object and is absent from the normal reference."}
+    </answer>
+
+    Example 2 (normal):
+    <compare>
+    Image 1 and Image 2 match in shape, texture, and surface appearance.
+    </compare>
+    <ground>
+    No localized difference provides sufficient evidence of a defect.
+    candidate_bbox_2d=null
+    </ground>
+    <verify>
+    The observed variations are consistent with normal appearance.
+    </verify>
+    <answer>
+    {"is_anomaly": false, "bbox_2d": null, "description": "No clear defect is observed relative to the normal reference."}
+    </answer>
 
 training:
   max_length: 2048
@@ -189,6 +231,12 @@ grpo:
     normal_correct: 1.0
     wrong_decision: -1.0
     invalid_output: -1.0
+    format_reward_scale: 0.5
+    format_weights:
+      compare: 0.2
+      ground: 0.3
+      verify: 0.2
+      answer: 0.3
 
 distributed:
   num_gpu: 2
