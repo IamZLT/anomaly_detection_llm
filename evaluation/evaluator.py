@@ -23,7 +23,7 @@ from reasoning.parser import parse_cot_output
 from reasoning.rewards import box_iou, qwen1000_to_pixels_strict, valid_bbox_1000
 from rl.grpo import model_inputs, move_batch, unwrap_model
 from utils.common import train_log, rollout_log
-from visualization.tensorboard import log_heatmap_and_case
+from visualization.tensorboard import log_eval_cases_grid, log_heatmap_and_case
 
 
 def tb_vis_flags(cfg: dict) -> dict:
@@ -76,6 +76,7 @@ def run_simple_eval(
         n_max = int(n_max)
     seen = 0
     tok = getattr(processor, "tokenizer", processor)
+    vis_cases = []
     for batch in loader:
         if seen >= n_max:
             break
@@ -156,25 +157,16 @@ def run_simple_eval(
             f"[PROMPT]\n{prompt_text}\n[/PROMPT]\n"
             f"response_repr: {text!r}"
         )
-        if writer is not None and log_images and seen < vis_n:
-            vis_dir = os.path.join(
-                str((cfg.get("paths") or {}).get("output_dir") or "."),
-                "eval_steps",
-                f"vis_step{int(global_step):08d}",
-            )
-            log_heatmap_and_case(
-                writer,
-                step=int(global_step),
-                tag_prefix=f"eval_case_{seen}",
-                meta=meta,
-                response=text,
-                parsed=parsed,
-                iou=float(iou_v),
-                rec_ok=bool(ok),
-                iou_c=float(iou_c),
-                overlay_alpha=alpha,
-                save_dir=vis_dir,
-                **tb_vis_flags(cfg),
+        if log_images and seen < vis_n:
+            vis_cases.append(
+                {
+                    "meta": meta,
+                    "response": text,
+                    "parsed": parsed,
+                    "iou": float(iou_v),
+                    "iou_c": float(iou_c),
+                    "rec_ok": bool(ok),
+                }
             )
         records.append(
             {
@@ -191,6 +183,19 @@ def run_simple_eval(
             }
         )
         seen += 1
+    if vis_cases:
+        vis_dir = os.path.join(
+            str((cfg.get("paths") or {}).get("output_dir") or "."),
+            "eval_steps",
+            f"vis_step{int(global_step):08d}",
+        )
+        log_eval_cases_grid(
+            writer,
+            step=int(global_step),
+            cases=vis_cases,
+            overlay_alpha=alpha,
+            save_dir=vis_dir,
+        )
     n = max(seen, 1)
     mean_iou = float(sum(ious) / len(ious)) if ious else 0.0
     mean_iou_c = float(sum(ious_c) / len(ious_c)) if ious_c else 0.0

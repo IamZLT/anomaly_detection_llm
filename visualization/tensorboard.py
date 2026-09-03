@@ -100,6 +100,30 @@ def hstack_labeled(pairs: List[Tuple[str, Image.Image]], gap: int = 6) -> Image.
     return out
 
 
+def vstack_labeled(pairs: List[Tuple[str, Image.Image]], gap: int = 6) -> Image.Image:
+    """Stack labeled images vertically (one case per row) into a single panel."""
+    if not pairs:
+        return Image.new("RGB", (16, 16), (0, 0, 0))
+    w = max(im.width for _, im in pairs)
+    imgs = []
+    for title, im in pairs:
+        if im.width != w:
+            h = max(1, int(im.height * w / im.width))
+            im = im.resize((w, h), Image.Resampling.BILINEAR)
+        cap = _caption_bar(w, title)
+        canvas = Image.new("RGB", (w, im.height + cap.height), (20, 20, 20))
+        canvas.paste(cap, (0, 0))
+        canvas.paste(im.convert("RGB"), (0, cap.height))
+        imgs.append(canvas)
+    total_h = sum(im.height for im in imgs) + gap * (len(imgs) - 1)
+    out = Image.new("RGB", (w, total_h), (12, 12, 12))
+    y = 0
+    for im in imgs:
+        out.paste(im, (0, y))
+        y += im.height + gap
+    return out
+
+
 def draw_prior_points(image: Image.Image, points_1000: Optional[Sequence[Sequence[int]]], color=(0, 220, 255)) -> Image.Image:
     im = image.copy().convert("RGB")
     if not points_1000:
@@ -208,6 +232,63 @@ def format_grpo_group_text(
     return "\n".join(lines)
 
 
+def _render_case(
+    *,
+    step: int,
+    stage: str,
+    meta: dict,
+    response: str,
+    parsed: dict,
+    iou: float,
+    rec_ok: bool,
+    iou_c: float,
+    overlay_alpha: float,
+):
+    """Build (heatmap_panel, bbox_vis, cot_text) for a single case."""
+    ref = meta.get("ref")
+    test = meta.get("test")
+    heat = meta.get("heatmap")
+    orig = tuple(meta.get("orig_size") or (test.size if test is not None else (1, 1)))
+    pred_px = None
+    cand_px = None
+    if parsed.get("bbox_2d") is not None:
+        pred_px = qwen_norm1000_to_original_pixels(parsed["bbox_2d"], orig)
+    cand_box = parsed.get("candidate_bbox_2d")
+    if cand_box is None:
+        cand_box = parsed.get("candidate_bbox")
+    if cand_box is not None:
+        cand_px = qwen_norm1000_to_original_pixels(cand_box, orig)
+    gt = meta.get("gt_box_px")
+
+    panel = None
+    if ref is not None and test is not None and heat is not None:
+        panel = make_heatmap_panel(
+            ref, test, heat, alpha=overlay_alpha, prior_points=meta.get("prior_points")
+        )
+
+    vis = None
+    if test is not None:
+        vis = draw_case_boxes(
+            test,
+            gt_orig=gt,
+            pred_orig=pred_px,
+            cand_orig=cand_px,
+            orig_wh=orig,
+        )
+
+    cot = format_case_text(
+        step=step,
+        stage=stage,
+        meta=meta,
+        response=response,
+        parsed=parsed,
+        iou=iou,
+        rec_ok=rec_ok,
+        iou_c=iou_c,
+    )
+    return panel, vis, cot
+
+
 def log_heatmap_and_case(
     writer: Optional[SummaryWriter],
     *,
@@ -226,42 +307,7 @@ def log_heatmap_and_case(
 ) -> None:
     if writer is None and not save_dir:
         return
-    ref = meta.get("ref")
-    test = meta.get("test")
-    heat = meta.get("heatmap")
-    orig = tuple(meta.get("orig_size") or (test.size if test is not None else (1, 1)))
-    pred_px = None
-    cand_px = None
-    if parsed.get("bbox_2d") is not None:
-        pred_px = qwen_norm1000_to_original_pixels(parsed["bbox_2d"], orig)
-    cand_box = parsed.get("candidate_bbox_2d")
-    if cand_box is None:
-        cand_box = parsed.get("candidate_bbox")
-    if cand_box is not None:
-        cand_px = qwen_norm1000_to_original_pixels(cand_box, orig)
-    gt = meta.get("gt_box_px")
-
-    panel = None
-    vis = None
-    if ref is not None and test is not None and heat is not None:
-        panel = make_heatmap_panel(
-            ref, test, heat, alpha=overlay_alpha, prior_points=meta.get("prior_points")
-        )
-        if writer is not None and log_heatmap:
-            writer.add_image(f"{tag_prefix}/1_heatmap_compare", pil_to_tb(panel), step)
-
-    if test is not None:
-        vis = draw_case_boxes(
-            test,
-            gt_orig=gt,
-            pred_orig=pred_px,
-            cand_orig=cand_px,
-            orig_wh=orig,
-        )
-        if writer is not None and log_case:
-            writer.add_image(f"{tag_prefix}/2_bbox_vis", pil_to_tb(vis), step)
-
-    cot = format_case_text(
+    panel, vis, cot = _render_case(
         step=step,
         stage=tag_prefix,
         meta=meta,
@@ -270,7 +316,12 @@ def log_heatmap_and_case(
         iou=iou,
         rec_ok=rec_ok,
         iou_c=iou_c,
+        overlay_alpha=overlay_alpha,
     )
+    if writer is not None and log_heatmap and panel is not None:
+        writer.add_image(f"{tag_prefix}/1_heatmap_compare", pil_to_tb(panel), step)
+    if writer is not None and log_case and vis is not None:
+        writer.add_image(f"{tag_prefix}/2_bbox_vis", pil_to_tb(vis), step)
     if writer is not None and log_case:
         writer.add_text(f"{tag_prefix}/3_cot", cot, step)
         writer.flush()
@@ -283,6 +334,56 @@ def log_heatmap_and_case(
             vis.save(os.path.join(save_dir, f"{tag_prefix}_bbox.png"))
         with open(os.path.join(save_dir, f"{tag_prefix}_cot.txt"), "w", encoding="utf-8") as f:
             f.write(cot)
+
+
+def log_eval_cases_grid(
+    writer: Optional[SummaryWriter],
+    *,
+    step: int,
+    cases: List[dict],
+    overlay_alpha: float = 0.45,
+    save_dir: Optional[str] = None,
+) -> None:
+    """Consolidate multiple eval samples into ONE image panel + ONE text panel."""
+    if writer is None and not save_dir:
+        return
+    rows: List[Tuple[str, Image.Image]] = []
+    cot_parts: List[str] = []
+    for ci, c in enumerate(cases):
+        panel, vis, cot = _render_case(
+            step=step,
+            stage=f"eval_case_{ci}",
+            meta=c["meta"],
+            response=c["response"],
+            parsed=c["parsed"],
+            iou=float(c.get("iou", 0.0)),
+            rec_ok=bool(c.get("rec_ok", False)),
+            iou_c=float(c.get("iou_c", 0.0)),
+            overlay_alpha=overlay_alpha,
+        )
+        parts = []
+        if panel is not None:
+            parts.append(("H", panel))
+        if vis is not None:
+            parts.append(("bbox", vis))
+        if parts:
+            meta = c["meta"]
+            title = (
+                f"#{ci} {meta.get('class_name')} gt_anom={meta.get('is_anomaly')} "
+                f"pred={c['parsed'].get('is_anomaly')} iou={float(c.get('iou', 0.0)):.2f} "
+                f"valid={c['parsed'].get('trajectory_valid')}"
+            )
+            rows.append((title, hstack_labeled(parts)))
+        cot_parts.append(cot)
+    if rows and writer is not None:
+        writer.add_image("eval/cases_grid", pil_to_tb(vstack_labeled(rows)), step)
+    if writer is not None:
+        writer.add_text("eval/cases_cot", "\n\n".join(cot_parts), step)
+        writer.flush()
+    if save_dir and rows:
+        import os
+        os.makedirs(save_dir, exist_ok=True)
+        vstack_labeled(rows).save(os.path.join(save_dir, "cases_grid.png"))
 
 
 def log_grpo_run_config(writer: Optional[SummaryWriter], cfg: dict) -> None:
