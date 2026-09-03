@@ -1,4 +1,4 @@
-"""VisA/MVTec samples: normal ref + test + prior heatmap prompt for GRPO."""
+"""VisA/MVTec samples: normal ref + test + prior spatial hint for GRPO."""
 
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 
 from models.qwen35 import qwen_vision_factor
+from models.anomaly_prior import heatmap_to_pil, overlay_heatmap_on_image
+from models.vision_cache import format_prior_hint
 from utils.common import smart_resize
 
 
@@ -69,8 +71,14 @@ def pick_ref_image(
     randomize: bool = False,
     query_size: Optional[tuple] = None,
     topk: int = 5,
+    cands: Optional[List[str]] = None,
 ) -> str:
-    cands = list_normal_refs(cls, dataset_root, query_path, source=source, ref_dir=ref_dir, layout=layout)
+    if cands is None:
+        cands = list_normal_refs(cls, dataset_root, query_path, source=source, ref_dir=ref_dir, layout=layout)
+    else:
+        query_abs = os.path.abspath(query_path)
+        filtered = [p for p in cands if os.path.abspath(p) != query_abs]
+        cands = filtered or list(cands)
     if not cands:
         raise FileNotFoundError(f"no normal reference for class={cls} query={query_path}")
     if not randomize or len(cands) == 1:
@@ -111,7 +119,9 @@ def build_user_prompt(cfg: dict, class_name: str) -> str:
         tmpl = (
             "Image 1 is a defect-free normal reference of a {class_name}. "
             "Image 2 is the inspection sample. "
-            "Image 3 is a normal-test discrepancy prior H (hint only, not a label). "
+            "The <prior_hint> lists high-response points from a normal-test feature discrepancy map. "
+            "These points are only spatial hints and are not defect labels. "
+            "Verify them by comparing Image 1 and Image 2. "
             "Return exactly five XML blocks in order: <compare>, <ground>, <verify>, <boundary>, <answer>. "
             "Do not copy instruction text. Always output all five blocks. "
             "In <compare> write 1-2 sentences of concrete visual differences. "
@@ -126,6 +136,26 @@ def build_user_prompt(cfg: dict, class_name: str) -> str:
     return tmpl.replace("{class_name}", class_name)
 
 
+def build_train_ref_pool(train_samples: List[dict]) -> Dict[str, List[str]]:
+    """Normal images from VisA-train only; VisA-dev must not appear as I_r."""
+    pool: Dict[str, List[str]] = {}
+    seen: Dict[str, set] = {}
+    for s in train_samples:
+        meta = s.get("metadata") or {}
+        if bool(meta.get("anomaly")):
+            continue
+        cls = str(meta.get("class") or "object")
+        path = s.get("full_img_path") or s.get("image")
+        if not path:
+            continue
+        ap = os.path.abspath(str(path))
+        if ap in seen.setdefault(cls, set()):
+            continue
+        seen[cls].add(ap)
+        pool.setdefault(cls, []).append(str(path))
+    return pool
+
+
 def _is_test_path(path: str) -> bool:
     parts = str(path).replace("\\", "/").split("/")
     return "test" in parts
@@ -138,10 +168,12 @@ class PriorCoTDataset(Dataset):
         cfg: dict,
         processor,
         mode: str = "train",
+        ref_pool: Optional[Dict[str, List[str]]] = None,
     ):
         self.cfg = cfg
         self.processor = processor
         self.mode = mode
+        self.ref_pool = ref_pool
         self.max_length = int(cfg.get("training", {}).get("max_length", 2048))
         self.dataset_root = str(cfg.get("paths", {}).get("dataset_root", ""))
         self.source = str(cfg.get("data", {}).get("source_dirname", "mvtec_anomaly_detection"))
@@ -161,6 +193,9 @@ class PriorCoTDataset(Dataset):
         gt_box = meta.get("bbox")
         test = Image.open(str(img_path)).convert("RGB")
         orig_size = test.size
+        pool_cands = None
+        if self.ref_pool is not None:
+            pool_cands = list(self.ref_pool.get(cls) or [])
         ref_path = pick_ref_image(
             cls,
             self.dataset_root,
@@ -171,6 +206,7 @@ class PriorCoTDataset(Dataset):
             randomize=(self.mode == "train" and self.random_train_ref),
             query_size=orig_size,
             topk=self.ref_topk,
+            cands=pool_cands,
         )
         ref = Image.open(ref_path).convert("RGB")
         gt_px = None
@@ -256,12 +292,8 @@ class PriorCollator:
         img_proc = getattr(self.processor, "image_processor", None)
         data = self.cfg.get("data") or {}
         max_size = int(data.get("max_image_size", 448))
-        min_pixels = getattr(img_proc, "min_pixels", None) if img_proc is not None else None
-        max_pixels = getattr(img_proc, "max_pixels", None) if img_proc is not None else None
-        if min_pixels is None:
-            min_pixels = factor * factor
-        if max_pixels is None:
-            max_pixels = max_size * max_size
+        min_pixels = int(getattr(img_proc, "min_pixels", 256 * 256) or (256 * 256))
+        max_pixels = int(getattr(img_proc, "max_pixels", None) or (max_size * max_size))
         test_rs, _, _ = smart_resize(test, max_size=max_size, factor=factor, min_pixels=int(min_pixels), max_pixels=int(max_pixels))
         ref_rs = ref.resize(test_rs.size, Image.Resampling.BICUBIC)
         return ref_rs, test_rs
@@ -277,25 +309,55 @@ class PriorCollator:
                 enc[k] = v[..., :max_length]
         return enc
 
+    def _concat_image_tensors(self, ref_im: Image.Image, test_im: Image.Image) -> dict:
+        img_proc = getattr(self.processor, "image_processor", None)
+        if img_proc is None:
+            raise RuntimeError("processor.image_processor is required for shared vision encode")
+
+        def _pixels(t: torch.Tensor) -> torch.Tensor:
+            if t.ndim == 3:
+                return t.reshape(-1, t.shape[-1])
+            return t
+
+        def _grid(t: torch.Tensor) -> torch.Tensor:
+            if t.ndim == 1:
+                t = t.unsqueeze(0)
+            if t.ndim == 3:
+                t = t.reshape(-1, int(t.shape[-1]))
+            return t
+
+        ref_enc = img_proc(images=ref_im, return_tensors="pt")
+        test_enc = img_proc(images=test_im, return_tensors="pt")
+        if "pixel_values" not in ref_enc or "image_grid_thw" not in ref_enc:
+            raise KeyError(f"image_grid_thw missing; keys={list(ref_enc.keys())}")
+        return {
+            "pixel_values": torch.cat([_pixels(ref_enc["pixel_values"]), _pixels(test_enc["pixel_values"])], dim=0),
+            "image_grid_thw": torch.cat([_grid(ref_enc["image_grid_thw"]), _grid(test_enc["image_grid_thw"])], dim=0),
+        }
+
     def _encode_one(self, item: dict) -> dict:
         device = self._device()
         ref_rs, test_rs = self._align_pair(item["ref"], item["test"])
-        heat, hmap = self.prior.heatmap_image(
-            self.processor,
-            ref_rs,
-            test_rs,
-            device=device,
-            render=self.render,
-            overlay_alpha=self.overlay_alpha,
-        )
-        images = [ref_rs, test_rs, heat]
+        vis_in = self._concat_image_tensors(ref_rs, test_rs)
+        pv = vis_in["pixel_values"].to(device)
+        grid = vis_in["image_grid_thw"].to(device)
+        th, tw = test_rs.size[1], test_rs.size[0]
+        vis = self.prior.encode_pair(pv, grid, upsample_size=(th, tw))
+        hmap = vis["heatmap"]
+        points = vis["prior_points"]
+        merged = vis["merged_embeddings"].detach()
+        if self.render == "overlay":
+            heat = overlay_heatmap_on_image(test_rs, hmap, alpha=self.overlay_alpha)
+        else:
+            heat = heatmap_to_pil(hmap, test_rs.size)
+        user_text = item["prompt"].rstrip() + "\n\n" + format_prior_hint(points)
+        images = [ref_rs, test_rs]
         user = {
             "role": "user",
             "content": [
                 {"type": "image", "image": images[0]},
                 {"type": "image", "image": images[1]},
-                {"type": "image", "image": images[2]},
-                {"type": "text", "text": item["prompt"]},
+                {"type": "text", "text": user_text},
             ],
         }
         messages = [user]
@@ -312,9 +374,29 @@ class PriorCollator:
         except TypeError:
             full = self.processor(text=[text], images=images, return_tensors="pt")
         full = self._clip_text_tensors(full, max_length)
+        proc_grid = full.get("image_grid_thw")
+        if proc_grid is not None:
+            g = proc_grid.detach()
+            if g.ndim == 3:
+                g = g.squeeze(0)
+            merge = max(int(getattr(self.prior, "spatial_merge_size", 2) or 2), 1)
+            n_tok = int((g.prod(dim=-1) // (merge * merge)).sum().item())
+            if n_tok != int(merged.shape[0]):
+                pv2 = full["pixel_values"]
+                if pv2.ndim == 3:
+                    pv2 = pv2.reshape(-1, pv2.shape[-1])
+                vis = self.prior.encode_pair(pv2.to(device), g.to(device), upsample_size=(th, tw))
+                merged = vis["merged_embeddings"].detach()
+                hmap = vis["heatmap"]
+                points = vis["prior_points"]
+                if self.render == "overlay":
+                    heat = overlay_heatmap_on_image(test_rs, hmap, alpha=self.overlay_alpha)
+                else:
+                    heat = heatmap_to_pil(hmap, test_rs.size)
         out = {k: v.squeeze(0) if isinstance(v, torch.Tensor) and v.shape[0] == 1 else v for k, v in full.items()}
         prompt_ids = out["input_ids"]
         out["prompt_len"] = torch.tensor(int(prompt_ids.numel()), dtype=torch.long)
+        out["image_embeds"] = merged.cpu()
         out["_meta"] = {
             "orig_size": item["orig_size"],
             "gt_box_px": item["gt_box_px"],
@@ -326,6 +408,7 @@ class PriorCollator:
             "test": test_rs,
             "heatmap": heat,
             "hmap_tensor": hmap.detach().cpu(),
+            "prior_points": points,
             "vision_size": test_rs.size,
         }
         return out
@@ -340,6 +423,8 @@ class PriorCollator:
                 pad_val = -100 if k == "labels" else (0 if k == "attention_mask" else int(self.pad_token_id))
                 out[k] = pad_sequence(vals, batch_first=True, padding_value=pad_val)
             elif k == "pixel_values":
+                out[k] = torch.cat([v if v.ndim == 2 else v.reshape(-1, v.shape[-1]) for v in vals], dim=0)
+            elif k == "image_embeds":
                 out[k] = torch.cat([v if v.ndim == 2 else v.reshape(-1, v.shape[-1]) for v in vals], dim=0)
             elif k == "image_grid_thw":
                 stacked = []

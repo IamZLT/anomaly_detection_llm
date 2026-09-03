@@ -49,10 +49,23 @@ def apply_processor_geometry(processor, cfg: dict, visual=None) -> int:
     factor = qwen_vision_factor(processor, visual)
     data = cfg.get("data") or {}
     max_size = int(data.get("max_image_size", 448))
-    max_pixels = data.get("max_pixels")
-    min_pixels = data.get("min_pixels")
-    max_pixels = int(max_pixels) if max_pixels not in (None, "", "null", "None") else max_size * max_size
-    min_pixels = int(min_pixels) if min_pixels not in (None, "", "null", "None") else factor * factor
+    size = getattr(img, "size", None)
+    official_min_pixels = None
+    if isinstance(size, dict):
+        official_min_pixels = size.get("shortest_edge")
+    if official_min_pixels is None:
+        official_min_pixels = getattr(img, "min_pixels", None)
+    if official_min_pixels is None:
+        official_min_pixels = 256 * 256
+    cfg_min = data.get("min_pixels")
+    cfg_max = data.get("max_pixels")
+    min_pixels = (
+        int(cfg_min) if cfg_min not in (None, "", "null", "None") else int(official_min_pixels)
+    )
+    max_pixels = (
+        int(cfg_max) if cfg_max not in (None, "", "null", "None") else max_size * max_size
+    )
+    min_pixels = min(min_pixels, max_pixels)
     if hasattr(img, "min_pixels"):
         img.min_pixels = int(min_pixels)
     if hasattr(img, "max_pixels"):

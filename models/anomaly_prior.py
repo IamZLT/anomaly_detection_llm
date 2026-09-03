@@ -20,6 +20,7 @@ from torch import nn
 
 
 from models.qwen35 import unwrap_qwen_core
+from models.vision_cache import topk_spatial_points
 
 
 def get_qwen_visual(qwen: nn.Module) -> nn.Module:
@@ -108,7 +109,7 @@ def overlay_heatmap_on_image(image: Image.Image, heatmap: torch.Tensor, alpha: f
 
 
 class AnomalyPrior(nn.Module):
-    """Frozen vision encoder → one anomaly heatmap. No trainable parameters."""
+    """Frozen vision encoder → H from layers 12/16/20/24, plus merger tokens V_r, V_t."""
 
     def __init__(self, visual: nn.Module, cfg: dict):
         super().__init__()
@@ -123,6 +124,8 @@ class AnomalyPrior(nn.Module):
         self.spatial_merge_size = int(
             getattr(visual, "spatial_merge_size", getattr(visual.config, "spatial_merge_size", 2))
         )
+        self.hint_topk = int(prior_cfg.get("hint_topk", 5))
+        self.hint_nms_radius = int(prior_cfg.get("hint_nms_radius", 2))
 
         for p in self.visual.parameters():
             p.requires_grad = False
@@ -132,11 +135,11 @@ class AnomalyPrior(nn.Module):
     def from_qwen(cls, qwen: nn.Module, cfg: dict) -> "AnomalyPrior":
         return cls(get_qwen_visual(qwen), cfg)
 
-    def _encode_layers(
+    def _encode_one(
         self,
         pixel_values: torch.Tensor,
         image_grid_thw: torch.Tensor,
-    ) -> Tuple[List[torch.Tensor], Tuple[int, int]]:
+    ) -> Tuple[List[torch.Tensor], Tuple[int, int], torch.Tensor]:
         try:
             from transformers.models.qwen3_5.modeling_qwen3_5 import (
                 get_vision_bilinear_indices_and_weights,
@@ -178,6 +181,7 @@ class AnomalyPrior(nn.Module):
         if missing:
             raise RuntimeError(f"vision blocks missing {missing}; valid 0..{len(visual.blocks) - 1}")
 
+        merged = visual.merger(hs)
         t = int(image_grid_thw[0, 0])
         th, tw = int(image_grid_thw[0, 1]), int(image_grid_thw[0, 2])
         m = self.spatial_merge_size
@@ -187,7 +191,7 @@ class AnomalyPrior(nn.Module):
             if t == 1 and tok.shape[0] == th * tw and th % m == 0 and tw % m == 0:
                 tok = unpack_merge_order(tok, th, tw, m)
             feats.append(tok)
-        return feats, (th, tw)
+        return feats, (th, tw), merged
 
     def _nn_map(
         self,
@@ -239,8 +243,8 @@ class AnomalyPrior(nn.Module):
         upsample_size: Optional[Tuple[int, int]] = None,
     ) -> Dict[str, Any]:
         self.visual.eval()
-        f_r_layers, hw_r = self._encode_layers(ref_pixel_values, ref_grid_thw)
-        f_t_layers, hw_t = self._encode_layers(test_pixel_values, test_grid_thw)
+        f_r_layers, hw_r, v_r = self._encode_one(ref_pixel_values, ref_grid_thw)
+        f_t_layers, hw_t, v_t = self._encode_one(test_pixel_values, test_grid_thw)
         maps = [
             self._nn_map(ft, fr, hw_t, hw_r, self.neighborhood_radius)
             for ft, fr in zip(f_t_layers, f_r_layers)
@@ -250,12 +254,41 @@ class AnomalyPrior(nn.Module):
         heatmap = anomaly.unsqueeze(0).unsqueeze(0)
         if upsample_size is not None:
             heatmap = F.interpolate(heatmap, size=upsample_size, mode="bilinear", align_corners=False)
+        prior_points = topk_spatial_points(anomaly, k=self.hint_topk, nms_radius=self.hint_nms_radius)
         return {
             "heatmap": heatmap.squeeze(0).squeeze(0),
             "patch_map": anomaly,
             "grid_hw": hw_t,
             "ref_grid_hw": hw_r,
+            "ref_merged": v_r,
+            "test_merged": v_t,
+            "merged_embeddings": torch.cat([v_r, v_t], dim=0),
+            "prior_points": prior_points,
         }
+
+    @torch.no_grad()
+    def encode_pair(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+        upsample_size: Optional[Tuple[int, int]] = None,
+    ) -> Dict[str, Any]:
+        """One frozen ViT pass per image → layers for H and merger tokens for the LLM."""
+        if image_grid_thw.ndim == 1:
+            image_grid_thw = image_grid_thw.unsqueeze(0)
+        if int(image_grid_thw.shape[0]) != 2:
+            raise ValueError(f"encode_pair expects 2 images, got grid {tuple(image_grid_thw.shape)}")
+        counts = [int(x) for x in image_grid_thw.prod(dim=-1).tolist()]
+        chunks = torch.split(pixel_values, counts, dim=0)
+        if len(chunks) != 2:
+            raise ValueError(f"pixel_values split into {len(chunks)} images, expected 2")
+        return self.forward(
+            chunks[0],
+            image_grid_thw[0:1],
+            chunks[1],
+            image_grid_thw[1:2],
+            upsample_size=upsample_size,
+        )
 
     @torch.no_grad()
     def heatmap_image(

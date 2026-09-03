@@ -19,6 +19,9 @@ _COPY_MARKERS = (
     "xml blocks",
     "output exactly one json",
     "candidate_bbox_2d=[x1,y1,x2,y2]",
+    "only spatial hints",
+    "not defect labels",
+    "high_response_points_2d",
 )
 TAG_BLOCK_RE = re.compile(
     r"<(compare|ground|verify|boundary|answer)\s*>(.*?)</\1>",
@@ -248,7 +251,10 @@ def _trajectory_valid(
     answer: Dict[str, Any],
 ) -> bool:
     pred_cls = answer.get("is_anomaly")
-    prose_ok = structural_prose_ok(tags.get("compare", "")) and structural_prose_ok(tags.get("verify", ""))
+    compare_ok = structural_prose_ok(tags.get("compare", ""))
+    ground_ok = structural_prose_ok(tags.get("ground", ""))
+    verify_ok = structural_prose_ok(tags.get("verify", ""))
+    prose_ok = compare_ok and ground_ok and verify_ok
     if pred_cls is False:
         return (
             has_tags
@@ -300,7 +306,9 @@ def _pack_parsed(
         "bbox_2d": answer.get("bbox_2d"),
         "final_bbox_state": answer.get("final_bbox_state"),
         "answer_state": answer.get("answer_state"),
-        "prose_ok": structural_prose_ok(tags.get("compare", "")) and structural_prose_ok(tags.get("verify", "")),
+        "prose_ok": structural_prose_ok(tags.get("compare", ""))
+        and structural_prose_ok(tags.get("ground", ""))
+        and structural_prose_ok(tags.get("verify", "")),
         "trajectory_valid": _trajectory_valid(
             has_tags=has_tags,
             tags=tags,
@@ -470,86 +478,4 @@ def parse_cot_output_tolerant(text: str) -> Dict[str, Any]:
     if json_obj and not tags:
         packed["raw"] = json_obj
     return packed
-
-
-_EDGE_CN = {"L": "左", "R": "右", "T": "上", "B": "下"}
-_DIR_CN = {"inward": "向内收", "outward": "向外扩", "keep": "保持"}
-_PROTOCOL_LINE_RE = re.compile(
-    r"^\s*(?:candidate_bbox_2d|candidate_bbox|bbox_2d|final_bbox|bbox|is_anomaly|left|right|top|bottom)\s*=.*$",
-    re.IGNORECASE | re.MULTILINE,
-)
-
-
-def _tag_prose(chunk: str) -> str:
-    s = _PROTOCOL_LINE_RE.sub("", chunk or "").strip()
-    s = re.sub(r"\n{2,}", "\n", s).strip()
-    return s
-
-
-def _box_where(box) -> str:
-    if not isinstance(box, (list, tuple)) or len(box) != 4:
-        return ""
-    try:
-        x1, y1, x2, y2 = map(float, box)
-    except (TypeError, ValueError):
-        return ""
-    cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
-    loc_x = "左侧" if cx < 350 else ("右侧" if cx > 650 else "水平居中")
-    loc_y = "上部" if cy < 350 else ("下部" if cy > 650 else "垂直居中")
-    return f"{loc_y}{loc_x}  [{x1:.0f},{y1:.0f},{x2:.0f},{y2:.0f}]"
-
-
-def format_parsed_explain(parsed: Dict[str, Any]) -> str:
-    """Show the model's visual defect description plus compact box/decision summary."""
-    tags = parsed.get("tags") or {}
-    compare = _tag_prose(tags.get("compare", ""))
-    ground = _tag_prose(tags.get("ground", ""))
-    verify = _tag_prose(tags.get("verify", ""))
-    pred = parsed.get("is_anomaly")
-    if pred is True:
-        cls_s = "异常"
-    elif pred is False:
-        cls_s = "正常"
-    else:
-        cls_s = "未判定"
-
-    cand = parsed.get("candidate_bbox_2d")
-    if cand is None:
-        cand = parsed.get("candidate_bbox")
-    final = parsed.get("bbox_2d")
-    bound = parsed.get("boundary") or {}
-    if bound:
-        bound_s = " ".join(f"{_EDGE_CN.get(k, k)}={_DIR_CN.get(v, v)}" for k, v in bound.items())
-    else:
-        bound_s = "无"
-
-    lines = ["=== 缺陷描述 ==="]
-    if compare:
-        lines.append(f"比较: {compare}")
-    else:
-        lines.append("比较: （<compare> 中没有对 Image 1/2 的具体描述）")
-    if ground:
-        lines.append(f"定位: {ground}")
-    else:
-        lines.append("定位: （<ground> 中没有缺陷区域描述）")
-    if verify:
-        lines.append(f"复核: {verify}")
-    else:
-        lines.append("复核: （<verify> 中没有复核说明）")
-    lines.append(f"判定: {cls_s}")
-    lines.append(
-        f"轨迹: tags={bool(parsed.get('has_tags'))} valid={bool(parsed.get('trajectory_valid'))} "
-        f"Bc={parsed.get('candidate_bbox_state')} D={parsed.get('boundary_state')} "
-        f"ans={parsed.get('answer_state')} Bf={parsed.get('final_bbox_state')}"
-    )
-    if cand:
-        lines.append(f"候选区域: {_box_where(cand)}")
-    else:
-        lines.append("候选区域: 无")
-    if final:
-        lines.append(f"最终区域: {_box_where(final)}")
-    else:
-        lines.append("最终区域: 无")
-    lines.append(f"边界调整: {bound_s}")
-    return "\n".join(lines)
 

@@ -11,7 +11,7 @@ from PIL import Image, ImageDraw, ImageFont
 from torch.utils.tensorboard import SummaryWriter
 
 from utils.common import qwen_norm1000_to_original_pixels
-from reasoning.parser import format_parsed_explain, parse_cot_output, rollout_protocol_stats
+from reasoning.parser import parse_cot_output, rollout_protocol_stats
 
 
 def _font(size: int = 16):
@@ -100,15 +100,41 @@ def hstack_labeled(pairs: List[Tuple[str, Image.Image]], gap: int = 6) -> Image.
     return out
 
 
-def make_heatmap_panel(ref: Image.Image, test: Image.Image, heat: Image.Image, alpha: float = 0.45) -> Image.Image:
+def draw_prior_points(image: Image.Image, points_1000: Optional[Sequence[Sequence[int]]], color=(0, 220, 255)) -> Image.Image:
+    im = image.copy().convert("RGB")
+    if not points_1000:
+        return im
+    draw = ImageDraw.Draw(im)
+    w, h = im.size
+    for p in points_1000:
+        if p is None or len(p) < 2:
+            continue
+        x = int(round(float(p[0]) / 1000.0 * w))
+        y = int(round(float(p[1]) / 1000.0 * h))
+        r = 5
+        draw.ellipse((x - r, y - r, x + r, y + r), outline=color, width=2)
+        draw.line((x - 7, y, x + 7, y), fill=color, width=2)
+        draw.line((x, y - 7, x, y + 7), fill=color, width=2)
+    return im
+
+
+def make_heatmap_panel(
+    ref: Image.Image,
+    test: Image.Image,
+    heat: Image.Image,
+    alpha: float = 0.45,
+    prior_points: Optional[Sequence[Sequence[int]]] = None,
+) -> Image.Image:
     heat_rs = heat.convert("RGB").resize(test.size, Image.Resampling.BILINEAR)
     overlay = Image.blend(test.convert("RGB"), heat_rs, float(np.clip(alpha, 0.0, 1.0)))
+    overlay = draw_prior_points(overlay, prior_points)
+    test_pts = draw_prior_points(test, prior_points)
     return hstack_labeled(
         [
             ("REF (normal)", ref),
-            ("TEST", test),
+            ("TEST", test_pts),
             ("PRIOR H", heat_rs),
-            ("TEST + H", overlay),
+            ("TEST + H + P_H", overlay),
         ]
     )
 
@@ -147,11 +173,7 @@ def format_case_text(
         f"class={meta.get('class_name')} anomaly_gt={meta.get('is_anomaly')} rec_ok={rec_ok} "
         f"iou_f={iou:.3f} iou_c={iou_c:.3f}",
         "",
-        "=== model CoT ===",
-        (response or "")[:4000],
-        "",
-        "=== parsed ===",
-        format_parsed_explain(parsed),
+        response or "",
     ]
     return "\n".join(lines)
 
@@ -219,7 +241,9 @@ def log_heatmap_and_case(
     panel = None
     vis = None
     if ref is not None and test is not None and heat is not None:
-        panel = make_heatmap_panel(ref, test, heat, alpha=overlay_alpha)
+        panel = make_heatmap_panel(
+            ref, test, heat, alpha=overlay_alpha, prior_points=meta.get("prior_points")
+        )
         if writer is not None and log_heatmap:
             writer.add_image(f"{tag_prefix}/1_heatmap_compare", pil_to_tb(panel), step)
 

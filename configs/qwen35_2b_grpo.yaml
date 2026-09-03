@@ -41,7 +41,9 @@ prior:
   layer_indices: [12, 16, 20, 24]
   softmax_temperature: 0.5      # DualBrain fusion_temperature（作用在层间距离图上）
   neighborhood_radius: 0        # 0 = 对整张正常参考图做全局 patch NN（DualBrain gallery）
-  render: colormap          # colormap | overlay
+  hint_topk: 5                  # H → K soft spatial anchors in 0-1000
+  hint_nms_radius: 2            # local-max NMS window in patch cells
+  render: colormap              # TensorBoard only; H is not a third RGB image
   overlay_alpha: 0.45
 
 lora:
@@ -94,7 +96,10 @@ prompt:
   user: |
     Image 1 is a defect-free normal reference of a {class_name}.
     Image 2 is the inspection sample.
-    Image 3 is a normal-test discrepancy prior H. H is only a spatial hint and is not a defect label.
+
+    The <prior_hint> lists high-response points from a normal-test feature discrepancy map H.
+    These points are only spatial hints. They are not defect labels.
+    Verify them by comparing Image 1 and Image 2.
 
     Compare Image 2 with Image 1 and determine whether Image 2 contains a true anomaly.
 

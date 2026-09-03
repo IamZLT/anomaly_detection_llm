@@ -51,7 +51,7 @@ def qwen_smart_hw(
     height: int,
     width: int,
     factor: int = 32,
-    min_pixels: int = 32 * 32,
+    min_pixels: int = 256 * 256,
     max_pixels: int = 448 * 448,
 ) -> Tuple[int, int]:
     """Official Qwen-VL smart_resize: both sides divisible by factor, pixels in [min, max].
@@ -93,7 +93,7 @@ def smart_resize(
     if max_pixels is None:
         max_pixels = int(max_size) * int(max_size)
     if min_pixels is None:
-        min_pixels = factor * factor
+        min_pixels = 256 * 256
     new_h, new_w = qwen_smart_hw(h, w, factor=factor, min_pixels=min_pixels, max_pixels=max_pixels)
     new_w = max(new_w, factor)
     new_h = max(new_h, factor)

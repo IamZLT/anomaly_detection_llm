@@ -19,6 +19,7 @@ from evaluation.metrics import (
     summarize_detection_metrics,
 )
 from models.qwen35 import force_vision_eval
+from models.vision_cache import bind_cached_image_features
 from reasoning.parser import parse_cot_output
 from reasoning.rewards import box_iou, qwen1000_to_pixels_strict, valid_bbox_1000
 from rl.grpo import model_inputs, move_batch, unwrap_model
@@ -82,13 +83,14 @@ def run_simple_eval(
         device = next(model.parameters()).device
         batch = move_batch(batch, device)
         gen_in = model_inputs(batch)
-        outputs = model.generate(
-            **gen_in,
-            max_new_tokens=int(inf.get("max_new_tokens", 512)),
-            temperature=float(inf.get("temperature", 0.0)),
-            top_p=float(inf.get("top_p", 0.9)),
-            do_sample=bool(inf.get("do_sample", False)),
-        )
+        with bind_cached_image_features(model, batch.get("image_embeds")):
+            outputs = model.generate(
+                **gen_in,
+                max_new_tokens=int(inf.get("max_new_tokens", 512)),
+                temperature=float(inf.get("temperature", 0.0)),
+                top_p=float(inf.get("top_p", 0.9)),
+                do_sample=bool(inf.get("do_sample", False)),
+            )
         prompt_len = int(batch["prompt_len"][0].item()) if "prompt_len" in batch else int(batch["input_ids"].shape[1])
         text = tok.decode(outputs[0][prompt_len:], skip_special_tokens=True)
         meta = batch["_meta"][0]
@@ -253,13 +255,14 @@ def log_grpo_probe_cot(
     inf = cfg.get("inference") or {}
     was_training = model.training
     model.eval()
-    outputs = model.generate(
-        **gen_in,
-        max_new_tokens=max_new,
-        do_sample=False,
-        temperature=0.0,
-        top_p=float(inf.get("top_p", 0.9)),
-    )
+    with bind_cached_image_features(model, batch.get("image_embeds")):
+        outputs = model.generate(
+            **gen_in,
+            max_new_tokens=max_new,
+            do_sample=False,
+            temperature=0.0,
+            top_p=float(inf.get("top_p", 0.9)),
+        )
     tok = getattr(processor, "tokenizer", processor)
     prompt_len = int(batch["prompt_len"][0].item())
     seq = outputs[0]

@@ -14,7 +14,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from data.prior_dataset import PriorCollator, PriorCoTDataset
+from data.prior_dataset import PriorCollator, PriorCoTDataset, build_train_ref_pool
 from data.scan import load_prior_split, split_holdout_by_class
 from evaluation.evaluator import (
     first_anomaly_item,
@@ -27,6 +27,7 @@ from evaluation.metrics import defect_size_bin, gt_relative_area, is_truncated
 from models.anomaly_prior import AnomalyPrior
 from models.lora import apply_lora
 from models.qwen35 import freeze_vision_encoder, force_vision_eval, setup_model_and_processor
+from models.vision_cache import bind_cached_image_features
 from reasoning.parser import parse_cot_output, rollout_protocol_stats
 from reasoning.rewards import compute_rewards
 from rl.grpo import (
@@ -127,6 +128,8 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
     t0 = time.time()
     epoch = 0
     opt_step = 0
+    step = 0
+    attempt_step = 0
     last_gnorm: Optional[float] = None
     param_map = grpo_param_map(
         gcfg, lr=lr, accum=accum, group=group, temperature=temperature, top_p=top_p, max_new=max_new
@@ -153,23 +156,24 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
             it = iter(loader)
             return next(it)
 
-    def _generate_group(gen_in, prompt_len: int):
+    def _generate_group(gen_in, prompt_len: int, image_embeds=None):
         m = unwrap_model(model)
         was_training = m.training
         m.eval()
         seqs, texts = [], []
         with torch.no_grad():
-            for _ in range(group):
-                out_ids = m.generate(
-                    **gen_in,
-                    max_new_tokens=max_new,
-                    do_sample=True,
-                    temperature=temperature,
-                    top_p=top_p,
-                    num_return_sequences=1,
-                )
-                seqs.append(out_ids[0].detach())
-                texts.append(tok.decode(out_ids[0][prompt_len:], skip_special_tokens=True))
+            with bind_cached_image_features(m, image_embeds):
+                for _ in range(group):
+                    out_ids = m.generate(
+                        **gen_in,
+                        max_new_tokens=max_new,
+                        do_sample=True,
+                        temperature=temperature,
+                        top_p=top_p,
+                        num_return_sequences=1,
+                    )
+                    seqs.append(out_ids[0].detach())
+                    texts.append(tok.decode(out_ids[0][prompt_len:], skip_special_tokens=True))
         if was_training:
             m.train()
             force_vision_eval(m)
@@ -192,7 +196,8 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
             )
         return details, parsed_list
 
-    for step in range(1, max_steps + 1):
+    while step < max_steps:
+        attempt_step += 1
         raw_batch = pending_retry
         pending_retry = None
         from_requeue = raw_batch is not None
@@ -200,6 +205,7 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
             raw_batch = _next_batch()
         batch = move_batch(raw_batch, device)
         gen_in = model_inputs(batch)
+        vision_cache = batch.get("image_embeds")
         prompt_len = int(batch["prompt_len"][0].item())
         pad_id = tok.pad_token_id or tok.eos_token_id
         meta = batch["_meta"][0]
@@ -213,7 +219,7 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
         resample_n = 0
         skipped = False
         for attempt in range(attempts + 1):
-            seqs, texts = _generate_group(gen_in, prompt_len)
+            seqs, texts = _generate_group(gen_in, prompt_len, vision_cache)
             details, parsed_list = _score_group(texts, meta)
             std_g = group_std([float(d.get("R_ground", 0.0)) for d in details])
             std_r = group_std([float(d.get("R_reason", 0.0)) for d in details])
@@ -226,8 +232,6 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
             skipped = True
         if skipped:
             resample_n = attempts
-            if bool(meta.get("is_anomaly")) and not from_requeue:
-                pending_retry = raw_batch
 
         r_ground = torch.tensor([float(d.get("R_ground", 0.0)) for d in details], device=device, dtype=torch.float32)
         r_reason = torch.tensor([float(d.get("R_reason", 0.0)) for d in details], device=device, dtype=torch.float32)
@@ -254,9 +258,10 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
             adv_tok = torch.zeros_like(old_lp)
             seq_lp = torch.zeros(group, device=device)
         else:
-            old_lp, lp_mask = token_logprobs_nograd(model, gen_in, outputs, attn, labels)
-            with disable_adapter_ctx(model):
-                ref_lp, _ = token_logprobs_nograd(model, gen_in, outputs, attn, labels)
+            with bind_cached_image_features(model, vision_cache):
+                old_lp, lp_mask = token_logprobs_nograd(model, gen_in, outputs, attn, labels)
+                with disable_adapter_ctx(model):
+                    ref_lp, _ = token_logprobs_nograd(model, gen_in, outputs, attn, labels)
             ref_gap = float(((old_lp - ref_lp).abs() * lp_mask).sum() / lp_mask.sum().clamp(min=1))
             adv_tok = build_segment_advantages(
                 tok,
@@ -296,7 +301,7 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
         n_pe = max(policy_epochs, 1)
         opt.zero_grad(set_to_none=True)
         if not all_skipped:
-            with dropout_eval(model):
+            with dropout_eval(model), bind_cached_image_features(model, vision_cache):
                 for pe in range(n_pe):
                     pe_loss = pe_pg = pe_kl = pe_rho = pe_clip = 0.0
                     for i in range(group):
@@ -361,6 +366,18 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
         ref_gap = avg_across_ranks(ref_gap, device)
         proto_avg = {k: avg_across_ranks(float(v), device) for k, v in proto_stats.items()}
 
+        if skipped and bool(meta.get("is_anomaly")) and not from_requeue:
+            pending_retry = raw_batch
+
+        # Only all-rank skips omit an official step. Mixed DDP must still advance
+        # together so world size stays in the same while-loop / barrier cadence.
+        if all_skipped:
+            if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+                dist.barrier()
+            continue
+
+        step += 1
+
         if is_main_process():
             log_grpo_scalars(
                 writer,
@@ -404,6 +421,7 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                     "size_medium": 1.0 if size_bin == "medium" else 0.0,
                     "size_large": 1.0 if size_bin == "large" else 0.0,
                     "from_requeue": 1.0 if from_requeue else 0.0,
+                    "attempt_step": float(attempt_step),
                     **{k: float(v) for k, v in proto_avg.items()},
                 },
             )
@@ -411,7 +429,7 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                 n = max(group, 1)
                 skip_s = " all_skip" if all_skipped else (" skip" if skipped else "")
                 train_log(
-                    f"[grpo] step={step}/{max_steps} opt={opt_step} loss={loss_v:.4f} "
+                    f"[grpo] step={step}/{max_steps} att={attempt_step} opt={opt_step} loss={loss_v:.4f} "
                     f"pg={pg_v:.4f} kl={kl_v:.4f} rho={rho_v:.3f} clip={clip_v:.3f} "
                     f"Rf={r_mean:.3f}±{r_std:.3f} "
                     f"Rg={sum(d.get('R_ground', 0.0) for d in details)/n:.3f} "
@@ -569,6 +587,7 @@ def train_main(cfg: dict) -> None:
     train_samples, dev_samples = split_holdout_by_class(
         train_samples, holdout, seed=int(cfg["training"]["seed"])
     )
+    train_ref_pool = build_train_ref_pool(train_samples)
     n_tr_anom = sum(1 for s in train_samples if bool((s.get("metadata") or {}).get("anomaly")))
     n_dev_anom = sum(1 for s in dev_samples if bool((s.get("metadata") or {}).get("anomaly")))
     n_ev_anom = sum(1 for s in test_samples if bool((s.get("metadata") or {}).get("anomaly")))
@@ -580,6 +599,7 @@ def train_main(cfg: dict) -> None:
             f"train={len(train_samples)} (anom={n_tr_anom}) "
             f"visadev={len(dev_samples)} (anom={n_dev_anom}) "
             f"mvtec={len(test_samples)} (anom={n_ev_anom}) "
+            f"train_ref_pool={sum(len(v) for v in train_ref_pool.values())} "
             f"train_layout={train_layout} eval_layout={eval_layout}",
             main_only=True,
         )
@@ -599,11 +619,11 @@ def train_main(cfg: dict) -> None:
             find_unused_parameters=bool(cfg.get("distributed", {}).get("ddp_find_unused_parameters", False)),
         )
 
-    train_set = PriorCoTDataset(train_samples, cfg, processor, mode="train")
+    train_set = PriorCoTDataset(train_samples, cfg, processor, mode="train", ref_pool=train_ref_pool)
     eval_collate = PriorCollator(processor, prior, cfg)
     eval_loader = None
     if dev_samples:
-        dev_set = PriorCoTDataset(dev_samples, cfg, processor, mode="eval")
+        dev_set = PriorCoTDataset(dev_samples, cfg, processor, mode="eval", ref_pool=train_ref_pool)
         eval_loader = DataLoader(dev_set, batch_size=1, shuffle=False, collate_fn=eval_collate, num_workers=0)
     test_set = PriorCoTDataset(test_samples, cfg, processor, mode="eval")
     test_loader = DataLoader(test_set, batch_size=1, shuffle=False, collate_fn=eval_collate, num_workers=0)

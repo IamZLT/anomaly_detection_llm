@@ -30,7 +30,7 @@ def move_batch(batch: dict, device: torch.device) -> dict:
 
 
 def model_inputs(batch: dict) -> dict:
-    skip = {"labels", "_meta", "prompt_len"}
+    skip = {"labels", "_meta", "prompt_len", "image_embeds"}
     return {k: v for k, v in batch.items() if k not in skip and torch.is_tensor(v)}
 
 

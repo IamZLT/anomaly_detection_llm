@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import torch
 
+from data.prior_dataset import build_train_ref_pool, build_user_prompt, pick_ref_image
 from evaluation.metrics import defect_size_bin, gt_relative_area, summarize_detection_metrics
+from models.qwen35 import apply_processor_geometry
+from models.vision_cache import format_prior_hint, topk_spatial_points
 from reasoning.parser import parse_answer_block, parse_cot_output, parse_bbox_field
 from reasoning.rewards import (
     boundary_action_consistency,
     compute_rewards,
     edge_precision_reward,
 )
-from rl.grpo import padded_completion_tensors
+from rl.grpo import model_inputs, padded_completion_tensors
 from utils.common import qwen_smart_hw
 
 ANOM = """
@@ -92,6 +95,16 @@ def test_trajectory_and_prose_gate():
     assert not parse_cot_output(copied)["trajectory_valid"]
 
 
+def test_ground_bbox_only_fails_trajectory():
+    ground_only = ANOM.replace(
+        "The most suspicious region is concentrated around the damaged bottle body.\n",
+        "",
+    )
+    p = parse_cot_output(ground_only)
+    assert not p["prose_ok"]
+    assert not p["trajectory_valid"]
+
+
 def test_invalid_not_cheaper_than_wrong():
     cfg = {"grpo": {"reward": {"invalid_output": -1.0, "wrong_decision": -1.0}}}
     orig = (1000, 1000)
@@ -140,6 +153,103 @@ def test_size_bins_and_gated_miou():
     s = summarize_detection_metrics(rows)
     assert abs(s["mean_iou"] - 0.75) < 1e-6
     assert abs(s["mean_iou_gated"] - 0.3) < 1e-6
+
+
+def test_processor_null_min_pixels_uses_official_floor():
+    class _Img:
+        patch_size = 16
+        merge_size = 2
+        size = {"shortest_edge": 65536, "longest_edge": 1280 * 28 * 28}
+        min_pixels = 1024
+        max_pixels = 1280 * 28 * 28
+
+    class _Proc:
+        image_processor = _Img()
+
+    proc = _Proc()
+    apply_processor_geometry(
+        proc,
+        {"data": {"max_image_size": 448, "min_pixels": None, "max_pixels": None}},
+    )
+    assert proc.image_processor.min_pixels == 65536
+    assert proc.image_processor.max_pixels == 448 * 448
+
+
+def test_processor_missing_official_min_defaults_to_256sq():
+    class _Img:
+        patch_size = 16
+        merge_size = 2
+        size = "square"
+        min_pixels = None
+        max_pixels = None
+
+    class _Proc:
+        image_processor = _Img()
+
+    proc = _Proc()
+    apply_processor_geometry(proc, {"data": {"max_image_size": 448}})
+    assert proc.image_processor.min_pixels == 256 * 256
+    assert proc.image_processor.max_pixels == 448 * 448
+
+
+def test_train_ref_pool_excludes_dev_and_anomalies():
+    train = [
+        {"metadata": {"anomaly": False, "class": "pcb"}, "full_img_path": "/visa/pcb/n_train.png"},
+        {"metadata": {"anomaly": True, "class": "pcb"}, "full_img_path": "/visa/pcb/a_train.png"},
+    ]
+    pool = build_train_ref_pool(train)
+    assert pool["pcb"] == ["/visa/pcb/n_train.png"]
+    picked = pick_ref_image(
+        "pcb",
+        "/unused",
+        "/visa/pcb/query.png",
+        cands=pool.get("pcb", []),
+    )
+    assert picked == "/visa/pcb/n_train.png"
+    try:
+        pick_ref_image("pcb", "/unused", "/q.png", cands=[])
+        raise AssertionError("empty pool must not scan disk")
+    except FileNotFoundError:
+        pass
+
+
+def test_topk_spatial_nms_and_prior_hint():
+    h = torch.zeros(8, 8)
+    h[2, 2] = 1.0
+    h[2, 3] = 0.95
+    h[6, 6] = 0.8
+    pts = topk_spatial_points(h, k=2, nms_radius=1)
+    assert len(pts) == 2
+    assert pts[0] == [int(round(2.5 / 8 * 1000)), int(round(2.5 / 8 * 1000))]
+    assert pts[1] == [int(round(6.5 / 8 * 1000)), int(round(6.5 / 8 * 1000))]
+    text = format_prior_hint(pts)
+    assert text.startswith("<prior_hint>")
+    assert "high_response_points_2d=" in text
+    assert "</prior_hint>" in text
+
+
+def test_prompt_is_two_images_plus_spatial_hint():
+    text = build_user_prompt({"prompt": {}}, "bottle")
+    assert "Image 1" in text and "Image 2" in text
+    assert "Image 3" not in text
+    assert "spatial hint" in text.lower()
+
+
+def test_model_inputs_drops_image_embeds():
+    ids = torch.zeros(1, 4, dtype=torch.long)
+    cache = torch.randn(6, 8)
+    out = model_inputs(
+        {
+            "input_ids": ids,
+            "image_embeds": cache,
+            "labels": torch.zeros_like(ids),
+            "_meta": [{"x": 1}],
+            "prompt_len": torch.tensor([4]),
+        }
+    )
+    assert "image_embeds" not in out
+    assert "labels" not in out
+    assert "input_ids" in out
 
 
 def test_pad_id_equals_eos_keeps_real_eos():
