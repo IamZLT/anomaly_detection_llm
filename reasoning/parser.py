@@ -22,7 +22,10 @@ _COPY_MARKERS = (
     "only spatial hints",
     "not defect labels",
     "high_response_points_2d",
+    "one concise sentence describing the defect",
+    "one concise sentence stating that no clear defect",
 )
+ANSWER_DESC_MIN_CHARS = 24
 TAG_BLOCK_RE = re.compile(
     r"<(compare|ground|verify|boundary|answer)\s*>(.*?)</\1>",
     re.IGNORECASE | re.DOTALL,
@@ -173,27 +176,42 @@ def parse_bbox_field(text: str, field_name: str) -> tuple:
     return BOX_STATE_INVALID, None
 
 
+def _has_copy(txt: str) -> bool:
+    low = (txt or "").lower()
+    return any(m in low for m in _COPY_MARKERS)
+
+
+def answer_description_ok(description: Optional[str]) -> bool:
+    if not isinstance(description, str):
+        return False
+    t = description.strip()
+    if len(t) < ANSWER_DESC_MIN_CHARS:
+        return False
+    if _has_copy(t):
+        return False
+    return True
+
+
 def parse_answer_block(answer_txt: str) -> Dict[str, Any]:
+    def _empty_answer(state: str) -> Dict[str, Any]:
+        return {
+            "answer_state": state,
+            "is_anomaly": None,
+            "final_bbox_state": state,
+            "bbox_2d": None,
+            "description": None,
+        }
+
     blob = (answer_txt or "").strip()
     if not blob:
-        return {
-            "answer_state": BOX_STATE_MISSING,
-            "is_anomaly": None,
-            "final_bbox_state": BOX_STATE_MISSING,
-            "bbox_2d": None,
-        }
+        return _empty_answer(BOX_STATE_MISSING)
     obj = None
     try:
         obj = json.loads(blob)
     except Exception:
         obj = None
     if not isinstance(obj, dict):
-        return {
-            "answer_state": BOX_STATE_INVALID,
-            "is_anomaly": None,
-            "final_bbox_state": BOX_STATE_INVALID,
-            "bbox_2d": None,
-        }
+        return _empty_answer(BOX_STATE_INVALID)
     pred_cls = obj.get("is_anomaly", None)
     if not isinstance(pred_cls, bool):
         pred_cls = None
@@ -204,11 +222,15 @@ def parse_answer_block(answer_txt: str) -> Dict[str, Any]:
     else:
         bbox = parse_bbox(obj["bbox_2d"])
         bbox_state = BOX_STATE_BOX if bbox is not None else BOX_STATE_INVALID
+    desc = obj.get("description", None)
+    if desc is not None and not isinstance(desc, str):
+        desc = str(desc)
     return {
         "answer_state": "ok",
         "is_anomaly": pred_cls,
         "final_bbox_state": bbox_state,
         "bbox_2d": bbox,
+        "description": desc,
     }
 
 
@@ -255,10 +277,12 @@ def _trajectory_valid(
     ground_ok = structural_prose_ok(tags.get("ground", ""))
     verify_ok = structural_prose_ok(tags.get("verify", ""))
     prose_ok = compare_ok and ground_ok and verify_ok
+    desc_ok = answer_description_ok(answer.get("description"))
     if pred_cls is False:
         return (
             has_tags
             and prose_ok
+            and desc_ok
             and candidate_state == BOX_STATE_NULL
             and boundary_state == "not_applicable"
             and answer.get("answer_state") == "ok"
@@ -268,6 +292,7 @@ def _trajectory_valid(
         return (
             has_tags
             and prose_ok
+            and desc_ok
             and candidate_state == BOX_STATE_BOX
             and _valid_bbox_1000(candidate_bbox)
             and boundary_state == "complete"
@@ -304,6 +329,8 @@ def _pack_parsed(
         "boundary_state": boundary_state,
         "is_anomaly": answer.get("is_anomaly"),
         "bbox_2d": answer.get("bbox_2d"),
+        "description": answer.get("description"),
+        "description_ok": answer_description_ok(answer.get("description")),
         "final_bbox_state": answer.get("final_bbox_state"),
         "answer_state": answer.get("answer_state"),
         "prose_ok": structural_prose_ok(tags.get("compare", ""))
@@ -435,6 +462,7 @@ def parse_cot_output_tolerant(text: str) -> Dict[str, Any]:
                 "is_anomaly": pred,
                 "final_bbox_state": st,
                 "bbox_2d": box if st == BOX_STATE_BOX else None,
+                "description": None,
             }
     if answer["answer_state"] != "ok" and json_obj:
         pred = json_obj.get("is_anomaly")
@@ -457,11 +485,15 @@ def parse_cot_output_tolerant(text: str) -> Dict[str, Any]:
         else:
             st, box = BOX_STATE_MISSING, None
         if pred is not None or st != BOX_STATE_MISSING:
+            desc = json_obj.get("description")
+            if desc is not None and not isinstance(desc, str):
+                desc = str(desc)
             answer = {
                 "answer_state": "ok" if pred is not None else BOX_STATE_INVALID,
                 "is_anomaly": pred,
                 "final_bbox_state": st,
                 "bbox_2d": box if st == BOX_STATE_BOX else None,
+                "description": desc,
             }
 
     packed = _pack_parsed(

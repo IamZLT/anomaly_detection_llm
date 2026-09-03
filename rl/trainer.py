@@ -36,6 +36,7 @@ from rl.grpo import (
     clipped_pg_kl,
     disable_adapter_ctx,
     dropout_eval,
+    expand_gen_in_for_group,
     forward_with_vision,
     grpo_advantages,
     grpo_param_map,
@@ -89,6 +90,8 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
     max_resample = int(gcfg.get("max_resample_attempts", 2))
     hard_resample = int(gcfg.get("hard_resample_attempts", 4))
     small_area = float(gcfg.get("small_area_thresh", 0.02))
+    rollout_micro = gcfg.get("rollout_micro_batch_size")
+    rollout_micro = int(rollout_micro) if rollout_micro not in (None, "", "null", "None") else group
     log_mvtec_probe = bool((cfg.get("tensorboard") or {}).get("log_mvtec_probe", False))
     eval_every = int(cfg.get("training", {}).get("eval_every_n_steps", 50))
     save_every = int(gcfg.get("save_steps", 100))
@@ -161,19 +164,40 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
         was_training = m.training
         m.eval()
         seqs, texts = [], []
+        remain = int(group)
+        micro = max(1, min(int(rollout_micro), int(group)))
+
+        def _one_generate(n: int):
+            kw = dict(
+                max_new_tokens=max_new,
+                do_sample=True,
+                temperature=temperature,
+                top_p=top_p,
+                num_return_sequences=n,
+            )
+            try:
+                return m.generate(**gen_in, **kw, stop_strings=["</answer>"], tokenizer=tok)
+            except TypeError:
+                return m.generate(**gen_in, **kw)
+
         with torch.no_grad():
             with bind_cached_image_features(m, image_embeds):
-                for _ in range(group):
-                    out_ids = m.generate(
-                        **gen_in,
-                        max_new_tokens=max_new,
-                        do_sample=True,
-                        temperature=temperature,
-                        top_p=top_p,
-                        num_return_sequences=1,
-                    )
-                    seqs.append(out_ids[0].detach())
-                    texts.append(tok.decode(out_ids[0][prompt_len:], skip_special_tokens=True))
+                while remain > 0:
+                    n = min(micro, remain)
+                    try:
+                        out_ids = _one_generate(n)
+                    except torch.cuda.OutOfMemoryError:
+                        if n <= 1:
+                            raise
+                        torch.cuda.empty_cache()
+                        micro = 4 if n > 4 else max(n // 2, 1)
+                        continue
+                    if out_ids.dim() == 1:
+                        out_ids = out_ids.unsqueeze(0)
+                    for i in range(int(out_ids.shape[0])):
+                        seqs.append(out_ids[i].detach())
+                        texts.append(tok.decode(out_ids[i][prompt_len:], skip_special_tokens=True))
+                    remain -= int(out_ids.shape[0])
         if was_training:
             m.train()
             force_vision_eval(m)
@@ -258,10 +282,11 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
             adv_tok = torch.zeros_like(old_lp)
             seq_lp = torch.zeros(group, device=device)
         else:
-            with bind_cached_image_features(model, vision_cache):
-                old_lp, lp_mask = token_logprobs_nograd(model, gen_in, outputs, attn, labels)
+            group_gen_in = expand_gen_in_for_group(gen_in, group)
+            with bind_cached_image_features(model, vision_cache, repeat_factor=group):
+                old_lp, lp_mask = token_logprobs_nograd(model, group_gen_in, outputs, attn, labels)
                 with disable_adapter_ctx(model):
-                    ref_lp, _ = token_logprobs_nograd(model, gen_in, outputs, attn, labels)
+                    ref_lp, _ = token_logprobs_nograd(model, group_gen_in, outputs, attn, labels)
             ref_gap = float(((old_lp - ref_lp).abs() * lp_mask).sum() / lp_mask.sum().clamp(min=1))
             adv_tok = build_segment_advantages(
                 tok,
@@ -301,40 +326,34 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
         n_pe = max(policy_epochs, 1)
         opt.zero_grad(set_to_none=True)
         if not all_skipped:
-            with dropout_eval(model), bind_cached_image_features(model, vision_cache):
+            group_gen_in = expand_gen_in_for_group(gen_in, group)
+            with dropout_eval(model), bind_cached_image_features(model, vision_cache, repeat_factor=group):
                 for pe in range(n_pe):
-                    pe_loss = pe_pg = pe_kl = pe_rho = pe_clip = 0.0
-                    for i in range(group):
-                        ctx = (
-                            model.no_sync()
-                            if (use_ddp and i < group - 1 and hasattr(model, "no_sync"))
-                            else nullcontext()
-                        )
-                        with ctx:
-                            out = forward_with_vision(model, gen_in, outputs[i : i + 1], attn[i : i + 1])
-                            if skipped:
-                                loss = out.logits.float().sum() * 0.0
-                                L_pg = L_kl = loss
-                                rho_mean = torch.zeros((), device=device)
-                                clip_frac = torch.zeros((), device=device)
-                            else:
-                                new_lp, mask = token_logprobs(out.logits, labels[i : i + 1])
-                                loss, L_pg, L_kl, rho_mean, clip_frac = clipped_pg_kl(
-                                    new_lp,
-                                    mask,
-                                    old_lp[i : i + 1],
-                                    ref_lp[i : i + 1],
-                                    adv_tok[i : i + 1],
-                                    clip_low,
-                                    clip_high,
-                                    kl_beta,
-                                )
-                            (loss / float(group) / float(max(accum, 1))).backward()
-                        pe_loss += float(loss.detach())
-                        pe_pg += float(L_pg.detach())
-                        pe_kl += float(L_kl.detach())
-                        pe_rho += float(rho_mean)
-                        pe_clip += float(clip_frac)
+                    ctx = (
+                        model.no_sync()
+                        if (use_ddp and ((pe + 1) % max(accum, 1) != 0) and pe < n_pe - 1 and hasattr(model, "no_sync"))
+                        else nullcontext()
+                    )
+                    with ctx:
+                        out = forward_with_vision(model, group_gen_in, outputs, attn)
+                        if skipped:
+                            loss = out.logits.float().sum() * 0.0
+                            L_pg = L_kl = loss
+                            rho_mean = torch.zeros((), device=device)
+                            clip_frac = torch.zeros((), device=device)
+                        else:
+                            new_lp, mask = token_logprobs(out.logits, labels)
+                            loss, L_pg, L_kl, rho_mean, clip_frac = clipped_pg_kl(
+                                new_lp,
+                                mask,
+                                old_lp,
+                                ref_lp,
+                                adv_tok,
+                                clip_low,
+                                clip_high,
+                                kl_beta,
+                            )
+                        (loss / float(max(accum, 1))).backward()
                     if ((pe + 1) % max(accum, 1) == 0) or (pe == n_pe - 1):
                         grads = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
                         if grads:
@@ -343,12 +362,11 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                         opt.zero_grad(set_to_none=True)
                         opt_step += 1
                         did_opt = True
-                    g = float(max(group, 1))
-                    loss_v += pe_loss / g
-                    pg_v += pe_pg / g
-                    kl_v += pe_kl / g
-                    rho_v = pe_rho / g
-                    clip_v = pe_clip / g
+                    loss_v += float(L_pg.detach() + float(kl_beta) * L_kl.detach())
+                    pg_v += float(L_pg.detach())
+                    kl_v += float(L_kl.detach())
+                    rho_v = float(rho_mean)
+                    clip_v = float(clip_frac)
             loss_v /= float(n_pe)
             pg_v /= float(n_pe)
             kl_v /= float(n_pe)
@@ -398,31 +416,8 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                     "loss_kl": kl_v,
                     "rho_mean": rho_v,
                     "clip_frac": clip_v,
-                    "A_ground": float(a_ground.mean()),
-                    "A_reason": float(a_reason.mean()),
-                    "A_final": float(a_final.mean()),
-                    "R_iou_c": float(sum(d.get("R_iou_c", 0.0) for d in details) / max(group, 1)),
-                    "skipped": 1.0 if skipped else 0.0,
-                    "all_skipped": 1.0 if all_skipped else 0.0,
                     "resample": float(resample_n),
-                    "policy_epochs": float(policy_epochs),
-                    "answer_tag_rate": float(answer_tag_rate),
-                    "final_bbox_rate": float(final_bbox_rate),
-                    "cls_tag_rate": float(cls_tag_rate),
-                    "truncation_rate": float(truncation_rate),
-                    "old_ref_logprob_gap": float(ref_gap),
-                    "delta_iou": float(sum(d.get("delta_iou", 0.0) for d in details) / max(group, 1)),
-                    "action_consistency": float(sum(d.get("action_consistency", 0.0) for d in details) / max(group, 1)),
-                    "gt_rel_area": float(a_gt),
-                    "skip_small": 1.0 if skipped and size_bin == "small" else 0.0,
-                    "skip_medium": 1.0 if skipped and size_bin == "medium" else 0.0,
-                    "skip_large": 1.0 if skipped and size_bin == "large" else 0.0,
-                    "size_small": 1.0 if size_bin == "small" else 0.0,
-                    "size_medium": 1.0 if size_bin == "medium" else 0.0,
-                    "size_large": 1.0 if size_bin == "large" else 0.0,
-                    "from_requeue": 1.0 if from_requeue else 0.0,
-                    "attempt_step": float(attempt_step),
-                    **{k: float(v) for k, v in proto_avg.items()},
+                    "skipped": 1.0 if skipped else 0.0,
                 },
             )
             if log_every > 0 and step % log_every == 0:

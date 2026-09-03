@@ -172,6 +172,8 @@ def format_case_text(
         f"image={meta.get('image_path')}",
         f"class={meta.get('class_name')} anomaly_gt={meta.get('is_anomaly')} rec_ok={rec_ok} "
         f"iou_f={iou:.3f} iou_c={iou_c:.3f}",
+        f"pred={parsed.get('is_anomaly')} bbox={parsed.get('bbox_2d')} "
+        f"description={parsed.get('description') or ''}",
         "",
         response or "",
     ]
@@ -319,68 +321,42 @@ def log_grpo_scalars(
     is_anomaly: Optional[bool] = None,
     extra: Optional[Dict[str, float]] = None,
 ) -> None:
-    """Write GRPO hyperparams and metrics at the same step (same x-axis in TB)."""
+    """Write the small GRPO dashboard (same x-axis). Config lives in grpo/0_config text."""
     if writer is None:
         return
+    _ = (params, opt_step, is_anomaly, seq_lp, advantages)
     r = rewards.detach().float().cpu()
-    adv = advantages.detach().float().cpu()
-    lp = seq_lp.detach().float().cpu()
     n = max(len(details), 1)
     mean = lambda k: float(sum(float(d.get(k, 0.0)) for d in details) / n)
-    parsed_tb = [parse_cot_output(t) for t in texts]
-    parse_ok = sum(1 for p in parsed_tb if p.get("has_tags"))
-    box_ok = sum(1 for p in parsed_tb if p.get("bbox_2d") is not None)
-    ans_ok = sum(1 for p in parsed_tb if "answer" in (p.get("tags") or {}))
-    cls_ok = sum(1 for p in parsed_tb if p.get("is_anomaly") is not None)
-    proto_stats = rollout_protocol_stats(parsed_tb, texts)
-
-    pmap = dict(params or {})
-    for name, val in pmap.items():
-        try:
-            writer.add_scalar(f"grpo/param/{name}", float(val), step)
-        except (TypeError, ValueError):
-            continue
+    proto = rollout_protocol_stats([parse_cot_output(t) for t in texts], texts)
+    extra = extra or {}
 
     writer.add_scalar("grpo/loss", float(loss), step)
     writer.add_scalar("grpo/lr", float(lr), step)
-    writer.add_scalar("grpo/reward_mean", float(r.mean()), step)
-    writer.add_scalar("grpo/reward_std", float(r.std(unbiased=False)), step)
-    writer.add_scalar("grpo/reward_max", float(r.max()), step)
-    writer.add_scalar("grpo/reward_min", float(r.min()), step)
-    writer.add_scalar("grpo/R_cov", mean("R_cov"), step)
-    writer.add_scalar("grpo/R_dir", mean("R_dir"), step)
-    writer.add_scalar("grpo/R_iou", mean("R_iou"), step)
-    writer.add_scalar("grpo/R_edge", mean("R_edge"), step)
+    if grad_norm is not None:
+        writer.add_scalar("grpo/grad_norm", float(grad_norm), step)
+    writer.add_scalar("grpo/pg_loss", float(extra.get("loss_pg", extra.get("pg_loss", 0.0))), step)
+    writer.add_scalar("grpo/kl", float(extra.get("loss_kl", extra.get("kl", 0.0))), step)
+    writer.add_scalar("grpo/rho", float(extra.get("rho_mean", extra.get("rho", 1.0))), step)
+    writer.add_scalar("grpo/clip_frac", float(extra.get("clip_frac", 0.0)), step)
+
     writer.add_scalar("grpo/R_ground", mean("R_ground"), step)
     writer.add_scalar("grpo/R_reason", mean("R_reason"), step)
     writer.add_scalar("grpo/R_final", mean("R_final"), step)
+    writer.add_scalar("grpo/reward_std", float(r.std(unbiased=False)), step)
+
     writer.add_scalar("grpo/R_iou_c", mean("R_iou_c"), step)
-    writer.add_scalar("grpo/advantage_mean", float(adv.mean()), step)
-    writer.add_scalar("grpo/advantage_std", float(adv.std(unbiased=False)), step)
-    writer.add_scalar("grpo/logprob_mean", float(lp.mean()), step)
-    writer.add_scalar("grpo/format_parse_rate", parse_ok / max(len(texts), 1), step)
-    writer.add_scalar("grpo/valid_bbox_rate", box_ok / max(len(texts), 1), step)
-    writer.add_scalar("grpo/answer_tag_rate", ans_ok / max(len(texts), 1), step)
-    writer.add_scalar("grpo/cls_tag_rate", cls_ok / max(len(texts), 1), step)
-    for name, val in proto_stats.items():
-        writer.add_scalar(f"grpo/{name}", float(val), step)
-    if is_anomaly is not None:
-        writer.add_scalar("grpo/batch_is_anomaly", 1.0 if is_anomaly else 0.0, step)
-    if grad_norm is not None:
-        writer.add_scalar("grpo/grad_norm", float(grad_norm), step)
-    if opt_step is not None:
-        writer.add_scalar("grpo/opt_step", float(opt_step), step)
-    for name, val in (extra or {}).items():
-        try:
-            writer.add_scalar(f"grpo/{name}", float(val), step)
-        except (TypeError, ValueError):
-            continue
-    for i, det in enumerate(details[:8]):
-        writer.add_scalar(f"grpo/traj_{i}/R_final", float(det.get("R_final", det.get("R", 0.0))), step)
-        writer.add_scalar(f"grpo/traj_{i}/R_ground", float(det.get("R_ground", 0.0)), step)
-        writer.add_scalar(f"grpo/traj_{i}/R_iou", float(det.get("R_iou", 0.0)), step)
-        if i < adv.numel():
-            writer.add_scalar(f"grpo/traj_{i}/advantage_final", float(adv[i]), step)
+    writer.add_scalar("grpo/R_iou", mean("R_iou"), step)
+    writer.add_scalar("grpo/delta_iou", mean("delta_iou"), step)
+    writer.add_scalar("grpo/action_consistency", mean("action_consistency"), step)
+
+    writer.add_scalar("grpo/protocol_rate", float(proto.get("protocol_rate", 0.0)), step)
+    writer.add_scalar("grpo/trajectory_valid_rate", float(proto.get("trajectory_valid_rate", 0.0)), step)
+    writer.add_scalar("grpo/candidate_valid_rate", float(proto.get("candidate_valid_rate", 0.0)), step)
+    writer.add_scalar("grpo/final_valid_rate", float(proto.get("final_valid_rate", 0.0)), step)
+    writer.add_scalar("grpo/unique_response_rate", float(proto.get("unique_response_rate", 0.0)), step)
+    writer.add_scalar("grpo/resample_n", float(extra.get("resample", extra.get("resample_n", 0.0))), step)
+    writer.add_scalar("grpo/skip_rate", float(extra.get("skipped", extra.get("skip_rate", 0.0))), step)
     writer.flush()
 
 

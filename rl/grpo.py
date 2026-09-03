@@ -34,8 +34,30 @@ def model_inputs(batch: dict) -> dict:
     return {k: v for k, v in batch.items() if k not in skip and torch.is_tensor(v)}
 
 
+def expand_gen_in_for_group(gen_in: dict, group: int) -> dict:
+    """Repeat prompt-side multimodal metadata so one forward covers the whole GRPO group."""
+    group = max(int(group), 1)
+    out = {}
+    for k, v in gen_in.items():
+        if not torch.is_tensor(v):
+            continue
+        if k in ("pixel_values", "pixel_values_videos"):
+            out[k] = v
+            continue
+        if k in ("image_grid_thw", "video_grid_thw"):
+            g = v if v.ndim == 2 else v.reshape(-1, int(v.shape[-1]))
+            out[k] = g.repeat(group, 1) if group > 1 else g
+            continue
+        t = v.unsqueeze(0) if v.ndim == 1 else v
+        if group > 1 and t.shape[0] == 1:
+            t = t.repeat(group, *([1] * (t.ndim - 1)))
+        out[k] = t
+    return out
+
+
 def forward_with_vision(model, gen_in: dict, input_ids: torch.Tensor, attention_mask: torch.Tensor):
     """Keep processor vision tensors; pad mm_token_type_ids to generated length."""
+    n = int(input_ids.shape[0])
     kwargs = {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
@@ -43,13 +65,13 @@ def forward_with_vision(model, gen_in: dict, input_ids: torch.Tensor, attention_
     for k, v in gen_in.items():
         if k in ("input_ids", "attention_mask", "labels") or not torch.is_tensor(v):
             continue
-        if k in ("mm_token_type_ids",) and v.shape[-1] != input_ids.shape[-1]:
-            seq = int(input_ids.shape[-1])
-            cur = int(v.shape[-1])
+        if k in ("mm_token_type_ids",):
             if v.ndim == 1:
                 v = v.unsqueeze(0)
-            if v.shape[0] != input_ids.shape[0]:
-                v = v.expand(input_ids.shape[0], *v.shape[1:])
+            if v.shape[0] == 1 and n > 1:
+                v = v.repeat(n, *([1] * (v.ndim - 1)))
+            seq = int(input_ids.shape[-1])
+            cur = int(v.shape[-1])
             if cur < seq:
                 v = F.pad(v, (0, seq - cur), value=0)
             elif cur > seq:
@@ -93,22 +115,17 @@ def dropout_eval(model):
 
 
 def token_logprobs_nograd(model, gen_in: dict, outputs: torch.Tensor, attn: torch.Tensor, labels: torch.Tensor):
-    lps = []
-    masks = []
     m = unwrap_model(model)
     was_training = m.training
     m.eval()
     try:
         with torch.no_grad():
-            for i in range(outputs.shape[0]):
-                out = forward_with_vision(m, gen_in, outputs[i : i + 1], attn[i : i + 1])
-                lp, mask = token_logprobs(out.logits, labels[i : i + 1])
-                lps.append(lp)
-                masks.append(mask)
+            out = forward_with_vision(m, gen_in, outputs, attn)
+            lp, mask = token_logprobs(out.logits, labels)
     finally:
         if was_training:
             m.train()
-    return torch.cat(lps, dim=0), torch.cat(masks, dim=0)
+    return lp, mask
 
 
 def clipped_pg_kl(
@@ -121,17 +138,26 @@ def clipped_pg_kl(
     clip_high: float,
     kl_beta: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-trajectory mean, then mean over the group (do not pool tokens across sequences)."""
     rho = torch.exp((new_lp - old_lp).clamp(-20.0, 20.0))
     clipped = rho.clamp(1.0 - float(clip_low), 1.0 + float(clip_high))
     surr = torch.minimum(rho * adv, clipped * adv)
-    denom = mask.sum().clamp(min=1)
-    L_pg = -(surr * mask).sum() / denom
+    denom = mask.sum(dim=-1).clamp(min=1)
+    pg_per_seq = -(surr * mask).sum(dim=-1) / denom
+    L_pg = pg_per_seq.mean()
     delta = (ref_lp - new_lp).clamp(-20.0, 20.0)
     kl_token = torch.exp(delta) - delta - 1.0
-    L_kl = (kl_token * mask).sum() / denom
-    clip_frac = (((rho < (1.0 - clip_low)) | (rho > (1.0 + clip_high))).float() * mask).sum() / denom
-    rho_mean = (rho * mask).sum() / denom
-    return L_pg + float(kl_beta) * L_kl, L_pg, L_kl, rho_mean.detach(), clip_frac.detach()
+    kl_per_seq = (kl_token * mask).sum(dim=-1) / denom
+    L_kl = kl_per_seq.mean()
+    clip_per_seq = (((rho < (1.0 - clip_low)) | (rho > (1.0 + clip_high))).float() * mask).sum(dim=-1) / denom
+    rho_per_seq = (rho * mask).sum(dim=-1) / denom
+    return (
+        L_pg + float(kl_beta) * L_kl,
+        L_pg,
+        L_kl,
+        rho_per_seq.mean().detach(),
+        clip_per_seq.mean().detach(),
+    )
 
 
 def grpo_advantages(rewards: torch.Tensor, group: int, eps: float) -> torch.Tensor:

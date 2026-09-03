@@ -96,15 +96,26 @@ def _qwen_vl(model):
     return m
 
 
-def bind_cached_image_features(model, image_embeds: Optional[torch.Tensor]):
+def bind_cached_image_features(model, image_embeds: Optional[torch.Tensor], repeat_factor: int = 1):
     """Replace `get_image_features` with a frozen merger cache (no visual.forward)."""
     if image_embeds is None:
         return nullcontext()
-    return _bind_cached_image_features(model, image_embeds)
+    return _bind_cached_image_features(model, image_embeds, repeat_factor=max(int(repeat_factor), 1))
+
+
+def expand_cached_image_feats(cache: torch.Tensor, expected_n: int) -> torch.Tensor:
+    """Repeat a single-sample [V_r; V_t] cache to match a batched image_grid_thw."""
+    base_n = int(cache.shape[0])
+    expected_n = int(expected_n)
+    if expected_n == base_n:
+        return cache
+    if base_n > 0 and expected_n % base_n == 0:
+        return cache.repeat(expected_n // base_n, 1)
+    raise RuntimeError(f"cached image tokens {base_n} cannot tile expected {expected_n}")
 
 
 @contextmanager
-def _bind_cached_image_features(model, image_embeds: torch.Tensor) -> Iterator[None]:
+def _bind_cached_image_features(model, image_embeds: torch.Tensor, repeat_factor: int = 1) -> Iterator[None]:
     qwen = _qwen_vl(model)
     inner = getattr(qwen, "model", qwen)
     if not hasattr(inner, "get_image_features"):
@@ -118,21 +129,19 @@ def _bind_cached_image_features(model, image_embeds: torch.Tensor) -> Iterator[N
     def _cached(pixel_values, image_grid_thw=None, **kwargs):
         from transformers.modeling_outputs import BaseModelOutputWithPooling
 
+        feats = cache
+        if pixel_values is not None:
+            feats = feats.to(device=pixel_values.device, dtype=pixel_values.dtype)
         if image_grid_thw is None:
-            feats = cache
+            if repeat_factor > 1:
+                feats = feats.repeat(repeat_factor, 1)
             parts = (feats,)
         else:
-            split_sizes = (image_grid_thw.prod(-1) // (merge * merge)).tolist()
-            feats = cache.to(device=image_grid_thw.device)
-            if pixel_values is not None:
-                feats = feats.to(dtype=pixel_values.dtype)
-            n = int(sum(int(s) for s in split_sizes))
-            if int(feats.shape[0]) != n:
-                raise RuntimeError(
-                    f"cached image tokens {int(feats.shape[0])} != grid tokens {n} "
-                    f"(grid={image_grid_thw.tolist()} merge={merge})"
-                )
-            parts = torch.split(feats, [int(s) for s in split_sizes])
+            feats = feats.to(device=image_grid_thw.device)
+            split_sizes = [int(s) for s in (image_grid_thw.prod(-1) // (merge * merge)).tolist()]
+            expected_n = int(sum(split_sizes))
+            feats = expand_cached_image_feats(feats, expected_n)
+            parts = torch.split(feats, split_sizes)
         return BaseModelOutputWithPooling(pooler_output=parts, last_hidden_state=None)
 
     inner.get_image_features = _cached

@@ -135,12 +135,15 @@ prompt:
 
     In <answer>:
     Output exactly one JSON object.
+    Do not add a defect_type field.
 
     For an anomalous sample:
-    {"is_anomaly": true, "bbox_2d": [x1,y1,x2,y2]}
+    {"is_anomaly": true, "bbox_2d": [x1,y1,x2,y2], "description": "One concise sentence describing the defect and its location."}
 
     For a normal sample:
-    {"is_anomaly": false, "bbox_2d": null}
+    {"is_anomaly": false, "bbox_2d": null, "description": "One concise sentence stating that no clear defect is observed."}
+
+    The description must be one original sentence. For an anomaly, state where it is, what visual abnormality is seen, and how it differs from the normal reference. For a normal sample, state that no clear defect is observed. Do not name a fixed defect class.
 
     All bbox coordinates are integers in the 0-1000 coordinate system of Image 2.
 
@@ -162,7 +165,8 @@ grpo:
   max_steps: null
   learning_rate: 5.0e-6
   gradient_accumulation_steps: 1
-  max_new_tokens: 768
+  max_new_tokens: 384
+  rollout_micro_batch_size: 8   # OOM 时改成 4，两次 batched generate，不要退回 8 次串行
   temperature: 0.9
   top_p: 0.95
   logging_steps: 1          # 终端打印；TB 的 grpo/* 每步都写（与 param 同一 step）
@@ -201,7 +205,7 @@ inference:
   model_path: null
   image_path: null
   prompt: null
-  max_new_tokens: 768
+  max_new_tokens: 384
   temperature: 0.0
   top_p: 0.9
   do_sample: false

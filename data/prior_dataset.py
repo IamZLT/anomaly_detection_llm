@@ -129,8 +129,12 @@ def build_user_prompt(cfg: dict, class_name: str) -> str:
             "In <verify> decide true defect vs normal variation. "
             "In <boundary>, if candidate exists write four lines left/right/top/bottom=inward|outward|keep; "
             "if candidate_bbox_2d=null write not_applicable. "
-            "In <answer> output JSON {\"is_anomaly\": true, \"bbox_2d\": [x1,y1,x2,y2]} "
-            "or {\"is_anomaly\": false, \"bbox_2d\": null}. "
+            "In <answer> output JSON "
+            "{\"is_anomaly\": true, \"bbox_2d\": [x1,y1,x2,y2], "
+            "\"description\": \"One concise sentence describing the defect and its location.\"} "
+            "or {\"is_anomaly\": false, \"bbox_2d\": null, "
+            "\"description\": \"One concise sentence stating that no clear defect is observed.\"}. "
+            "Do not add a defect_type field. "
             "All bbox coordinates are integers in the 0-1000 system of Image 2."
         )
     return tmpl.replace("{class_name}", class_name)

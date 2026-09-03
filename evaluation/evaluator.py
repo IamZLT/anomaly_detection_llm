@@ -15,7 +15,6 @@ from evaluation.metrics import (
     classification_correct,
     defect_size_bin,
     gt_relative_area,
-    is_truncated,
     summarize_detection_metrics,
 )
 from models.qwen35 import force_vision_eval
@@ -84,13 +83,16 @@ def run_simple_eval(
         batch = move_batch(batch, device)
         gen_in = model_inputs(batch)
         with bind_cached_image_features(model, batch.get("image_embeds")):
-            outputs = model.generate(
-                **gen_in,
+            gen_kw = dict(
                 max_new_tokens=int(inf.get("max_new_tokens", 512)),
                 temperature=float(inf.get("temperature", 0.0)),
                 top_p=float(inf.get("top_p", 0.9)),
                 do_sample=bool(inf.get("do_sample", False)),
             )
+            try:
+                outputs = model.generate(**gen_in, **gen_kw, stop_strings=["</answer>"], tokenizer=tok)
+            except TypeError:
+                outputs = model.generate(**gen_in, **gen_kw)
         prompt_len = int(batch["prompt_len"][0].item()) if "prompt_len" in batch else int(batch["input_ids"].shape[1])
         text = tok.decode(outputs[0][prompt_len:], skip_special_tokens=True)
         meta = batch["_meta"][0]
@@ -178,18 +180,11 @@ def run_simple_eval(
     extra = summarize_detection_metrics(metric_rows)
     if writer is not None:
         writer.add_scalar("eval/rec_acc", rec_ok / n, global_step)
-        writer.add_scalar("eval/iou_at_03", extra.get("iou_at_03", (n_hit / n_anom) if n_anom else 0.0), global_step)
+        writer.add_scalar("eval/mean_iou_c", mean_iou_c, global_step)
         writer.add_scalar("eval/mean_iou", mean_iou, global_step)
         writer.add_scalar("eval/mean_iou_gated", extra.get("mean_iou_gated", 0.0), global_step)
-        writer.add_scalar("eval/mean_iou_c", mean_iou_c, global_step)
-        writer.add_scalar("eval/acc_at_01", extra.get("acc_at_01", 0.0), global_step)
         writer.add_scalar("eval/acc_at_03", extra.get("acc_at_03", 0.0), global_step)
         writer.add_scalar("eval/acc_at_05", extra.get("acc_at_05", 0.0), global_step)
-        writer.add_scalar("eval/macro_miou", extra.get("macro_miou", 0.0), global_step)
-        for b in ("small", "medium", "large"):
-            writer.add_scalar(f"eval/mean_iou_{b}", extra.get(f"mean_iou_{b}", 0.0), global_step)
-            writer.add_scalar(f"eval/mean_iou_gated_{b}", extra.get(f"mean_iou_gated_{b}", 0.0), global_step)
-        writer.add_scalar("eval/json_parse_rate", parse_ok / n, global_step)
         writer.flush()
     model.train()
     force_vision_eval(model)
@@ -255,23 +250,24 @@ def log_grpo_probe_cot(
     inf = cfg.get("inference") or {}
     was_training = model.training
     model.eval()
+    tok = getattr(processor, "tokenizer", processor)
     with bind_cached_image_features(model, batch.get("image_embeds")):
-        outputs = model.generate(
-            **gen_in,
+        gen_kw = dict(
             max_new_tokens=max_new,
             do_sample=False,
             temperature=0.0,
             top_p=float(inf.get("top_p", 0.9)),
         )
-    tok = getattr(processor, "tokenizer", processor)
+        try:
+            outputs = model.generate(**gen_in, **gen_kw, stop_strings=["</answer>"], tokenizer=tok)
+        except TypeError:
+            outputs = model.generate(**gen_in, **gen_kw)
     prompt_len = int(batch["prompt_len"][0].item())
     seq = outputs[0]
     text = tok.decode(seq[prompt_len:], skip_special_tokens=True)
     meta = batch["_meta"][0]
     parsed = parse_cot_output(text)
     iou_c, iou_f, rec_ok = box_ious_from_parsed(parsed, meta)
-    tags = parsed.get("tags") or {}
-    truncated = is_truncated(seq, prompt_len, max_new, tok.eos_token_id)
     log_heatmap_and_case(
         writer,
         step=step,
@@ -285,13 +281,6 @@ def log_grpo_probe_cot(
         iou_c=float(iou_c),
         **tb_vis_flags(cfg),
     )
-    writer.add_scalar(f"{tag_prefix}/iou_final", float(iou_f), step)
-    writer.add_scalar(f"{tag_prefix}/iou_candidate", float(iou_c), step)
-    writer.add_scalar(f"{tag_prefix}/rec_ok", 1.0 if rec_ok else 0.0, step)
-    writer.add_scalar(f"{tag_prefix}/answer_tag", 1.0 if "answer" in tags else 0.0, step)
-    writer.add_scalar(f"{tag_prefix}/final_bbox", 1.0 if parsed.get("bbox_2d") is not None else 0.0, step)
-    writer.add_scalar(f"{tag_prefix}/cls_valid", 1.0 if parsed.get("is_anomaly") is not None else 0.0, step)
-    writer.add_scalar(f"{tag_prefix}/truncated", 1.0 if truncated else 0.0, step)
     if was_training:
         model.train()
         force_vision_eval(model)
