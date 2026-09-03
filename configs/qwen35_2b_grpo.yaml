@@ -72,6 +72,8 @@ data:
   visa_max_normal_per_class: null   # null = 每类全部 Normal
   source_dirname: VisA           # 参考图回退路径用
   train_anomaly_only: false
+  # 训练时每张图从同类 normal 中随机抽 I_r；eval/test 固定第一张
+  random_train_ref: true
   # 训练采样：每类 正常:异常。1.0 = 1:1（保留全部异常，下采样正常）；null = 不限制
   normal_anomaly_ratio: 1.0
   holdout_ratio: 0.0
@@ -146,27 +148,17 @@ grpo:
   min_reward_std: 0.02
   max_resample_attempts: 2
   reward:
-    w_cov: 0.7
-    w_compact: 0.3
-    w_iou: 0.45
+    # candidate grounding
+    w_cov: 0.60
+    w_cand_iou: 0.40
+    # final bbox (classification is a gate, not a separate reward)
+    w_iou: 0.60
     w_edge: 0.40
-    w_center: 0.15
     edge_beta: 8.0
-    center_gamma: 8.0
     keep_tol_norm1000: 8.0
-    format_weight: 0.03
-    cls_correct: 1.0
-    cls_wrong: -1.0
-    cls_invalid: -0.5
-    normal_false_positive: -0.5
-    a_ground_on_ground: 0.6
-    a_cls_on_ground: 0.2
-    a_box_on_ground: 0.2
-    a_reason_on_reason: 0.3
-    a_cls_on_reason: 0.3
-    a_box_on_reason: 0.4
-    a_cls_on_answer: 0.7
-    a_box_on_answer: 0.3
+    normal_correct: 1.0
+    wrong_decision: -1.0
+    invalid_output: -0.5
 
 distributed:
   num_gpu: 2

@@ -14,14 +14,14 @@ from torch.utils.data import Dataset
 from utils.common import smart_resize
 
 
-def pick_ref_image(
+def list_normal_refs(
     cls: str,
     dataset_root: str,
     query_path: str,
     source: str = "mvtec_anomaly_detection",
     ref_dir: Optional[str] = None,
     layout: str = "mvtec",
-) -> str:
+) -> List[str]:
     query_abs = os.path.abspath(query_path)
     roots: List[str] = []
     if ref_dir:
@@ -40,18 +40,38 @@ def pick_ref_image(
         ]
     )
     cands: List[str] = []
+    seen = set()
     for d in roots:
         if not os.path.isdir(d):
             continue
         for name in sorted(os.listdir(d)):
-            if name.lower().endswith((".png", ".jpg", ".jpeg", ".bmp")):
-                cands.append(os.path.join(d, name))
-    for p in cands:
-        if os.path.isfile(p) and os.path.abspath(p) != query_abs:
-            return p
-    if cands:
-        return cands[0]
-    raise FileNotFoundError(f"no normal reference for class={cls} query={query_path}")
+            if not name.lower().endswith((".png", ".jpg", ".jpeg", ".bmp")):
+                continue
+            p = os.path.join(d, name)
+            ap = os.path.abspath(p)
+            if ap in seen or not os.path.isfile(p):
+                continue
+            seen.add(ap)
+            cands.append(p)
+    valid = [p for p in cands if os.path.abspath(p) != query_abs]
+    return valid or cands
+
+
+def pick_ref_image(
+    cls: str,
+    dataset_root: str,
+    query_path: str,
+    source: str = "mvtec_anomaly_detection",
+    ref_dir: Optional[str] = None,
+    layout: str = "mvtec",
+    randomize: bool = False,
+) -> str:
+    cands = list_normal_refs(cls, dataset_root, query_path, source=source, ref_dir=ref_dir, layout=layout)
+    if not cands:
+        raise FileNotFoundError(f"no normal reference for class={cls} query={query_path}")
+    if randomize and len(cands) > 1:
+        return random.choice(cands)
+    return cands[0]
 
 
 def apply_chat_template_safe(processor, messages, add_generation_prompt: bool, enable_thinking: bool):
@@ -99,6 +119,7 @@ class PriorCoTDataset(Dataset):
         self.factor = int(cfg.get("data", {}).get("factor", 28))
         self.dataset_root = str(cfg.get("paths", {}).get("dataset_root", ""))
         self.source = str(cfg.get("data", {}).get("source_dirname", "mvtec_anomaly_detection"))
+        self.random_train_ref = bool(cfg.get("data", {}).get("random_train_ref", True))
         self.samples = samples
 
     def __len__(self):
@@ -118,6 +139,7 @@ class PriorCoTDataset(Dataset):
             source=self.source,
             ref_dir=meta.get("ref_dir"),
             layout=str(meta.get("layout") or "mvtec"),
+            randomize=(self.mode == "train" and self.random_train_ref),
         )
         test = Image.open(str(img_path)).convert("RGB")
         ref = Image.open(ref_path).convert("RGB")

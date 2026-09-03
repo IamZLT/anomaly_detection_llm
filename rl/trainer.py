@@ -73,7 +73,6 @@ def disable_hf_datasets_check() -> None:
 def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, output_dir: str, writer: Optional[SummaryWriter]) -> None:
     gcfg = cfg.get("grpo") or {}
     inf = cfg.get("inference") or {}
-    rew_cfg = gcfg.get("reward") or {}
     group = int(gcfg.get("group_size", 8))
     policy_epochs = int(gcfg.get("policy_epochs", 3))
     lr = float(gcfg.get("learning_rate", 5.0e-6))
@@ -197,11 +196,10 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
         for attempt in range(max_resample + 1):
             seqs, texts = _generate_group(gen_in, prompt_len)
             details, parsed_list = _score_group(texts, meta)
-            std_box = group_std([float(d.get("R_box", 0.0)) for d in details])
             std_g = group_std([float(d.get("R_ground", 0.0)) for d in details])
             std_r = group_std([float(d.get("R_reason", 0.0)) for d in details])
-            std_c = group_std([float(d.get("R_cls", 0.0)) for d in details])
-            if max(std_box, std_g, std_r, std_c) >= min_std:
+            std_f = group_std([float(d.get("R_final", 0.0)) for d in details])
+            if max(std_g, std_r, std_f) >= min_std:
                 resample_n = attempt
                 skipped = False
                 break
@@ -210,14 +208,12 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
         if skipped:
             resample_n = max_resample
 
-        r_box = torch.tensor([float(d.get("R_box", 0.0)) for d in details], device=device, dtype=torch.float32)
         r_ground = torch.tensor([float(d.get("R_ground", 0.0)) for d in details], device=device, dtype=torch.float32)
         r_reason = torch.tensor([float(d.get("R_reason", 0.0)) for d in details], device=device, dtype=torch.float32)
-        r_cls = torch.tensor([float(d.get("R_cls", 0.0)) for d in details], device=device, dtype=torch.float32)
+        r_final = torch.tensor([float(d.get("R_final", 0.0)) for d in details], device=device, dtype=torch.float32)
         a_ground = grpo_advantages(r_ground, group, adv_eps)
         a_reason = grpo_advantages(r_reason, group, adv_eps)
-        a_box = grpo_advantages(r_box, group, adv_eps)
-        a_cls = grpo_advantages(r_cls, group, adv_eps)
+        a_final = grpo_advantages(r_final, group, adv_eps)
 
         use_ddp = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
         active = torch.tensor([0 if skipped else 1], device=device, dtype=torch.int64)
@@ -248,7 +244,15 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                 ref_lp, _ = token_logprobs_nograd(model, gen_in, outputs, attn, labels)
             ref_gap = float(((old_lp - ref_lp).abs() * lp_mask).sum() / lp_mask.sum().clamp(min=1))
             adv_tok = build_segment_advantages(
-                tok, seqs, prompt_len, max_t, a_ground, a_reason, a_box, a_cls, rew_cfg, device
+                tok,
+                seqs,
+                prompt_len,
+                max_t,
+                a_ground,
+                a_reason,
+                a_final,
+                bool(meta.get("is_anomaly")),
+                device,
             )
             if skipped:
                 adv_tok = torch.zeros_like(adv_tok)
@@ -330,8 +334,8 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
         loss_v = avg_across_ranks(loss_v, device)
         pg_v = avg_across_ranks(pg_v, device)
         kl_v = avg_across_ranks(kl_v, device)
-        r_mean = avg_across_ranks(float(r_box.mean()), device)
-        r_std = avg_across_ranks(float(r_box.std(unbiased=False)), device)
+        r_mean = avg_across_ranks(float(r_final.mean()), device)
+        r_std = avg_across_ranks(float(r_final.std(unbiased=False)), device)
         parse_rate = avg_across_ranks(parse_rate_local, device)
         answer_tag_rate = avg_across_ranks(answer_tag_rate, device)
         final_bbox_rate = avg_across_ranks(final_bbox_rate, device)
@@ -344,9 +348,9 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                 writer,
                 step=step,
                 loss=loss_v,
-                rewards=r_box,
+                rewards=r_final,
                 details=details,
-                advantages=a_box,
+                advantages=a_final,
                 seq_lp=seq_lp,
                 texts=texts,
                 lr=lr,
@@ -361,9 +365,7 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                     "clip_frac": clip_v,
                     "A_ground": float(a_ground.mean()),
                     "A_reason": float(a_reason.mean()),
-                    "A_box": float(a_box.mean()),
-                    "A_cls": float(a_cls.mean()),
-                    "R_cls": float(r_cls.mean()),
+                    "A_final": float(a_final.mean()),
                     "R_iou_c": float(sum(d.get("R_iou_c", 0.0) for d in details) / max(group, 1)),
                     "skipped": 1.0 if skipped else 0.0,
                     "all_skipped": 1.0 if all_skipped else 0.0,
@@ -382,10 +384,9 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                 train_log(
                     f"[grpo] step={step}/{max_steps} opt={opt_step} loss={loss_v:.4f} "
                     f"pg={pg_v:.4f} kl={kl_v:.4f} rho={rho_v:.3f} clip={clip_v:.3f} "
-                    f"Rb={r_mean:.3f}±{r_std:.3f} "
+                    f"Rf={r_mean:.3f}±{r_std:.3f} "
                     f"Rg={sum(d.get('R_ground', 0.0) for d in details)/n:.3f} "
                     f"Rr={sum(d.get('R_reason', 0.0) for d in details)/n:.3f} "
-                    f"Rc={sum(d.get('R_cls', 0.0) for d in details)/n:.3f} "
                     f"iou_f={sum(d.get('R_iou', 0.0) for d in details)/n:.3f} "
                     f"iou_c={sum(d.get('R_iou_c', 0.0) for d in details)/n:.3f} "
                     f"ans={answer_tag_rate:.2f} bbox={final_bbox_rate:.2f} "
@@ -395,7 +396,7 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                 )
 
         if is_main_process() and vis_every > 0 and step % vis_every == 0:
-            best_i = int(torch.argmax(r_cls + r_box).item())
+            best_i = int(torch.argmax(r_final).item())
             log_heatmap_and_case(
                 writer,
                 step=step,
@@ -418,7 +419,7 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                         meta=meta,
                         texts=texts,
                         details=details,
-                        advantages=a_box.detach().cpu().tolist(),
+                        advantages=a_final.detach().cpu().tolist(),
                         logprobs=seq_lp.detach().cpu().tolist(),
                     ),
                     step,

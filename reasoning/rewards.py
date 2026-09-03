@@ -1,11 +1,11 @@
-"""Verifiable spatial rewards: coverage, direction, classification, IoU."""
+"""Three-level verifiable rewards: candidate grounding, boundary reasoning, final gate."""
 
 from __future__ import annotations
 
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
-from reasoning.parser import EDGE_KEYS, TAG_NAMES
+from reasoning.parser import EDGE_KEYS
 from utils.common import qwen_norm1000_to_original_pixels
 
 
@@ -34,6 +34,16 @@ def box_coverage(pred: List[float], gt: List[float]) -> float:
 
 def box_area(box: List[float]) -> float:
     return max(0.0, float(box[2]) - float(box[0])) * max(0.0, float(box[3]) - float(box[1]))
+
+
+def valid_bbox_1000(box) -> bool:
+    if box is None or not isinstance(box, (list, tuple)) or len(box) != 4:
+        return False
+    try:
+        x1, y1, x2, y2 = map(float, box)
+    except (TypeError, ValueError):
+        return False
+    return 0.0 <= x1 < x2 <= 1000.0 and 0.0 <= y1 < y2 <= 1000.0
 
 
 def pixels_to_qwen1000(box: List[float], orig_wh: Tuple[int, int]) -> List[int]:
@@ -70,30 +80,10 @@ def edge_precision_reward(pred: List[float], gt: List[float], orig_wh: Tuple[int
     return float(sum(math.exp(-beta * d) for d in dists) / 4.0)
 
 
-def center_reward(pred: List[float], gt: List[float], orig_wh: Tuple[int, int], gamma: float) -> float:
-    w, h = float(max(orig_wh[0], 1)), float(max(orig_wh[1], 1))
-    pc = ((pred[0] + pred[2]) * 0.5, (pred[1] + pred[3]) * 0.5)
-    gc = ((gt[0] + gt[2]) * 0.5, (gt[1] + gt[3]) * 0.5)
-    dist = math.hypot(pc[0] - gc[0], pc[1] - gc[1])
-    diag = math.sqrt(w * w + h * h)
-    return float(math.exp(-float(gamma) * dist / max(diag, 1e-6)))
-
-
-def _format_ok(parsed: Dict[str, Any], is_anomaly: bool) -> bool:
-    tags = parsed.get("tags") or {}
-    has_tags = all(n in tags for n in TAG_NAMES)
-    pred_cls = parsed.get("is_anomaly", None)
-    if not has_tags or pred_cls is None:
-        return False
-    if not is_anomaly:
-        return (pred_cls is False) and parsed.get("bbox_2d") is None
-    bound = parsed.get("boundary") or {}
-    return (
-        pred_cls is True
-        and parsed.get("candidate_bbox") is not None
-        and parsed.get("bbox_2d") is not None
-        and all(k in bound for k in EDGE_KEYS)
-    )
+def _to_px(box, orig_wh: Tuple[int, int]) -> Optional[List[float]]:
+    if not valid_bbox_1000(box):
+        return None
+    return [float(x) for x in qwen_norm1000_to_original_pixels(box, orig_wh)]
 
 
 def compute_rewards(
@@ -103,120 +93,117 @@ def compute_rewards(
     is_anomaly: bool,
     cfg: dict,
 ) -> Dict[str, float]:
-    rew_cfg = cfg.get("grpo", {}).get("reward", {}) or {}
-    w_cov = float(rew_cfg.get("w_cov", 0.7))
-    w_compact = float(rew_cfg.get("w_compact", 0.3))
-    w_iou = float(rew_cfg.get("w_iou", 0.45))
-    w_edge = float(rew_cfg.get("w_edge", 0.40))
-    w_center = float(rew_cfg.get("w_center", 0.15))
+    rew_cfg = (cfg.get("grpo") or {}).get("reward") or {}
+    w_cov = float(rew_cfg.get("w_cov", 0.6))
+    w_cand_iou = float(rew_cfg.get("w_cand_iou", 0.4))
+    w_iou = float(rew_cfg.get("w_iou", 0.6))
+    w_edge = float(rew_cfg.get("w_edge", 0.4))
     beta = float(rew_cfg.get("edge_beta", 8.0))
-    gamma = float(rew_cfg.get("center_gamma", 8.0))
     keep_tol = float(rew_cfg.get("keep_tol_norm1000", 8.0))
-    fmt_w = float(rew_cfg.get("format_weight", 0.03))
-    normal_fp_pen = float(rew_cfg.get("normal_false_positive", -0.5))
-    cls_correct = float(rew_cfg.get("cls_correct", 1.0))
-    cls_wrong = float(rew_cfg.get("cls_wrong", -1.0))
-    cls_invalid = float(rew_cfg.get("cls_invalid", -0.5))
+    r_ok = float(rew_cfg.get("normal_correct", 1.0))
+    r_wrong = float(rew_cfg.get("wrong_decision", -1.0))
+    r_invalid = float(rew_cfg.get("invalid_output", -0.5))
 
-    pred_f = parsed.get("bbox_2d")
+    pred_cls = parsed.get("is_anomaly")
     cand = parsed.get("candidate_bbox")
-    pred_cls = parsed.get("is_anomaly", None)
-    if pred_cls is None:
-        r_cls = cls_invalid
-    elif bool(pred_cls) == bool(is_anomaly):
-        r_cls = cls_correct
-    else:
-        r_cls = cls_wrong
+    final_box = parsed.get("bbox_2d")
+    cand_px = _to_px(cand, orig_wh)
+    final_px = _to_px(final_box, orig_wh)
 
-    pred_px = None
-    cand_px = None
-    if pred_f is not None:
-        pred_px = [float(x) for x in qwen_norm1000_to_original_pixels(pred_f, orig_wh)]
-    if cand is not None:
-        cand_px = [float(x) for x in qwen_norm1000_to_original_pixels(cand, orig_wh)]
-
-    r_fmt = 1.0 if _format_ok(parsed, is_anomaly) else 0.0
-    zeros = {
-        "R_cov": 0.0,
-        "R_compact": 0.0,
-        "R_dir": 0.0,
-        "R_iou": 0.0,
-        "R_iou_c": 0.0,
-        "R_edge": 0.0,
-        "R_center": 0.0,
-        "R_format": float(r_fmt),
-        "R_cls": float(r_cls),
-        "pred_box_px": pred_px,
-        "cand_box_px": cand_px,
-        "pred_cls": pred_cls,
-        "d_star": {},
-    }
+    def _pack(
+        *,
+        r_ground: float,
+        r_reason: float,
+        r_final: float,
+        r_cov: float = 0.0,
+        r_iou_c: float = 0.0,
+        r_dir: float = 0.0,
+        r_iou: float = 0.0,
+        r_edge: float = 0.0,
+        r_compact: float = 0.0,
+        d_star: Optional[dict] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "R_ground": float(r_ground),
+            "R_reason": float(r_reason),
+            "R_final": float(r_final),
+            "R": float(r_final),
+            "R_cov": float(r_cov),
+            "R_iou_c": float(r_iou_c),
+            "R_dir": float(r_dir),
+            "R_iou": float(r_iou),
+            "R_edge": float(r_edge),
+            "R_compact": float(r_compact),
+            "pred_box_px": final_px,
+            "cand_box_px": cand_px,
+            "pred_cls": pred_cls,
+            "d_star": d_star or {},
+        }
 
     if not is_anomaly:
-        r_ground = fmt_w * r_fmt
-        r_reason = fmt_w * r_fmt
-        r_box = (normal_fp_pen if pred_px is not None else 0.0) + fmt_w * r_fmt
-        zeros.update(
-            {
-                "R_ground": float(r_ground),
-                "R_reason": float(r_reason),
-                "R_box": float(r_box),
-                "R": float(r_cls),
-            }
-        )
-        return zeros
+        if pred_cls is False and final_box is None:
+            r_final = r_ok
+        elif pred_cls is True:
+            r_final = r_wrong
+        else:
+            r_final = r_invalid
+        return _pack(r_ground=0.0, r_reason=0.0, r_final=r_final)
+
+    if pred_cls is None:
+        r_final_gate = r_invalid
+    elif pred_cls is False:
+        r_final_gate = r_wrong
+    elif final_px is None:
+        r_final_gate = r_invalid
+    else:
+        r_final_gate = None
 
     if gt_box_px is None:
-        zeros.update(
-            {
-                "R_ground": fmt_w * r_fmt,
-                "R_reason": fmt_w * r_fmt,
-                "R_box": fmt_w * r_fmt,
-                "R": float(r_cls),
-            }
+        return _pack(
+            r_ground=0.0,
+            r_reason=0.0,
+            r_final=r_invalid if r_final_gate is None else r_final_gate,
         )
-        return zeros
 
-    w_img, h_img = float(max(orig_wh[0], 1)), float(max(orig_wh[1], 1))
-    img_area = w_img * h_img
     r_cov = box_coverage(cand_px, gt_box_px) if cand_px is not None else 0.0
+    r_iou_c = box_iou(cand_px, gt_box_px) if cand_px is not None else 0.0
+    r_ground = (w_cov * r_cov + w_cand_iou * r_iou_c) if cand_px is not None else 0.0
+
+    img_area = float(max(orig_wh[0], 1)) * float(max(orig_wh[1], 1))
     r_compact = 0.0
     if cand_px is not None:
         r_compact = float(max(0.0, min(1.0, 1.0 - box_area(cand_px) / max(img_area, 1.0))))
-    r_iou = box_iou(pred_px, gt_box_px) if pred_px is not None else 0.0
-    r_iou_c = box_iou(cand_px, gt_box_px) if cand_px is not None else 0.0
-    r_edge = edge_precision_reward(pred_px, gt_box_px, orig_wh, beta) if pred_px is not None else 0.0
-    r_center = center_reward(pred_px, gt_box_px, orig_wh, gamma) if pred_px is not None else 0.0
 
     d_star: Dict[str, str] = {}
+    r_dir = 0.0
     if cand_px is not None:
         d_star = boundary_targets(
             pixels_to_qwen1000(cand_px, orig_wh),
             pixels_to_qwen1000(gt_box_px, orig_wh),
             keep_tol,
         )
-    pred_d = parsed.get("boundary") or {}
-    r_dir = (sum(1 for k in EDGE_KEYS if pred_d.get(k) == d_star.get(k)) / 4.0) if d_star else 0.0
+        pred_d = parsed.get("boundary") or {}
+        r_dir = sum(1 for k in EDGE_KEYS if pred_d.get(k) == d_star.get(k)) / 4.0
+    r_reason = r_dir
 
-    r_ground = w_cov * r_cov + w_compact * r_compact + fmt_w * r_fmt
-    r_reason = r_dir + fmt_w * r_fmt
-    r_box = w_iou * r_iou + w_edge * r_edge + w_center * r_center + fmt_w * r_fmt
-    return {
-        "R_cov": float(r_cov),
-        "R_compact": float(r_compact),
-        "R_dir": float(r_dir),
-        "R_iou": float(r_iou),
-        "R_iou_c": float(r_iou_c),
-        "R_edge": float(r_edge),
-        "R_center": float(r_center),
-        "R_format": float(r_fmt),
-        "R_cls": float(r_cls),
-        "R_ground": float(r_ground),
-        "R_reason": float(r_reason),
-        "R_box": float(r_box),
-        "R": float(r_box),
-        "pred_box_px": pred_px,
-        "cand_box_px": cand_px,
-        "pred_cls": pred_cls,
-        "d_star": d_star,
-    }
+    r_iou = 0.0
+    r_edge = 0.0
+    if r_final_gate is not None:
+        r_final = r_final_gate
+    else:
+        r_iou = box_iou(final_px, gt_box_px)
+        r_edge = edge_precision_reward(final_px, gt_box_px, orig_wh, beta)
+        r_final = w_iou * r_iou + w_edge * r_edge
+
+    return _pack(
+        r_ground=r_ground,
+        r_reason=r_reason,
+        r_final=r_final,
+        r_cov=r_cov,
+        r_iou_c=r_iou_c,
+        r_dir=r_dir,
+        r_iou=r_iou,
+        r_edge=r_edge,
+        r_compact=r_compact,
+        d_star=d_star,
+    )

@@ -176,10 +176,10 @@ def format_grpo_group_text(
         adv = f" adv={float(advantages[i]):+.3f}" if advantages is not None else ""
         lp = f" logp={float(logprobs[i]):.3f}" if logprobs is not None else ""
         lines.append(
-            f"--- τ[{i}]  Rb={det.get('R_box', 0):.3f} Rg={det.get('R_ground', 0):.3f} "
-            f"Rr={det.get('R_reason', 0):.3f} Rc={det.get('R_cls', 0):.3f} cov={det.get('R_cov', 0):.3f} "
+            f"--- τ[{i}]  Rf={det.get('R_final', 0):.3f} Rg={det.get('R_ground', 0):.3f} "
+            f"Rr={det.get('R_reason', 0):.3f} cov={det.get('R_cov', 0):.3f} "
             f"dir={det.get('R_dir', 0):.3f} iou_f={det.get('R_iou', 0):.3f} iou_c={det.get('R_iou_c', 0):.3f} "
-            f"edge={det.get('R_edge', 0):.3f} ctr={det.get('R_center', 0):.3f}{adv}{lp}"
+            f"edge={det.get('R_edge', 0):.3f} compact={det.get('R_compact', 0):.3f}{adv}{lp}"
         )
         lines.append((text or "")[:1800])
         lines.append("")
@@ -336,12 +336,9 @@ def log_grpo_scalars(
     writer.add_scalar("grpo/R_dir", mean("R_dir"), step)
     writer.add_scalar("grpo/R_iou", mean("R_iou"), step)
     writer.add_scalar("grpo/R_edge", mean("R_edge"), step)
-    writer.add_scalar("grpo/R_center", mean("R_center"), step)
-    writer.add_scalar("grpo/R_format", mean("R_format"), step)
     writer.add_scalar("grpo/R_ground", mean("R_ground"), step)
     writer.add_scalar("grpo/R_reason", mean("R_reason"), step)
-    writer.add_scalar("grpo/R_box", mean("R_box"), step)
-    writer.add_scalar("grpo/R_cls", mean("R_cls"), step)
+    writer.add_scalar("grpo/R_final", mean("R_final"), step)
     writer.add_scalar("grpo/R_iou_c", mean("R_iou_c"), step)
     writer.add_scalar("grpo/advantage_mean", float(adv.mean()), step)
     writer.add_scalar("grpo/advantage_std", float(adv.std(unbiased=False)), step)
@@ -362,11 +359,11 @@ def log_grpo_scalars(
         except (TypeError, ValueError):
             continue
     for i, det in enumerate(details[:8]):
-        writer.add_scalar(f"grpo/traj_{i}/R_box", float(det.get("R_box", det.get("R", 0.0))), step)
+        writer.add_scalar(f"grpo/traj_{i}/R_final", float(det.get("R_final", det.get("R", 0.0))), step)
         writer.add_scalar(f"grpo/traj_{i}/R_ground", float(det.get("R_ground", 0.0)), step)
         writer.add_scalar(f"grpo/traj_{i}/R_iou", float(det.get("R_iou", 0.0)), step)
         if i < adv.numel():
-            writer.add_scalar(f"grpo/traj_{i}/advantage_box", float(adv[i]), step)
+            writer.add_scalar(f"grpo/traj_{i}/advantage_final", float(adv[i]), step)
     writer.flush()
 
 

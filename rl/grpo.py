@@ -121,7 +121,7 @@ def clipped_pg_kl(
     clip_high: float,
     kl_beta: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    rho = (new_lp - old_lp).exp().clamp(max=1.0e4)
+    rho = torch.exp((new_lp - old_lp).clamp(-20.0, 20.0))
     clipped = rho.clamp(1.0 - float(clip_low), 1.0 + float(clip_high))
     surr = torch.minimum(rho * adv, clipped * adv)
     denom = mask.sum().clamp(min=1)
@@ -137,7 +137,7 @@ def clipped_pg_kl(
 def grpo_advantages(rewards: torch.Tensor, group: int, eps: float) -> torch.Tensor:
     r = rewards.view(-1, group)
     mean = r.mean(dim=1, keepdim=True)
-    std = r.std(dim=1, keepdim=True).clamp(min=eps)
+    std = r.std(dim=1, keepdim=True, unbiased=False).clamp(min=eps)
     adv = (r - mean) / std
     return adv.reshape(-1)
 
@@ -164,20 +164,19 @@ def build_segment_advantages(
     max_t: int,
     a_ground: torch.Tensor,
     a_reason: torch.Tensor,
-    a_box: torch.Tensor,
-    a_cls: torch.Tensor,
-    rew_cfg: dict,
+    a_final: torch.Tensor,
+    is_anomaly: bool,
     device: torch.device,
 ) -> torch.Tensor:
     adv = torch.zeros(len(seqs), max(max_t - 1, 1), device=device, dtype=torch.float32)
     for i, s in enumerate(seqs):
         comp = s[prompt_len:]
         segs = completion_segment_ids(tokenizer, comp)
-        ag, ar, ab, ac = float(a_ground[i]), float(a_reason[i]), float(a_box[i]), float(a_cls[i])
+        ag, ar, af = float(a_ground[i]), float(a_reason[i]), float(a_final[i])
         for k, seg in enumerate(segs):
             j = prompt_len - 1 + k
             if 0 <= j < adv.shape[1]:
-                adv[i, j] = mix_segment_advantage(seg, ag, ar, ab, ac, rew_cfg)
+                adv[i, j] = mix_segment_advantage(seg, ag, ar, af, is_anomaly)
     return adv
 
 
@@ -199,19 +198,15 @@ def grpo_param_map(gcfg: dict, *, lr: float, accum: int, group: int, temperature
         "min_reward_std": float(gcfg.get("min_reward_std", 0.02)),
         "max_resample_attempts": float(gcfg.get("max_resample_attempts", 2)),
         "epochs": float(gcfg.get("epochs", 2)),
-        "cls_correct": float(rew.get("cls_correct", 1.0)),
-        "cls_wrong": float(rew.get("cls_wrong", -1.0)),
-        "cls_invalid": float(rew.get("cls_invalid", -0.5)),
-        "w_cov": float(rew.get("w_cov", 0.7)),
-        "w_compact": float(rew.get("w_compact", 0.3)),
-        "w_iou": float(rew.get("w_iou", 0.45)),
-        "w_edge": float(rew.get("w_edge", 0.40)),
-        "w_center": float(rew.get("w_center", 0.15)),
+        "w_cov": float(rew.get("w_cov", 0.6)),
+        "w_cand_iou": float(rew.get("w_cand_iou", 0.4)),
+        "w_iou": float(rew.get("w_iou", 0.6)),
+        "w_edge": float(rew.get("w_edge", 0.4)),
         "edge_beta": float(rew.get("edge_beta", 8.0)),
-        "center_gamma": float(rew.get("center_gamma", 8.0)),
-        "format_weight": float(rew.get("format_weight", 0.03)),
         "keep_tol_norm1000": float(rew.get("keep_tol_norm1000", 8.0)),
-        "normal_false_positive": float(rew.get("normal_false_positive", -0.5)),
+        "normal_correct": float(rew.get("normal_correct", 1.0)),
+        "wrong_decision": float(rew.get("wrong_decision", -1.0)),
+        "invalid_output": float(rew.get("invalid_output", -0.5)),
     }
 
 

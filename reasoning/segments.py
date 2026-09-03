@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 from reasoning.parser import TAG_BLOCK_RE
+
+# Method-defined mix (not yaml hyperparameters).
+_GROUND_AG, _GROUND_AF = 0.8, 0.2
+_REASON_AR, _REASON_AF = 0.7, 0.3
 
 
 def _seg_role(tag: str) -> str:
@@ -48,21 +52,13 @@ def mix_segment_advantage(
     seg: str,
     a_ground: float,
     a_reason: float,
-    a_box: float,
-    a_cls: float,
-    rew_cfg: Optional[dict] = None,
+    a_final: float,
+    is_anomaly: bool,
 ) -> float:
-    cfg = rew_cfg or {}
+    if not is_anomaly:
+        return a_final
     if seg == "ground":
-        return (
-            float(cfg.get("a_ground_on_ground", 0.6)) * a_ground
-            + float(cfg.get("a_cls_on_ground", 0.2)) * a_cls
-            + float(cfg.get("a_box_on_ground", 0.2)) * a_box
-        )
+        return _GROUND_AG * a_ground + _GROUND_AF * a_final
     if seg == "reason":
-        return (
-            float(cfg.get("a_reason_on_reason", 0.3)) * a_reason
-            + float(cfg.get("a_cls_on_reason", 0.3)) * a_cls
-            + float(cfg.get("a_box_on_reason", 0.4)) * a_box
-        )
-    return float(cfg.get("a_cls_on_answer", 0.7)) * a_cls + float(cfg.get("a_box_on_answer", 0.3)) * a_box
+        return _REASON_AR * a_reason + _REASON_AF * a_final
+    return a_final
