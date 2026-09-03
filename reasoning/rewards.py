@@ -68,17 +68,55 @@ def boundary_targets(candidate: List[float], gt: List[float], keep_tol: float) -
     return {"L": l, "R": r, "T": t, "B": b}
 
 
-def edge_precision_reward(pred: List[float], gt: List[float], orig_wh: Tuple[int, int], beta: float) -> float:
+def edge_precision_reward(
+    pred: List[float],
+    gt: List[float],
+    orig_wh: Tuple[int, int],
+    beta: float,
+    min_frac: float = 0.05,
+) -> float:
     w, h = float(max(orig_wh[0], 1)), float(max(orig_wh[1], 1))
     px1, py1, px2, py2 = pred
     gx1, gy1, gx2, gy2 = gt
+    gw = max(gx2 - gx1, float(min_frac) * w)
+    gh = max(gy2 - gy1, float(min_frac) * h)
     dists = [
-        abs(px1 - gx1) / w,
-        abs(px2 - gx2) / w,
-        abs(py1 - gy1) / h,
-        abs(py2 - gy2) / h,
+        abs(px1 - gx1) / gw,
+        abs(px2 - gx2) / gw,
+        abs(py1 - gy1) / gh,
+        abs(py2 - gy2) / gh,
     ]
     return float(sum(math.exp(-beta * d) for d in dists) / 4.0)
+
+
+def boundary_action_consistency(cand_1000, final_1000, pred_d: dict, keep_tol: float) -> float:
+    if cand_1000 is None or final_1000 is None or not pred_d:
+        return 0.0
+    cx1, cy1, cx2, cy2 = map(float, cand_1000)
+    fx1, fy1, fx2, fy2 = map(float, final_1000)
+    tol = float(keep_tol)
+    signed = {
+        "L": fx1 - cx1,
+        "R": cx2 - fx2,
+        "T": fy1 - cy1,
+        "B": cy2 - fy2,
+    }
+    ok = 0
+    n = 0
+    for edge in EDGE_KEYS:
+        d = pred_d.get(edge)
+        if d not in ("inward", "outward", "keep"):
+            continue
+        n += 1
+        delta = signed[edge]
+        if d == "keep":
+            hit = abs(delta) <= tol
+        elif d == "inward":
+            hit = delta > tol
+        else:
+            hit = delta < -tol
+        ok += int(hit)
+    return float(ok / n) if n else 0.0
 
 
 def _to_px(box, orig_wh: Tuple[int, int]) -> Optional[List[float]]:
@@ -103,7 +141,8 @@ def compute_rewards(
     keep_tol = float(rew_cfg.get("keep_tol_norm1000", 8.0))
     r_ok = float(rew_cfg.get("normal_correct", 1.0))
     r_wrong = float(rew_cfg.get("wrong_decision", -1.0))
-    r_invalid = float(rew_cfg.get("invalid_output", -0.5))
+    r_invalid = float(rew_cfg.get("invalid_output", -1.0))
+    edge_min_frac = float(rew_cfg.get("edge_min_frac", 0.05))
 
     pred_cls = parsed.get("is_anomaly")
     protocol_ok = bool(parsed.get("has_tags", False))
@@ -127,6 +166,8 @@ def compute_rewards(
         r_dir: float = 0.0,
         r_iou: float = 0.0,
         r_edge: float = 0.0,
+        delta_iou: float = 0.0,
+        action_consistency: float = 0.0,
         d_star: Optional[dict] = None,
     ) -> Dict[str, Any]:
         return {
@@ -139,6 +180,8 @@ def compute_rewards(
             "R_dir": float(r_dir),
             "R_iou": float(r_iou),
             "R_edge": float(r_edge),
+            "delta_iou": float(delta_iou),
+            "action_consistency": float(action_consistency),
             "pred_box_px": final_px,
             "cand_box_px": cand_px,
             "pred_cls": pred_cls,
@@ -192,12 +235,25 @@ def compute_rewards(
 
     r_iou = 0.0
     r_edge = 0.0
+    iou_f_diag = box_iou(final_px, gt_box_px) if final_px is not None else 0.0
     if r_final_gate is not None:
         r_final = r_final_gate
+    elif final_px is None:
+        r_final = r_invalid
     else:
-        r_iou = box_iou(final_px, gt_box_px)
-        r_edge = edge_precision_reward(final_px, gt_box_px, orig_wh, beta)
+        r_iou = iou_f_diag
+        r_edge = edge_precision_reward(final_px, gt_box_px, orig_wh, beta, min_frac=edge_min_frac)
         r_final = w_iou * r_iou + w_edge * r_edge
+
+    delta_iou = float(iou_f_diag - r_iou_c)
+    action_cons = 0.0
+    if cand_ok and final_px is not None:
+        action_cons = boundary_action_consistency(
+            pixels_to_qwen1000(cand_px, orig_wh),
+            pixels_to_qwen1000(final_px, orig_wh),
+            parsed.get("boundary") or {},
+            keep_tol,
+        )
 
     return _pack(
         r_ground=r_ground,
@@ -208,5 +264,7 @@ def compute_rewards(
         r_dir=r_dir,
         r_iou=r_iou,
         r_edge=r_edge,
+        delta_iou=delta_iou,
+        action_consistency=action_cons,
         d_star=d_star,
     )

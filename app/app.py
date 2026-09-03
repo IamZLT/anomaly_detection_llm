@@ -25,7 +25,6 @@ from utils.common import (
     infer_model_compute_device,
     parse_grounding_output,
     qwen_norm1000_to_original_pixels,
-    smart_resize,
 )
 from utils.config import load_yaml_config, apply_runtime_overrides
 
@@ -159,13 +158,7 @@ def inference():
         # 加载模型
         model, processor = load_model()
 
-        processed_image, _, scale_factor = smart_resize(
-            image.copy(),
-            max_size=cfg["data"]["max_image_size"],
-            factor=cfg["data"]["factor"],
-        )
-
-        inputs = build_generation_inputs(cfg, processor, processed_image, prompt)
+        inputs = build_generation_inputs(cfg, processor, image, prompt)
         model_device = infer_model_compute_device(model)
         inputs = {
             k: v.to(model_device) if torch.is_tensor(v) else v for k, v in inputs.items()

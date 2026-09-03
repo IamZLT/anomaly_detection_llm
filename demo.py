@@ -20,7 +20,6 @@ from utils.common import (
     draw_bbox_on_image,
     infer_model_compute_device,
     qwen_norm1000_to_original_pixels,
-    smart_resize,
 )
 from utils.config import apply_runtime_overrides, load_yaml_config
 
@@ -58,12 +57,8 @@ def main() -> None:
         model = model.to("cuda")
 
     image_original = Image.open(image_path).convert("RGB")
-    image, original_size, _ = smart_resize(
-        image_original.copy(),
-        max_size=int(cfg.get("data", {}).get("max_image_size", 448)),
-        factor=int(cfg.get("data", {}).get("factor", 28)),
-    )
-    inputs = build_generation_inputs(cfg, processor, image, prompt)
+    original_size = image_original.size
+    inputs = build_generation_inputs(cfg, processor, image_original, prompt)
     device = infer_model_compute_device(model)
     inputs = {k: v.to(device) if torch.is_tensor(v) else v for k, v in inputs.items()}
     inf = cfg.get("inference") or {}

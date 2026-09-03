@@ -157,6 +157,27 @@ def group_std(vals: List[float]) -> float:
     return float(t.std(unbiased=False))
 
 
+def padded_completion_tensors(
+    seqs: List[torch.Tensor],
+    prompt_len: int,
+    pad_id: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad by length, not by token identity, so pad_id==eos_id does not mask real EOS."""
+    max_t = max(int(s.numel()) for s in seqs)
+    group = len(seqs)
+    outputs = torch.full((group, max_t), int(pad_id), device=device, dtype=torch.long)
+    attn = torch.zeros((group, max_t), device=device, dtype=torch.long)
+    labels = torch.full((group, max_t), -100, device=device, dtype=torch.long)
+    for i, s in enumerate(seqs):
+        n = int(s.numel())
+        outputs[i, :n] = s.to(device)
+        attn[i, :n] = 1
+        if n > int(prompt_len):
+            labels[i, int(prompt_len) : n] = s[int(prompt_len) :].to(device)
+    return outputs, attn, labels
+
+
 def build_segment_advantages(
     tokenizer,
     seqs: List[torch.Tensor],
@@ -206,7 +227,8 @@ def grpo_param_map(gcfg: dict, *, lr: float, accum: int, group: int, temperature
         "keep_tol_norm1000": float(rew.get("keep_tol_norm1000", 8.0)),
         "normal_correct": float(rew.get("normal_correct", 1.0)),
         "wrong_decision": float(rew.get("wrong_decision", -1.0)),
-        "invalid_output": float(rew.get("invalid_output", -0.5)),
+        "invalid_output": float(rew.get("invalid_output", -1.0)),
+        "edge_min_frac": float(rew.get("edge_min_frac", 0.05)),
     }
 
 

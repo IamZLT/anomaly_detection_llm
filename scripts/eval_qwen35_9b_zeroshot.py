@@ -18,7 +18,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from models.qwen35 import setup_model_and_processor
+from models.qwen35 import qwen_vision_factor, setup_model_and_processor
 from utils.common import parse_grounding_output, qwen_norm1000_to_original_pixels, smart_resize
 from utils.config import load_yaml_config
 from evaluation.infer import build_generation_inputs, decode_generation_output
@@ -230,7 +230,8 @@ def main() -> None:
     print(f"[eval] model ready on {device} in {time.time() - t0:.1f}s", flush=True)
 
     max_image_size = int(cfg.get("data", {}).get("max_image_size", 512))
-    factor = int(cfg.get("data", {}).get("factor", 28))
+    raw_factor = cfg.get("data", {}).get("factor")
+    factor = int(raw_factor) if raw_factor not in (None, "", "null", "None") else qwen_vision_factor(processor)
     print(f"[eval] input resize: max_image_size={max_image_size} factor={factor} bbox=qwen_norm1000", flush=True)
 
     results: List[Dict[str, Any]] = []

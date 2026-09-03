@@ -10,7 +10,14 @@ import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from evaluation.metrics import box_ious_from_parsed, classification_correct, is_truncated
+from evaluation.metrics import (
+    box_ious_from_parsed,
+    classification_correct,
+    defect_size_bin,
+    gt_relative_area,
+    is_truncated,
+    summarize_detection_metrics,
+)
 from models.qwen35 import force_vision_eval
 from reasoning.parser import parse_cot_output
 from reasoning.rewards import box_iou, qwen1000_to_pixels_strict, valid_bbox_1000
@@ -60,6 +67,7 @@ def run_simple_eval(
     n_hit = 0
     parse_ok = 0
     records = []
+    metric_rows = []
     if n_max is None:
         n_max = (cfg.get("training") or {}).get("eval_num_samples", 8)
     if n_max in (None, "null", "None", ""):
@@ -96,6 +104,8 @@ def run_simple_eval(
         iou_v = 0.0
         iou_c = 0.0
         pred_px = None
+        a_gt = gt_relative_area(meta.get("gt_box_px"), orig) if is_anom else 0.0
+        size_bin = defect_size_bin(a_gt, is_anom)
         if is_anom:
             n_anom += 1
             gt = meta.get("gt_box_px")
@@ -113,6 +123,18 @@ def run_simple_eval(
             if cand_box is not None and gt is not None and valid_bbox_1000(cand_box):
                 iou_c = box_iou(qwen1000_to_pixels_strict(cand_box, orig), gt)
             ious_c.append(iou_c)
+        metric_rows.append(
+            {
+                "is_anomaly": is_anom,
+                "pred_cls": pred_cls,
+                "class_name": meta.get("class_name"),
+                "iou_f": iou_v,
+                "iou_c": iou_c,
+                "a_gt": a_gt,
+                "size_bin": size_bin,
+                "rec_ok": ok,
+            }
+        )
         if writer is not None and log_images and seen < vis_n:
             vis_dir = os.path.join(
                 str((cfg.get("paths") or {}).get("output_dir") or "."),
@@ -140,6 +162,8 @@ def run_simple_eval(
                 "pred_anomaly": pred_cls,
                 "iou": iou_v,
                 "iou_c": iou_c,
+                "a_gt": a_gt,
+                "size_bin": size_bin,
                 "pred_box": pred_px,
                 "response": text[:2000],
                 "parsed": parsed.get("raw"),
@@ -149,24 +173,35 @@ def run_simple_eval(
     n = max(seen, 1)
     mean_iou = float(sum(ious) / len(ious)) if ious else 0.0
     mean_iou_c = float(sum(ious_c) / len(ious_c)) if ious_c else 0.0
+    extra = summarize_detection_metrics(metric_rows)
     if writer is not None:
         writer.add_scalar("eval/rec_acc", rec_ok / n, global_step)
-        writer.add_scalar("eval/iou_at_03", (n_hit / n_anom) if n_anom else 0.0, global_step)
+        writer.add_scalar("eval/iou_at_03", extra.get("iou_at_03", (n_hit / n_anom) if n_anom else 0.0), global_step)
         writer.add_scalar("eval/mean_iou", mean_iou, global_step)
+        writer.add_scalar("eval/mean_iou_gated", extra.get("mean_iou_gated", 0.0), global_step)
         writer.add_scalar("eval/mean_iou_c", mean_iou_c, global_step)
+        writer.add_scalar("eval/acc_at_01", extra.get("acc_at_01", 0.0), global_step)
+        writer.add_scalar("eval/acc_at_03", extra.get("acc_at_03", 0.0), global_step)
+        writer.add_scalar("eval/acc_at_05", extra.get("acc_at_05", 0.0), global_step)
+        writer.add_scalar("eval/macro_miou", extra.get("macro_miou", 0.0), global_step)
+        for b in ("small", "medium", "large"):
+            writer.add_scalar(f"eval/mean_iou_{b}", extra.get(f"mean_iou_{b}", 0.0), global_step)
+            writer.add_scalar(f"eval/mean_iou_gated_{b}", extra.get(f"mean_iou_gated_{b}", 0.0), global_step)
         writer.add_scalar("eval/json_parse_rate", parse_ok / n, global_step)
         writer.flush()
     model.train()
     force_vision_eval(model)
-    return {
+    out = {
         "n": seen,
         "rec_acc": rec_ok / n,
-        "iou_at_03": (n_hit / n_anom) if n_anom else 0.0,
+        "iou_at_03": extra.get("iou_at_03", (n_hit / n_anom) if n_anom else 0.0),
         "mean_iou": mean_iou,
         "mean_iou_c": mean_iou_c,
         "json_parse_rate": parse_ok / n,
         "records": records,
     }
+    out.update({k: v for k, v in extra.items() if k not in out})
+    return out
 
 
 def run_final_mvtec_eval(cfg, model, processor, eval_loader, writer, output_dir, tag: str) -> dict:
@@ -181,8 +216,9 @@ def run_final_mvtec_eval(cfg, model, processor, eval_loader, writer, output_dir,
         n_max=n_max,
     )
     train_log(
-        f"[final-{tag}] MVTec n={stats['n']} rec={stats['rec_acc']:.3f} "
-        f"iou03={stats['iou_at_03']:.3f} mean_iou={stats['mean_iou']:.3f}",
+        f"[final-{tag}] n={stats['n']} rec={stats['rec_acc']:.3f} "
+        f"iou03={stats['iou_at_03']:.3f} gated_mIoU={stats.get('mean_iou_gated', 0.0):.3f} "
+        f"acc@0.5={stats.get('acc_at_05', 0.0):.3f} mean_iou={stats['mean_iou']:.3f}",
         main_only=True,
     )
     os.makedirs(os.path.join(output_dir, "eval_steps"), exist_ok=True)

@@ -137,11 +137,18 @@ class AnomalyPrior(nn.Module):
         pixel_values: torch.Tensor,
         image_grid_thw: torch.Tensor,
     ) -> Tuple[List[torch.Tensor], Tuple[int, int]]:
-        from transformers.models.qwen3_5.modeling_qwen3_5 import (
-            get_vision_bilinear_indices_and_weights,
-            get_vision_cu_seqlens,
-            get_vision_position_ids,
-        )
+        try:
+            from transformers.models.qwen3_5.modeling_qwen3_5 import (
+                get_vision_bilinear_indices_and_weights,
+                get_vision_cu_seqlens,
+                get_vision_position_ids,
+            )
+        except ImportError as e:
+            raise ImportError(
+                "AnomalyPrior needs transformers Qwen3.5 vision helpers "
+                "(pin requirements.txt: transformers>=5.14,<5.15; tested 5.14.1). "
+                f"Original error: {e}"
+            ) from e
 
         visual = self.visual
         pv = pixel_values.type(visual.dtype)

@@ -13,6 +13,13 @@ BOX_STATE_INVALID = "invalid"
 EDGE_KEYS = ("L", "R", "T", "B")
 EDGE_CHOICES = ("inward", "outward", "keep")
 TAG_NAMES = ("compare", "ground", "verify", "boundary", "answer")
+_COPY_MARKERS = (
+    "return exactly five",
+    "do not copy",
+    "xml blocks",
+    "output exactly one json",
+    "candidate_bbox_2d=[x1,y1,x2,y2]",
+)
 TAG_BLOCK_RE = re.compile(
     r"<(compare|ground|verify|boundary|answer)\s*>(.*?)</\1>",
     re.IGNORECASE | re.DOTALL,
@@ -176,12 +183,7 @@ def parse_answer_block(answer_txt: str) -> Dict[str, Any]:
     try:
         obj = json.loads(blob)
     except Exception:
-        m = re.search(r"\{.*\}", blob, re.DOTALL)
-        if m:
-            try:
-                obj = json.loads(m.group(0))
-            except Exception:
-                obj = None
+        obj = None
     if not isinstance(obj, dict):
         return {
             "answer_state": BOX_STATE_INVALID,
@@ -217,18 +219,40 @@ def parse_boundary_block(bound_txt: str) -> tuple:
     return ("complete" if len(boundary) == 4 else BOX_STATE_INVALID), boundary
 
 
+def structural_prose_ok(chunk: str, min_chars: int = 12) -> bool:
+    s = re.sub(
+        r"candidate_bbox_2d\s*[:=]\s*(null|none|\[[^\]]*\])",
+        "",
+        chunk or "",
+        flags=re.I,
+    )
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) < min_chars:
+        return False
+    low = s.lower()
+    if any(m in low for m in _COPY_MARKERS):
+        return False
+    tokens = re.findall(r"[A-Za-z]+", s)
+    if tokens and len(set(t.lower() for t in tokens)) <= 1:
+        return False
+    return True
+
+
 def _trajectory_valid(
     *,
     has_tags: bool,
+    tags: Dict[str, str],
     candidate_state: str,
     candidate_bbox,
     boundary_state: str,
     answer: Dict[str, Any],
 ) -> bool:
     pred_cls = answer.get("is_anomaly")
+    prose_ok = structural_prose_ok(tags.get("compare", "")) and structural_prose_ok(tags.get("verify", ""))
     if pred_cls is False:
         return (
             has_tags
+            and prose_ok
             and candidate_state == BOX_STATE_NULL
             and boundary_state == "not_applicable"
             and answer.get("answer_state") == "ok"
@@ -237,6 +261,7 @@ def _trajectory_valid(
     if pred_cls is True:
         return (
             has_tags
+            and prose_ok
             and candidate_state == BOX_STATE_BOX
             and _valid_bbox_1000(candidate_bbox)
             and boundary_state == "complete"
@@ -275,8 +300,10 @@ def _pack_parsed(
         "bbox_2d": answer.get("bbox_2d"),
         "final_bbox_state": answer.get("final_bbox_state"),
         "answer_state": answer.get("answer_state"),
+        "prose_ok": structural_prose_ok(tags.get("compare", "")) and structural_prose_ok(tags.get("verify", "")),
         "trajectory_valid": _trajectory_valid(
             has_tags=has_tags,
+            tags=tags,
             candidate_state=candidate_state,
             candidate_bbox=cand,
             boundary_state=boundary_state,

@@ -60,6 +60,7 @@ def main() -> None:
     compact = {k: v for k, v in stats.items() if k != "records"}
     print(
         f"[evaluate] n={stats['n']} rec={stats['rec_acc']:.3f} "
+        f"gated_mIoU={stats.get('mean_iou_gated', 0.0):.3f} acc@0.5={stats.get('acc_at_05', 0.0):.3f} "
         f"iou03={stats['iou_at_03']:.3f} mean_iou_f={stats['mean_iou']:.3f} "
         f"mean_iou_c={stats['mean_iou_c']:.3f}",
         flush=True,

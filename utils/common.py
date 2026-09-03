@@ -47,19 +47,57 @@ def train_log(msg: str, main_only: bool = False) -> None:
     print(f"[train rank={rank} local={lr}] {msg}", flush=True)
 
 
+def qwen_smart_hw(
+    height: int,
+    width: int,
+    factor: int = 32,
+    min_pixels: int = 32 * 32,
+    max_pixels: int = 448 * 448,
+) -> Tuple[int, int]:
+    """Official Qwen-VL smart_resize: both sides divisible by factor, pixels in [min, max].
+
+    Returns (height, width). Qwen3.5 uses factor = patch_size * spatial_merge_size = 32.
+    """
+    import math
+
+    factor = max(int(factor), 1)
+    min_pixels = max(int(min_pixels), factor * factor)
+    max_pixels = max(int(max_pixels), min_pixels)
+    h = max(int(height), 1)
+    w = max(int(width), 1)
+    if max(h, w) / min(h, w) > 200:
+        raise ValueError(f"absolute aspect ratio must be smaller than 200, got {max(h, w) / min(h, w)}")
+    h_bar = round(h / factor) * factor
+    w_bar = round(w / factor) * factor
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((h * w) / max_pixels)
+        h_bar = max(factor, math.floor(h / beta / factor) * factor)
+        w_bar = max(factor, math.floor(w / beta / factor) * factor)
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (h * w))
+        h_bar = math.ceil(h * beta / factor) * factor
+        w_bar = math.ceil(w * beta / factor) * factor
+    return int(h_bar), int(w_bar)
+
+
 def smart_resize(
-    image: Image.Image, max_size: int = 1024, factor: int = 28
+    image: Image.Image,
+    max_size: int = 1024,
+    factor: int = 32,
+    min_pixels: Optional[int] = None,
+    max_pixels: Optional[int] = None,
 ) -> Tuple[Image.Image, Tuple[int, int], Tuple[float, float]]:
     original_size = image.size
     w, h = original_size
-    scale = min(max_size / max(w, h), 1.0)
-
-    new_w = int(w * scale / factor) * factor
-    new_h = int(h * scale / factor) * factor
+    factor = max(int(factor), 1)
+    if max_pixels is None:
+        max_pixels = int(max_size) * int(max_size)
+    if min_pixels is None:
+        min_pixels = factor * factor
+    new_h, new_w = qwen_smart_hw(h, w, factor=factor, min_pixels=min_pixels, max_pixels=max_pixels)
     new_w = max(new_w, factor)
     new_h = max(new_h, factor)
-
-    resized = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    resized = image.resize((new_w, new_h), Image.Resampling.BICUBIC)
     return resized, original_size, (new_w / w, new_h / h)
 
 

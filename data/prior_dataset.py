@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import random
 from typing import Any, Dict, List, Optional
@@ -11,6 +12,7 @@ from PIL import Image
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 
+from models.qwen35 import qwen_vision_factor
 from utils.common import smart_resize
 
 
@@ -65,13 +67,34 @@ def pick_ref_image(
     ref_dir: Optional[str] = None,
     layout: str = "mvtec",
     randomize: bool = False,
+    query_size: Optional[tuple] = None,
+    topk: int = 5,
 ) -> str:
     cands = list_normal_refs(cls, dataset_root, query_path, source=source, ref_dir=ref_dir, layout=layout)
     if not cands:
         raise FileNotFoundError(f"no normal reference for class={cls} query={query_path}")
-    if randomize and len(cands) > 1:
+    if not randomize or len(cands) == 1:
+        return cands[0]
+    topk = max(int(topk or 1), 1)
+    if query_size is None or topk >= len(cands):
         return random.choice(cands)
-    return cands[0]
+    qw, qh = float(query_size[0]), float(max(query_size[1], 1))
+    qasp = qw / qh
+    qarea = max(qw * qh, 1.0)
+    scored = []
+    for p in cands:
+        try:
+            with Image.open(p) as im:
+                w, h = im.size
+        except Exception:
+            continue
+        asp = float(w) / float(max(h, 1))
+        area = max(float(w * h), 1.0)
+        score = abs(math.log(max(asp, 1e-6) / max(qasp, 1e-6))) + abs(math.log(area / qarea))
+        scored.append((score, p))
+    scored.sort(key=lambda x: x[0])
+    pool = [p for _, p in scored[:topk]] or cands
+    return random.choice(pool)
 
 
 def apply_chat_template_safe(processor, messages, add_generation_prompt: bool, enable_thinking: bool):
@@ -120,11 +143,10 @@ class PriorCoTDataset(Dataset):
         self.processor = processor
         self.mode = mode
         self.max_length = int(cfg.get("training", {}).get("max_length", 2048))
-        self.max_image_size = int(cfg.get("data", {}).get("max_image_size", 448))
-        self.factor = int(cfg.get("data", {}).get("factor", 28))
         self.dataset_root = str(cfg.get("paths", {}).get("dataset_root", ""))
         self.source = str(cfg.get("data", {}).get("source_dirname", "mvtec_anomaly_detection"))
         self.random_train_ref = bool(cfg.get("data", {}).get("random_train_ref", True))
+        self.ref_topk = int(cfg.get("data", {}).get("ref_topk", 5))
         self.samples = samples
 
     def __len__(self):
@@ -137,6 +159,8 @@ class PriorCoTDataset(Dataset):
         defect = str(meta.get("defect_type") or ("defect" if meta.get("anomaly") else "good"))
         is_anom = bool(meta.get("anomaly", False))
         gt_box = meta.get("bbox")
+        test = Image.open(str(img_path)).convert("RGB")
+        orig_size = test.size
         ref_path = pick_ref_image(
             cls,
             self.dataset_root,
@@ -145,20 +169,16 @@ class PriorCoTDataset(Dataset):
             ref_dir=meta.get("ref_dir"),
             layout=str(meta.get("layout") or "mvtec"),
             randomize=(self.mode == "train" and self.random_train_ref),
+            query_size=orig_size,
+            topk=self.ref_topk,
         )
-        test = Image.open(str(img_path)).convert("RGB")
         ref = Image.open(ref_path).convert("RGB")
-        test_rs, orig_size, _ = smart_resize(test, self.max_image_size, self.factor)
-        ref_rs, _, _ = smart_resize(ref, self.max_image_size, self.factor)
-        if ref_rs.size != test_rs.size:
-            ref_rs = ref_rs.resize(test_rs.size, Image.Resampling.LANCZOS)
         gt_px = None
         if gt_box is not None and len(gt_box) == 4:
-            # bbox is on original pixels; scale to orig_size which is original, keep original for 0-1000
             gt_px = [float(gt_box[0]), float(gt_box[1]), float(gt_box[2]), float(gt_box[3])]
         return {
-            "ref": ref_rs,
-            "test": test_rs,
+            "ref": ref,
+            "test": test,
             "orig_size": orig_size,
             "gt_box_px": gt_px,
             "is_anomaly": is_anom,
@@ -230,17 +250,45 @@ class PriorCollator:
         except Exception:
             return torch.device("cpu")
 
+    def _align_pair(self, ref: Image.Image, test: Image.Image):
+        visual = getattr(self.prior, "visual", None)
+        factor = qwen_vision_factor(self.processor, visual)
+        img_proc = getattr(self.processor, "image_processor", None)
+        data = self.cfg.get("data") or {}
+        max_size = int(data.get("max_image_size", 448))
+        min_pixels = getattr(img_proc, "min_pixels", None) if img_proc is not None else None
+        max_pixels = getattr(img_proc, "max_pixels", None) if img_proc is not None else None
+        if min_pixels is None:
+            min_pixels = factor * factor
+        if max_pixels is None:
+            max_pixels = max_size * max_size
+        test_rs, _, _ = smart_resize(test, max_size=max_size, factor=factor, min_pixels=int(min_pixels), max_pixels=int(max_pixels))
+        ref_rs = ref.resize(test_rs.size, Image.Resampling.BICUBIC)
+        return ref_rs, test_rs
+
+    @staticmethod
+    def _clip_text_tensors(enc: dict, max_length: int) -> dict:
+        ids = enc.get("input_ids")
+        if not torch.is_tensor(ids) or ids.shape[-1] <= max_length:
+            return enc
+        seq = int(ids.shape[-1])
+        for k, v in list(enc.items()):
+            if torch.is_tensor(v) and v.ndim >= 1 and v.shape[-1] == seq:
+                enc[k] = v[..., :max_length]
+        return enc
+
     def _encode_one(self, item: dict) -> dict:
         device = self._device()
+        ref_rs, test_rs = self._align_pair(item["ref"], item["test"])
         heat, hmap = self.prior.heatmap_image(
             self.processor,
-            item["ref"],
-            item["test"],
+            ref_rs,
+            test_rs,
             device=device,
             render=self.render,
             overlay_alpha=self.overlay_alpha,
         )
-        images = [item["ref"], item["test"], heat]
+        images = [ref_rs, test_rs, heat]
         user = {
             "role": "user",
             "content": [
@@ -252,33 +300,21 @@ class PriorCollator:
         }
         messages = [user]
         text = apply_chat_template_safe(self.processor, messages, True, self.enable_thinking)
-        prompt_text = text
-
         max_length = int(self.cfg.get("training", {}).get("max_length", 2048))
-
-        def _proc(txt: str):
-            try:
-                return self.processor(
-                    text=[txt],
-                    images=images,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=max_length,
-                )
-            except TypeError:
-                return self.processor(text=[txt], images=images, return_tensors="pt")
-
-        full = _proc(text)
-        prompt_enc = _proc(prompt_text)
-        for enc in (full, prompt_enc):
-            if "input_ids" in enc and enc["input_ids"].shape[-1] > max_length:
-                enc["input_ids"] = enc["input_ids"][..., :max_length]
-                if "attention_mask" in enc:
-                    enc["attention_mask"] = enc["attention_mask"][..., :max_length]
+        try:
+            full = self.processor(
+                text=[text],
+                images=images,
+                return_tensors="pt",
+                truncation=True,
+                max_length=max_length,
+            )
+        except TypeError:
+            full = self.processor(text=[text], images=images, return_tensors="pt")
+        full = self._clip_text_tensors(full, max_length)
         out = {k: v.squeeze(0) if isinstance(v, torch.Tensor) and v.shape[0] == 1 else v for k, v in full.items()}
-        prompt_ids = prompt_enc["input_ids"].squeeze(0)
+        prompt_ids = out["input_ids"]
         out["prompt_len"] = torch.tensor(int(prompt_ids.numel()), dtype=torch.long)
-        # meta for GRPO / eval (not fed to model.forward)
         out["_meta"] = {
             "orig_size": item["orig_size"],
             "gt_box_px": item["gt_box_px"],
@@ -286,10 +322,11 @@ class PriorCollator:
             "image_path": item["image_path"],
             "class_name": item["class_name"],
             "defect_type": item.get("defect_type"),
-            "ref": item["ref"],
-            "test": item["test"],
+            "ref": ref_rs,
+            "test": test_rs,
             "heatmap": heat,
             "hmap_tensor": hmap.detach().cpu(),
+            "vision_size": test_rs.size,
         }
         return out
 

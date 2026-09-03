@@ -253,3 +253,31 @@ def balance_normal_anomaly(samples: List[dict], data_cfg: dict, seed: int = 42) 
         out.extend(norms[:n_keep])
     rng.shuffle(out)
     return out
+
+
+def split_holdout_by_class(samples: List[dict], ratio: float, seed: int = 42) -> tuple[List[dict], List[dict]]:
+    """Per-class VisA holdout so mid-training eval does not use MVTec test."""
+    from collections import defaultdict
+
+    ratio = float(ratio or 0.0)
+    if ratio <= 0 or not samples:
+        return list(samples), []
+    by_cls: Dict[str, List[dict]] = defaultdict(list)
+    for s in samples:
+        by_cls[_sample_class(s)].append(s)
+    rng = random.Random(seed)
+    train: List[dict] = []
+    dev: List[dict] = []
+    for cls in sorted(by_cls):
+        items = list(by_cls[cls])
+        rng.shuffle(items)
+        n_hold = int(round(len(items) * ratio))
+        if len(items) <= 1:
+            n_hold = 0
+        else:
+            n_hold = min(max(n_hold, 0), len(items) - 1)
+        dev.extend(items[:n_hold])
+        train.extend(items[n_hold:])
+    rng.shuffle(train)
+    rng.shuffle(dev)
+    return train, dev

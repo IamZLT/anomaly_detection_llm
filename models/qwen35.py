@@ -11,6 +11,71 @@ from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
 from utils.common import is_main_process
 
 
+def qwen_vision_factor(processor=None, visual=None) -> int:
+    """Qwen3.5 spatial alignment unit: patch_size * spatial_merge_size (typically 16*2=32)."""
+    patch, merge = 16, 2
+    img = getattr(processor, "image_processor", processor) if processor is not None else None
+    if img is not None:
+        p = getattr(img, "patch_size", None)
+        m = getattr(img, "merge_size", None) or getattr(img, "spatial_merge_size", None)
+        if p is not None:
+            patch = int(p[-1] if isinstance(p, (list, tuple)) else p)
+        if m is not None:
+            merge = int(m)
+    if visual is not None:
+        cfg = getattr(visual, "config", visual)
+        p = getattr(cfg, "patch_size", None)
+        m = getattr(cfg, "spatial_merge_size", None)
+        if p is not None:
+            patch = int(p[-1] if isinstance(p, (list, tuple)) else p)
+        if m is not None:
+            merge = int(m)
+    return max(int(patch) * int(merge), 1)
+
+
+def apply_processor_geometry(processor, cfg: dict, visual=None) -> int:
+    """Sync the official image processor to the vision tower and our pixel budget."""
+    img = getattr(processor, "image_processor", None)
+    if img is None:
+        return qwen_vision_factor(processor, visual)
+    if visual is not None:
+        vcfg = getattr(visual, "config", visual)
+        patch = getattr(vcfg, "patch_size", None)
+        merge = getattr(vcfg, "spatial_merge_size", None)
+        if patch is not None:
+            img.patch_size = int(patch[-1] if isinstance(patch, (list, tuple)) else patch)
+        if merge is not None and hasattr(img, "merge_size"):
+            img.merge_size = int(merge)
+    factor = qwen_vision_factor(processor, visual)
+    data = cfg.get("data") or {}
+    max_size = int(data.get("max_image_size", 448))
+    max_pixels = data.get("max_pixels")
+    min_pixels = data.get("min_pixels")
+    max_pixels = int(max_pixels) if max_pixels not in (None, "", "null", "None") else max_size * max_size
+    min_pixels = int(min_pixels) if min_pixels not in (None, "", "null", "None") else factor * factor
+    if hasattr(img, "min_pixels"):
+        img.min_pixels = int(min_pixels)
+    if hasattr(img, "max_pixels"):
+        img.max_pixels = int(max_pixels)
+    size = getattr(img, "size", None)
+    if isinstance(size, dict):
+        size["shortest_edge"] = int(min_pixels)
+        size["longest_edge"] = int(max_pixels)
+    cfg_factor = data.get("factor")
+    if cfg_factor not in (None, "", "null", "None"):
+        want = int(cfg_factor)
+        if want != factor and is_main_process():
+            print(f"[setup] data.factor={want} ignored; using native vision factor={factor}", flush=True)
+    if is_main_process():
+        print(
+            f"[setup] Qwen vision geometry factor={factor} "
+            f"min_pixels={min_pixels} max_pixels={max_pixels} "
+            f"(patch={getattr(img, 'patch_size', '?')} merge={getattr(img, 'merge_size', '?')})",
+            flush=True,
+        )
+    return factor
+
+
 def unwrap_qwen_core(qwen: nn.Module) -> nn.Module:
     if hasattr(qwen, "get_base_model"):
         try:
@@ -145,6 +210,12 @@ def setup_model_and_processor(
             f"[setup] Qwen-VL 就绪：总参数 {n_param / 1e6:.1f}M，可训练 {n_train / 1e6:.1f}M",
             flush=True,
         )
+    visual = None
+    mods = _vision_modules(model)
+    if mods:
+        visual = mods[0]
+    apply_processor_geometry(processor, cfg, visual=visual)
+
     if for_inference:
         model.eval()
     else:

@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from data.prior_dataset import PriorCollator, PriorCoTDataset
-from data.scan import load_prior_split
+from data.scan import load_prior_split, split_holdout_by_class
 from evaluation.evaluator import (
     first_anomaly_item,
     log_grpo_probe_cot,
@@ -23,7 +23,7 @@ from evaluation.evaluator import (
     run_simple_eval,
     tb_vis_flags,
 )
-from evaluation.metrics import is_truncated
+from evaluation.metrics import defect_size_bin, gt_relative_area, is_truncated
 from models.anomaly_prior import AnomalyPrior
 from models.lora import apply_lora
 from models.qwen35 import freeze_vision_encoder, force_vision_eval, setup_model_and_processor
@@ -41,6 +41,7 @@ from rl.grpo import (
     group_std,
     model_inputs,
     move_batch,
+    padded_completion_tensors,
     resolve_max_steps,
     token_logprobs,
     token_logprobs_nograd,
@@ -85,6 +86,9 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
     kl_beta = float(gcfg.get("kl_beta", 1.0e-4))
     min_std = float(gcfg.get("min_reward_std", 0.02))
     max_resample = int(gcfg.get("max_resample_attempts", 2))
+    hard_resample = int(gcfg.get("hard_resample_attempts", 4))
+    small_area = float(gcfg.get("small_area_thresh", 0.02))
+    log_mvtec_probe = bool((cfg.get("tensorboard") or {}).get("log_mvtec_probe", False))
     eval_every = int(cfg.get("training", {}).get("eval_every_n_steps", 50))
     save_every = int(gcfg.get("save_steps", 100))
     tb = cfg.get("tensorboard") or {}
@@ -111,10 +115,13 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
     device = next(model.parameters()).device
     tok = getattr(processor, "tokenizer", processor)
     eos_id = tok.eos_token_id
-    eval_ds = getattr(eval_loader, "dataset", None)
-    crossdomain_probe = first_anomaly_item(eval_ds) if is_main_process() else None
+    eval_ds = getattr(eval_loader, "dataset", None) if eval_loader is not None else None
     train_probe = first_anomaly_item(train_set) if is_main_process() else None
+    crossdomain_probe = None
+    if is_main_process() and log_mvtec_probe and eval_ds is not None:
+        crossdomain_probe = first_anomaly_item(eval_ds)
     it = iter(loader)
+    pending_retry = None
     model.train()
     force_vision_eval(model)
     t0 = time.time()
@@ -186,16 +193,26 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
         return details, parsed_list
 
     for step in range(1, max_steps + 1):
-        batch = move_batch(_next_batch(), device)
+        raw_batch = pending_retry
+        pending_retry = None
+        from_requeue = raw_batch is not None
+        if raw_batch is None:
+            raw_batch = _next_batch()
+        batch = move_batch(raw_batch, device)
         gen_in = model_inputs(batch)
         prompt_len = int(batch["prompt_len"][0].item())
         pad_id = tok.pad_token_id or tok.eos_token_id
         meta = batch["_meta"][0]
+        a_gt = gt_relative_area(meta.get("gt_box_px"), tuple(meta["orig_size"])) if meta.get("is_anomaly") else 0.0
+        size_bin = defect_size_bin(a_gt, bool(meta.get("is_anomaly")))
+        attempts = max_resample
+        if bool(meta.get("is_anomaly")) and a_gt < small_area:
+            attempts = max(attempts, hard_resample)
 
         seqs, texts, details, parsed_list = [], [], [], []
         resample_n = 0
         skipped = False
-        for attempt in range(max_resample + 1):
+        for attempt in range(attempts + 1):
             seqs, texts = _generate_group(gen_in, prompt_len)
             details, parsed_list = _score_group(texts, meta)
             std_g = group_std([float(d.get("R_ground", 0.0)) for d in details])
@@ -208,7 +225,9 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
             resample_n = attempt
             skipped = True
         if skipped:
-            resample_n = max_resample
+            resample_n = attempts
+            if bool(meta.get("is_anomaly")) and not from_requeue:
+                pending_retry = raw_batch
 
         r_ground = torch.tensor([float(d.get("R_ground", 0.0)) for d in details], device=device, dtype=torch.float32)
         r_reason = torch.tensor([float(d.get("R_reason", 0.0)) for d in details], device=device, dtype=torch.float32)
@@ -223,14 +242,8 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
             dist.all_reduce(active, op=dist.ReduceOp.SUM)
         all_skipped = int(active.item()) == 0
 
-        max_t = max(int(s.numel()) for s in seqs)
-        outputs = torch.full((group, max_t), int(pad_id), device=device, dtype=torch.long)
-        for i, s in enumerate(seqs):
-            outputs[i, : s.numel()] = s.to(device)
-        attn = (outputs != pad_id).long()
-        labels = outputs.clone()
-        labels[:, :prompt_len] = -100
-        labels[outputs == pad_id] = -100
+        outputs, attn, labels = padded_completion_tensors(seqs, prompt_len, int(pad_id), device)
+        max_t = int(outputs.shape[1])
 
         if all_skipped:
             t_lp = max(max_t - 1, 1)
@@ -381,6 +394,16 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                     "cls_tag_rate": float(cls_tag_rate),
                     "truncation_rate": float(truncation_rate),
                     "old_ref_logprob_gap": float(ref_gap),
+                    "delta_iou": float(sum(d.get("delta_iou", 0.0) for d in details) / max(group, 1)),
+                    "action_consistency": float(sum(d.get("action_consistency", 0.0) for d in details) / max(group, 1)),
+                    "gt_rel_area": float(a_gt),
+                    "skip_small": 1.0 if skipped and size_bin == "small" else 0.0,
+                    "skip_medium": 1.0 if skipped and size_bin == "medium" else 0.0,
+                    "skip_large": 1.0 if skipped and size_bin == "large" else 0.0,
+                    "size_small": 1.0 if size_bin == "small" else 0.0,
+                    "size_medium": 1.0 if size_bin == "medium" else 0.0,
+                    "size_large": 1.0 if size_bin == "large" else 0.0,
+                    "from_requeue": 1.0 if from_requeue else 0.0,
                     **{k: float(v) for k, v in proto_avg.items()},
                 },
             )
@@ -399,6 +422,9 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                     f"traj={proto_avg.get('trajectory_valid_rate', 0.0):.2f} "
                     f"cand={proto_avg.get('candidate_valid_rate', 0.0):.2f} "
                     f"uniq={proto_avg.get('unique_response_rate', 0.0):.2f} "
+                    f"dIoU={sum(d.get('delta_iou', 0.0) for d in details)/n:.3f} "
+                    f"act={sum(d.get('action_consistency', 0.0) for d in details)/n:.2f} "
+                    f"sz={size_bin} a={a_gt:.4f} "
                     f"trunc={truncation_rate:.2f} fmt={parse_rate:.2f} rs={resample_n}{skip_s}"
                     + (f" gnorm={last_gnorm:.2f}" if did_opt and last_gnorm is not None else ""),
                     main_only=True,
@@ -446,7 +472,7 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                     alpha=alpha,
                     tag_prefix="train_diagnostic_probe",
                 )
-            if crossdomain_probe is not None:
+            if log_mvtec_probe and crossdomain_probe is not None:
                 log_grpo_probe_cot(
                     cfg,
                     unwrap_model(model),
@@ -462,13 +488,15 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
             if writer is not None:
                 writer.flush()
 
-        if is_main_process() and eval_every > 0 and step % eval_every == 0:
+        if is_main_process() and eval_every > 0 and eval_loader is not None and step % eval_every == 0:
             stats = run_simple_eval(
                 cfg, unwrap_model(model), processor, eval_loader, writer=writer, global_step=step
             )
             train_log(
-                f"[grpo-eval] step={step} rec={stats['rec_acc']:.3f} "
-                f"mean_iou_f={stats['mean_iou']:.3f} mean_iou_c={stats.get('mean_iou_c', 0.0):.3f}",
+                f"[grpo-eval visadev] step={step} rec={stats['rec_acc']:.3f} "
+                f"gated_mIoU={stats.get('mean_iou_gated', 0.0):.3f} "
+                f"mean_iou_f={stats['mean_iou']:.3f} mean_iou_c={stats.get('mean_iou_c', 0.0):.3f} "
+                f"acc@0.5={stats.get('acc_at_05', 0.0):.3f}",
                 main_only=True,
             )
             os.makedirs(os.path.join(output_dir, "eval_steps"), exist_ok=True)
@@ -536,15 +564,22 @@ def train_main(cfg: dict) -> None:
     eval_layout = str(data_cfg.get("eval_layout", "mvtec")).lower()
     if train_layout == "json" or eval_layout == "json":
         raise ValueError("旧 JSON 训练链路已移除，请用 data.train_layout=visa / eval_layout=mvtec 扫盘")
-    train_samples, eval_samples = load_prior_split(cfg)
+    train_samples, test_samples = load_prior_split(cfg)
+    holdout = float((cfg.get("data") or {}).get("holdout_ratio", 0.1) or 0.0)
+    train_samples, dev_samples = split_holdout_by_class(
+        train_samples, holdout, seed=int(cfg["training"]["seed"])
+    )
     n_tr_anom = sum(1 for s in train_samples if bool((s.get("metadata") or {}).get("anomaly")))
-    n_ev_anom = sum(1 for s in eval_samples if bool((s.get("metadata") or {}).get("anomaly")))
+    n_dev_anom = sum(1 for s in dev_samples if bool((s.get("metadata") or {}).get("anomaly")))
+    n_ev_anom = sum(1 for s in test_samples if bool((s.get("metadata") or {}).get("anomaly")))
     if is_main:
         ratio = (cfg.get("data") or {}).get("normal_anomaly_ratio")
         train_log(
-            f"数据协议: VisA 训练 / MVTec test 测试；normal:anomaly={ratio}；"
-            f"train={len(train_samples)} (anom={n_tr_anom}, normal={len(train_samples)-n_tr_anom}) "
-            f"eval={len(eval_samples)} (anom={n_ev_anom}) "
+            f"数据协议: VisA train / VisA-dev holdout={holdout} 调参, MVTec test 仅最终评测；"
+            f"normal:anomaly={ratio}；"
+            f"train={len(train_samples)} (anom={n_tr_anom}) "
+            f"visadev={len(dev_samples)} (anom={n_dev_anom}) "
+            f"mvtec={len(test_samples)} (anom={n_ev_anom}) "
             f"train_layout={train_layout} eval_layout={eval_layout}",
             main_only=True,
         )
@@ -565,9 +600,13 @@ def train_main(cfg: dict) -> None:
         )
 
     train_set = PriorCoTDataset(train_samples, cfg, processor, mode="train")
-    eval_set = PriorCoTDataset(eval_samples, cfg, processor, mode="eval")
     eval_collate = PriorCollator(processor, prior, cfg)
-    eval_loader = DataLoader(eval_set, batch_size=1, shuffle=False, collate_fn=eval_collate, num_workers=0)
+    eval_loader = None
+    if dev_samples:
+        dev_set = PriorCoTDataset(dev_samples, cfg, processor, mode="eval")
+        eval_loader = DataLoader(dev_set, batch_size=1, shuffle=False, collate_fn=eval_collate, num_workers=0)
+    test_set = PriorCoTDataset(test_samples, cfg, processor, mode="eval")
+    test_loader = DataLoader(test_set, batch_size=1, shuffle=False, collate_fn=eval_collate, num_workers=0)
 
     writer = None
     tb_dir = tensorboard_event_dir(output_dir)
@@ -582,7 +621,7 @@ def train_main(cfg: dict) -> None:
         unwrap_model(model).save_pretrained(gdir)
         processor.save_pretrained(gdir)
         print(f"GRPO 完成: {gdir}", flush=True)
-        run_final_mvtec_eval(cfg, model, processor, eval_loader, writer, output_dir, tag="grpo")
+        run_final_mvtec_eval(cfg, model, processor, test_loader, writer, output_dir, tag="grpo")
 
     if writer is not None:
         writer.close()

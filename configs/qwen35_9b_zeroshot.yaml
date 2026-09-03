@@ -21,7 +21,7 @@ lora:
 
 data:
   max_image_size: 512
-  factor: 28
+  factor: null
 
 inference:
   model_path: /data2/zlt/anomaly_detection_llm/model_card/Qwen3.5-9B
