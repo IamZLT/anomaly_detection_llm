@@ -284,13 +284,14 @@ def test_scale_aware_edge():
 def test_dense_geometry_exact_match_is_one():
     gt = [100, 200, 300, 400]
 
-    r = dense_geometry_reward(gt, gt)
+    r = dense_geometry_reward(gt, gt, (1000, 1000))
 
     assert abs(r - 1.0) < 1e-6
 
 
 def test_dense_geometry_distinguishes_zero_iou_boxes():
     gt = [100, 600, 250, 800]
+    orig = (1000, 1000)
 
     near = [280, 580, 430, 780]
     far = [700, 100, 850, 300]
@@ -298,20 +299,38 @@ def test_dense_geometry_distinguishes_zero_iou_boxes():
     assert box_iou(near, gt) == 0.0
     assert box_iou(far, gt) == 0.0
 
-    r_near = dense_geometry_reward(near, gt)
-    r_far = dense_geometry_reward(far, gt)
+    r_near = dense_geometry_reward(near, gt, orig)
+    r_far = dense_geometry_reward(far, gt, orig)
 
     assert r_near > r_far
 
 
+def test_dense_geometry_has_no_far_distance_plateau():
+    orig = (1000, 1000)
+
+    gt = [100, 600, 250, 800]
+
+    mid = [500, 100, 650, 300]
+    far = [700, 100, 850, 300]
+
+    assert box_iou(mid, gt) == 0.0
+    assert box_iou(far, gt) == 0.0
+
+    r_mid = dense_geometry_reward(mid, gt, orig)
+    r_far = dense_geometry_reward(far, gt, orig)
+
+    assert r_mid > r_far
+
+
 def test_dense_progress_rewards_better_refinement():
     gt = [400, 400, 600, 600]
+    orig = (1000, 1000)
 
     bc = [650, 400, 850, 600]
     bf = [560, 400, 760, 600]
 
-    rc = dense_geometry_reward(bc, gt)
-    rf = dense_geometry_reward(bf, gt)
+    rc = dense_geometry_reward(bc, gt, orig)
+    rf = dense_geometry_reward(bf, gt, orig)
 
     assert rf > rc
 
@@ -342,8 +361,8 @@ def test_refinement_direction_from_boxes():
     gt = [410, 190, 750, 760]
     det = compute_rewards(parse_cot_output(ANOM), gt, orig, True, cfg)
     assert det["R_dir"] == 1.0
-    # R_reason = w_dir*R_dir + w_progress*max(0, dense_f - dense_c): still dominated
-    # by the direction term, but no longer a pure discrete equality.
+    # R_reason = w_dir*R_dir + w_progress*(dense_f - dense_c): still dominated by
+    # the direction term, but no longer a pure discrete equality.
     assert 0.0 < det["R_reason"] <= 1.0
     assert "delta_iou" in det
     assert "delta_dense" in det
@@ -449,13 +468,28 @@ def test_topk_spatial_nms_and_prior_hint():
 
 
 def test_prompt_is_two_images_plus_spatial_hint():
-    text = build_user_prompt({"prompt": {}}, "bottle")
+    # prompt.user is now the single source of truth; there is no silent fallback.
+    try:
+        build_user_prompt({"prompt": {}}, "bottle")
+        raise AssertionError("build_user_prompt must require prompt.user")
+    except ValueError:
+        pass
+
+    tmpl = (
+        "Image 1 is a defect-free normal reference of a {class_name}.\n"
+        "Image 2 is the inspection image.\n"
+        "These points are only spatial hints, not defect labels.\n"
+        "Output exactly these four blocks, in this order:\n"
+        "<compare>...</compare>\n<ground>...</ground>\n<verify>...</verify>\n<answer>...</answer>\n"
+    )
+    text = build_user_prompt({"prompt": {"user": tmpl}}, "bottle")
     assert "Image 1" in text and "Image 2" in text
     assert "Image 3" not in text
+    assert "bottle" in text
     assert "spatial hint" in text.lower()
-    assert "four XML" in text
+    assert "four blocks" in text
     assert "<boundary>" not in text
-    assert "five XML" not in text
+    assert "five" not in text.lower()
 
 
 def test_model_inputs_drops_image_embeds():

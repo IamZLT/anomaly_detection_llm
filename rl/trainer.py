@@ -28,8 +28,12 @@ from models.anomaly_prior import AnomalyPrior
 from models.lora import apply_lora
 from models.qwen35 import freeze_vision_encoder, force_vision_eval, setup_model_and_processor
 from models.vision_cache import bind_cached_image_features
-from reasoning.parser import parse_cot_output, rollout_protocol_stats
-from reasoning.rewards import compute_rewards
+from reasoning.parser import (
+    parse_cot_output,
+    parse_cot_output_task,
+    rollout_protocol_stats,
+)
+from reasoning.rewards import compute_rewards, format_reward
 from rl.grpo import (
     avg_across_ranks,
     build_segment_advantages,
@@ -297,19 +301,35 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
         details = []
         parsed_list = []
         for text in texts:
-            parsed = parse_cot_output(text)
-            parsed_list.append(parsed)
-            details.append(
-                compute_rewards(
-                    parsed,
-                    meta.get("gt_box_px"),
-                    tuple(meta["orig_size"]),
-                    bool(meta["is_anomaly"]),
-                    cfg,
-                )
+            strict_parsed = parse_cot_output(text)
+            task_parsed = parse_cot_output_task(text)
+
+            det = compute_rewards(
+                task_parsed,
+                meta.get("gt_box_px"),
+                tuple(meta["orig_size"]),
+                bool(meta["is_anomaly"]),
+                cfg,
             )
-            if not parsed.get("trajectory_valid"):
-                _dump_parser_debug(text, parsed)
+
+            rew_cfg = (cfg.get("grpo") or {}).get("reward") or {}
+            fmt_weights = rew_cfg.get("format_weights") or {
+                "compare": 0.2,
+                "ground": 0.3,
+                "verify": 0.2,
+                "answer": 0.3,
+            }
+
+            # R_fmt must come from the strict parser, while spatial task
+            # rewards come from the tolerant task parser.
+            det["R_fmt"] = format_reward(strict_parsed, fmt_weights)
+            det["protocol_ok"] = bool(strict_parsed.get("has_tags"))
+
+            parsed_list.append(strict_parsed)
+            details.append(det)
+
+            if not strict_parsed.get("trajectory_valid"):
+                _dump_parser_debug(text, strict_parsed)
         return details, parsed_list
 
     while step < max_steps:

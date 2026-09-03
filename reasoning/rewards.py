@@ -41,16 +41,10 @@ def box_center(box: List[float]) -> Tuple[float, float]:
     return 0.5 * (x1 + x2), 0.5 * (y1 + y2)
 
 
-def box_diag(box: List[float]) -> float:
-    x1, y1, x2, y2 = map(float, box)
-    w = max(0.0, x2 - x1)
-    h = max(0.0, y2 - y1)
-    return math.sqrt(w * w + h * h)
-
-
 def dense_geometry_reward(
     pred: List[float],
     gt: List[float],
+    orig_wh: Tuple[int, int],
     *,
     w_dist: float = 0.6,
     w_area: float = 0.4,
@@ -60,6 +54,10 @@ def dense_geometry_reward(
 
     Key property: even when IoU == 0, a box closer to GT receives a larger
     reward than a far-away box, removing the sparse-reward dead zone.
+
+    Center distance is normalized by the image diagonal (not the box diagonal)
+    so the gradient stays continuous across the whole image and never plateaus
+    to a constant for far-away boxes.
     """
     if pred is None or gt is None:
         return 0.0
@@ -74,15 +72,13 @@ def dense_geometry_reward(
         + (cy_p - cy_g) ** 2
     )
 
-    diag_norm = max(
-        box_diag(pred),
-        box_diag(gt),
-        1.0,
-    )
+    w = float(max(orig_wh[0], 1))
+    h = float(max(orig_wh[1], 1))
+    image_diag = math.sqrt(w * w + h * h)
 
     s_center = 1.0 - min(
         1.0,
-        dist / (diag_norm + eps),
+        dist / (image_diag + eps),
     )
 
     area_p = box_area(pred)
@@ -369,6 +365,7 @@ def compute_rewards(
         dense_geometry_reward(
             cand_px,
             gt_box_px,
+            orig_wh,
             w_dist=dense_w_dist,
             w_area=dense_w_area,
         )
@@ -390,6 +387,7 @@ def compute_rewards(
         dense_geometry_reward(
             final_px,
             gt_box_px,
+            orig_wh,
             w_dist=dense_w_dist,
             w_area=dense_w_area,
         )
@@ -397,11 +395,11 @@ def compute_rewards(
         else 0.0
     )
 
-    dense_progress = 0.0
+    delta_dense = 0.0
     if cand_ok and final_px is not None:
-        dense_progress = max(0.0, r_dense_f - r_dense_c)
+        delta_dense = r_dense_f - r_dense_c
 
-    r_reason = w_dir * r_dir + w_progress * dense_progress
+    r_reason = w_dir * r_dir + w_progress * delta_dense
 
     r_iou = 0.0
     r_edge = 0.0
@@ -416,7 +414,6 @@ def compute_rewards(
         r_final = w_dense_f * r_dense_f + w_edge * r_edge
 
     delta_iou = float(iou_f_diag - r_iou_c)
-    delta_dense = float(r_dense_f - r_dense_c)
 
     return _pack(
         r_ground=r_ground,

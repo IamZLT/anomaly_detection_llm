@@ -114,36 +114,19 @@ def apply_chat_template_safe(processor, messages, add_generation_prompt: bool, e
 
 
 def build_user_prompt(cfg: dict, class_name: str) -> str:
-    tmpl = str((cfg.get("prompt") or {}).get("user") or "").strip()
+    tmpl = str(
+        (cfg.get("prompt") or {}).get("user") or ""
+    ).strip()
+
     if not tmpl:
-        tmpl = (
-            "Image 1 is a defect-free normal reference of a {class_name}. "
-            "Image 2 is the inspection sample. "
-            "The <prior_hint> lists high-response points from a normal-test feature discrepancy map. "
-            "These points are only spatial hints and are not defect labels. "
-            "Verify them by comparing Image 1 and Image 2. "
-            "Return exactly four XML blocks in order: <compare>, <ground>, <verify>, <answer>. "
-            "Do not copy instruction text. Always output all four blocks. "
-            "Close every block with its matching closing tag, for example </compare>. "
-            "Do not add a colon after a tag name: write <answer>, never <answer>:. "
-            "In <compare> write 1-2 concise sentences of concrete visual differences. "
-            "In <ground> write one sentence then candidate_bbox_2d=[x1,y1,x2,y2] or candidate_bbox_2d=null. "
-            "The field name must be written literally as candidate_bbox_2d (lowercase, underscores, no spaces): "
-            "correct candidate_bbox_2d=[540,350,790,620]; wrong Candidate bbox 2d=..., candidate bbox=..., bbox_2d=.... "
-            "A candidate bbox must contain four integer coordinates in the 0-1000 system of Image 2. "
-            "In <verify> re-check the candidate against Image 1 and, if it is a true defect, "
-            "refine it into the most accurate final defect boundary. "
-            "In <answer> output JSON "
-            "{\"is_anomaly\": true, \"bbox_2d\": [x1,y1,x2,y2], "
-            "\"description\": \"One concise sentence describing the defect and its location relative to the normal reference.\"} "
-            "or {\"is_anomaly\": false, \"bbox_2d\": null, "
-            "\"description\": \"One concise sentence stating that no clear defect is observed.\"}. "
-            "If anomalous, candidate_bbox_2d and final bbox_2d must both be valid boxes; "
-            "if is_anomaly is false, final bbox_2d must be null while candidate_bbox_2d may be "
-            "null or a valid box rejected during verification. Do not add extra JSON fields. "
-            "All bbox coordinates are integers in the 0-1000 system of Image 2."
+        raise ValueError(
+            "prompt.user is required in the config"
         )
-    return tmpl.replace("{class_name}", class_name)
+
+    return tmpl.replace(
+        "{class_name}",
+        class_name,
+    )
 
 
 def build_train_ref_pool(train_samples: List[dict]) -> Dict[str, List[str]]:

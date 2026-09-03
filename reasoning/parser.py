@@ -374,6 +374,38 @@ def parse_cot_output(text: str) -> Dict[str, Any]:
     )
 
 
+def parse_cot_output_task(text: str) -> Dict[str, Any]:
+    """Task-semantic parser.
+
+    Same schema requirements as strict parsing, but permits recovery of a
+    trailing unclosed <answer> so spatial task reward is not destroyed by one
+    missing XML closing tag.
+    """
+    raw = strip_think(text)
+
+    # Only this function is tolerant:
+    # recover a trailing <answer>...</EOF>.
+    tags = extract_tag_blocks_tolerant(raw)
+
+    candidate_state, candidate_bbox = parse_bbox_field(
+        tags.get("ground", ""),
+        "candidate_bbox_2d",
+    )
+
+    answer = parse_answer_block(
+        tags.get("answer", "")
+    )
+
+    return _pack_parsed(
+        raw=raw,
+        tags=tags,
+        candidate_state=candidate_state,
+        candidate_bbox=candidate_bbox,
+        answer=answer,
+        strict=False,
+    )
+
+
 def parse_cot_output_tolerant(text: str) -> Dict[str, Any]:
     """Demo / legacy fallback: also search whole text and JSON if tags are missing."""
     raw = strip_think(text)

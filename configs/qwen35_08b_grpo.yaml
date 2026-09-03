@@ -85,98 +85,47 @@ prompt:
   enable_thinking: false
   user: |
     Image 1 is a defect-free normal reference of a {class_name}.
-    Image 2 is the inspection sample.
+    Image 2 is the inspection image.
 
-    The <prior_hint> lists high-response points from a normal-test feature discrepancy map H.
-    These points are only spatial hints. They are not defect labels.
-    Verify them by comparing Image 1 and Image 2.
+    The <prior_hint> contains high-response spatial points from the
+    normal-reference/test feature discrepancy map H.
+    These points are only spatial hints, not defect labels.
+    Use them to decide where to inspect, but verify every candidate
+    by directly comparing Image 1 and Image 2.
 
-    Compare Image 2 with Image 1 and determine whether Image 2 contains a true anomaly.
+    Determine whether Image 2 contains a true anomaly.
 
-    Return exactly four XML blocks in this order:
-    <compare>, <ground>, <verify>, <answer>.
+    Output format:
 
-    Always output all four blocks.
-    Close every block with its matching closing tag, for example </compare>.
-    Do not add a colon after a tag name: write <answer>, never <answer>:.
-    Do not copy or repeat the instructions.
+    <compare>
+    1-2 sentences comparing concrete visual differences.
+    </compare>
 
-    In <compare>:
-    Describe the concrete visual differences between Image 1 and Image 2 in 1-2 concise sentences.
-
-    In <ground>:
-    Describe the most suspicious region in one concise sentence.
-    Then output exactly one of:
+    <ground>
+    One sentence describing the suspicious region.
     candidate_bbox_2d=[x1,y1,x2,y2]
-    candidate_bbox_2d=null
-    The field name must be written literally as candidate_bbox_2d (lowercase, with underscores, no spaces).
-    Correct:   candidate_bbox_2d=[540,350,790,620]
-    Wrong:     Candidate bbox 2d=[540,350,790,620]
-    Wrong:     candidate bbox=[540,350,790,620]
-    Wrong:     bbox_2d=[540,350,790,620]
-    A candidate bbox must contain four integer coordinates in the 0-1000 coordinate system of Image 2.
-    Do not output only a point.
-    candidate_bbox_2d represents a suspicious proposal, not necessarily a confirmed defect.
-
-    In <verify>:
-    Re-check the candidate region against the normal reference.
-    Decide whether the difference is a true defect or normal variation.
-    Verification may either refine a true anomaly candidate or reject it as normal variation.
-    If it is a true defect, refine the candidate region into the most accurate final defect boundary.
-
-    In <answer>:
-    Output exactly one JSON object, then close the block with </answer>.
-    End your entire response with </answer> as the very last token.
-    Do not emit any end-of-turn marker after </answer>.
-
-    For an anomalous sample:
-    {"is_anomaly": true, "bbox_2d": [x1,y1,x2,y2], "description": "One concise sentence describing the defect and its location relative to the normal reference."}
-
-    For a normal sample:
-    {"is_anomaly": false, "bbox_2d": null, "description": "One concise sentence stating that no clear defect is observed."}
-
-    Consistency rules:
-    - If the sample is anomalous, candidate_bbox_2d and final bbox_2d must both be valid boxes.
-    - If no suspicious region is found, candidate_bbox_2d may be null.
-    - If a suspicious region is found but is rejected during verification as normal variation,
-      candidate_bbox_2d may be a valid box while final bbox_2d must be null.
-    - If is_anomaly is false, final bbox_2d must always be null.
-    - If is_anomaly is true, final bbox_2d must always be a valid box.
-    - The final bbox may refine the candidate bbox after verification.
-    - Do not add extra JSON fields.
-
-    Two illustrative examples (anomalous, then normal). Their coordinates and sentences are examples only:
-    do not copy them; always write coordinates and sentences for the actual Image 1 and Image 2.
-
-    Example 1 (anomalous):
-    <compare>
-    Image 2 has a missing region on the object that is absent from the normal reference.
-    </compare>
-    <ground>
-    The most suspicious region is the damaged area on the object.
-    candidate_bbox_2d=[540,350,790,620]
     </ground>
+
     <verify>
-    The region is missing only in Image 2, so the candidate is refined to tightly cover the damage.
+    One sentence verifying the candidate against Image 1 and deciding
+    whether to refine it or reject it.
     </verify>
+
     <answer>
-    {"is_anomaly": true, "bbox_2d": [574,382,760,590], "description": "A localized missing region is present on the object and is absent from the normal reference."}
+    {"is_anomaly": true/false, "bbox_2d": [x1,y1,x2,y2] or null, "description": "..."}
     </answer>
 
-    Example 2 (normal variation rejected after verification):
-    <compare>
-    Image 2 contains a localized appearance difference relative to Image 1.
-    </compare>
-    <ground>
-    A small region differs from the reference and requires verification.
-    candidate_bbox_2d=[280,420,410,560]
-    </ground>
-    <verify>
-    After comparison with the normal reference, the candidate is consistent with normal appearance variation rather than a true defect.
-    </verify>
-    <answer>
-    {"is_anomaly": false, "bbox_2d": null, "description": "The localized difference is consistent with normal variation and no true defect is observed."}
-    </answer>
+    Do not copy the instructional phrases above.
+    Write observations specific to the two images.
+
+    Rules:
+    - Coordinates are integers in [0,1000] for Image 2.
+    - candidate_bbox_2d is a proposal, not a confirmed defect; use null if nothing looks suspicious.
+    - For an anomaly, candidate_bbox_2d and bbox_2d are valid boxes.
+    - For a normal image, bbox_2d=null (a candidate may be rejected during <verify>).
+    - Never skip a block.
+    - Never repeat an opening tag.
+    - After </answer>, stop.
 
 training:
   max_length: 2048
@@ -216,8 +165,8 @@ grpo:
   format_advantage_weight: 0.20
   reward:
     # Candidate localization: preserve GT coverage while removing zero-IoU dead zone.
-    w_cov: 0.40
-    w_dense_c: 0.60
+    w_cov: 0.20
+    w_dense_c: 0.80
     # Dense geometry (DCLR-style center + area).
     dense_w_dist: 0.60
     dense_w_area: 0.40
