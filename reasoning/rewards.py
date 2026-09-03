@@ -106,6 +106,7 @@ def compute_rewards(
     r_invalid = float(rew_cfg.get("invalid_output", -0.5))
 
     pred_cls = parsed.get("is_anomaly")
+    protocol_ok = bool(parsed.get("has_tags", False))
     cand = parsed.get("candidate_bbox")
     final_box = parsed.get("bbox_2d")
     cand_px = _to_px(cand, orig_wh)
@@ -136,23 +137,25 @@ def compute_rewards(
             "pred_box_px": final_px,
             "cand_box_px": cand_px,
             "pred_cls": pred_cls,
+            "protocol_ok": bool(protocol_ok),
             "d_star": d_star or {},
         }
 
     if not is_anomaly:
-        if pred_cls is False and final_box is None:
-            r_final = r_ok
-        elif pred_cls is True:
+        if pred_cls is True:
             r_final = r_wrong
+        elif not protocol_ok:
+            r_final = r_invalid
+        elif pred_cls is False and final_box is None:
+            r_final = r_ok
         else:
             r_final = r_invalid
         return _pack(r_ground=0.0, r_reason=0.0, r_final=r_final)
 
-    if pred_cls is None:
-        r_final_gate = r_invalid
-    elif pred_cls is False:
+    # Classification error beats protocol: explicit false on an anomaly is -1, not -0.5.
+    if pred_cls is False:
         r_final_gate = r_wrong
-    elif final_px is None:
+    elif not protocol_ok or pred_cls is None or final_px is None:
         r_final_gate = r_invalid
     else:
         r_final_gate = None

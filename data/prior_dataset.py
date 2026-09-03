@@ -88,12 +88,15 @@ def build_user_prompt(cfg: dict, class_name: str) -> str:
         tmpl = (
             "Image 1 is a defect-free normal reference of a {class_name}. "
             "Image 2 is the inspection sample. "
-            "Image 3 is a normal-test patch discrepancy prior H (not a ground-truth label). "
-            "Write Grounded Comparative CoT with tags compare, ground, verify, boundary, answer. "
-            "Put candidate_bbox=[x1,y1,x2,y2] inside <ground>. "
-            "In <boundary> write left=<choice> right=<choice> top=<choice> bottom=<choice>; "
-            "replace each <choice> with exactly one of inward, outward, keep. "
-            "In <answer> write is_anomaly=<true_or_false> and bbox=<box_or_null>. "
+            "Image 3 is a normal-test discrepancy prior H (hint only, not a label). "
+            "Return exactly five XML blocks in order: <compare>, <ground>, <verify>, <boundary>, <answer>. "
+            "Do not copy instruction text. Always output all five blocks. "
+            "In <compare> write 1-2 sentences of concrete visual differences. "
+            "In <ground> write one sentence then candidate_bbox=[x1,y1,x2,y2] or candidate_bbox=null. "
+            "In <verify> decide true defect vs normal variation. "
+            "In <boundary>, if candidate exists write four lines left/right/top/bottom=inward|outward|keep; "
+            "if candidate_bbox=null write not_applicable. "
+            "In <answer> write is_anomaly=true and bbox=[x1,y1,x2,y2], or is_anomaly=false and bbox=null. "
             "Coordinates are Qwen 0-1000 on Image 2."
         )
     return tmpl.replace("{class_name}", class_name)

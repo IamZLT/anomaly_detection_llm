@@ -19,7 +19,7 @@ tensorboard:
   host: 0.0.0.0
   port: 5002
   # 默认盯本次 run 的 tb/：loss 曲线和热力图 / CoT 在同一个实验里
-  vis_every_n_steps: 20      # 热力图 / 案例 CoT / bbox 可视化 / GRPO group
+  vis_every_n_steps: 5      # 热力图 / 案例 CoT / bbox 可视化 / GRPO group
   vis_num_samples: 2
   log_heatmap: true
   log_case: true
@@ -87,34 +87,46 @@ prompt:
   user: |
     Image 1 is a defect-free normal reference of a {class_name}.
     Image 2 is the inspection sample.
-    Image 3 is a normal-test patch discrepancy prior H (not a ground-truth label).
-    Difference in H does not mean a defect; confirm by comparing Image 1 and Image 2.
-    Write a Grounded Comparative CoT with this exact tag layout:
-    <compare>
-    Natural language comparison of Image 1 vs Image 2, using H only as a hint.
-    </compare>
-    <ground>
-    Natural language reason for the suspected region.
+    Image 3 is a normal-test discrepancy prior H. H is only a spatial hint and is not a defect label.
+
+    Compare Image 2 against Image 1 and determine whether Image 2 contains a true structural or appearance anomaly.
+
+    Return exactly five XML blocks in this order:
+    <compare>, <ground>, <verify>, <boundary>, <answer>.
+    Do not copy or repeat any instruction text. Always output all five XML blocks.
+
+    In <compare>:
+    Write 1-2 sentences describing concrete visual differences you observe between Image 1 and Image 2.
+
+    In <ground>:
+    Explain the suspected region in 1 sentence.
+    Then write exactly one line:
     candidate_bbox=[x1,y1,x2,y2]
-    </ground>
-    <verify>
-    Re-check against Image 1: texture, lighting, pose, or a true defect.
-    </verify>
-    <boundary>
-    left=<choice>
-    right=<choice>
-    top=<choice>
-    bottom=<choice>
-    </boundary>
-    <answer>
-    is_anomaly=<true_or_false>
-    bbox=<box_or_null>
-    </answer>
-    Replace each <choice> with exactly one of: inward, outward, keep.
-    Coordinates are Qwen official 0-1000 on Image 2.
-    If the sample is normal, set candidate_bbox=null and write:
+    If no anomaly candidate exists, write:
+    candidate_bbox=null
+
+    In <verify>:
+    Re-check the candidate against Image 1 and decide whether it is a true defect or normal variation.
+
+    In <boundary>:
+    If candidate_bbox is not null, write exactly four lines:
+    left=VALUE
+    right=VALUE
+    top=VALUE
+    bottom=VALUE
+    where VALUE is exactly one of inward, outward, keep.
+    If candidate_bbox is null, write:
+    not_applicable
+
+    In <answer>:
+    For an anomalous sample write exactly:
+    is_anomaly=true
+    bbox=[x1,y1,x2,y2]
+    For a normal sample write exactly:
     is_anomaly=false
     bbox=null
+
+    All bbox coordinates must use the 0-1000 coordinate system of Image 2.
 
 training:
   max_length: 2048
