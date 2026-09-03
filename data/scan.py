@@ -26,7 +26,7 @@ def extract_bbox_from_mask(mask_path: str) -> Optional[List[int]]:
         x_indices = np.where(cols)[0]
         y1, y2 = y_indices[0], y_indices[-1]
         x1, x2 = x_indices[0], x_indices[-1]
-        return [int(x1), int(y1), int(x2), int(y2)]
+        return [int(x1), int(y1), int(x2) + 1, int(y2) + 1]
     except Exception:
         return None
 

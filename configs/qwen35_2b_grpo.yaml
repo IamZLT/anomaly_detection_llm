@@ -101,17 +101,16 @@ prompt:
     Re-check against Image 1: texture, lighting, pose, or a true defect.
     </verify>
     <boundary>
-    For each edge, choose exactly ONE value from: inward, outward, keep.
-    Do not list multiple alternatives.
-    left=inward
-    right=outward
-    top=keep
-    bottom=inward
+    left=<choice>
+    right=<choice>
+    top=<choice>
+    bottom=<choice>
     </boundary>
     <answer>
-    is_anomaly=true
-    bbox=[x1,y1,x2,y2]
+    is_anomaly=<true_or_false>
+    bbox=<box_or_null>
     </answer>
+    Replace each <choice> with exactly one of: inward, outward, keep.
     Coordinates are Qwen official 0-1000 on Image 2.
     If the sample is normal, set candidate_bbox=null and write:
     is_anomaly=false

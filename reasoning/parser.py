@@ -128,7 +128,34 @@ def parse_boundary(text_or_dict: Any) -> Dict[str, str]:
 
 
 def parse_cot_output(text: str) -> Dict[str, Any]:
-    """Parse XML Grounded CoT; JSON is only a fallback."""
+    """Strict process-aware parse: Bc from <ground>, D from <boundary>, Bf/ŷ from <answer>."""
+    raw = strip_think(text)
+    tags = extract_tag_blocks(raw)
+    ground_txt = tags.get("ground", "")
+    answer_txt = tags.get("answer", "")
+    bound_txt = tags.get("boundary", "")
+    cand = _box_from_text(ground_txt, prefer=("candidate_bbox", "bbox_c")) if ground_txt else None
+    bbox = _box_from_text(answer_txt, prefer=("bbox_2d", "final_bbox", "bbox")) if answer_txt else None
+    boundary = parse_boundary(bound_txt) if bound_txt else {}
+    is_anom = parse_final_decision(answer_txt) if answer_txt else None
+    has_tags = all(n in tags for n in TAG_NAMES)
+    return {
+        "raw": tags if tags else raw,
+        "tags": tags,
+        "has_tags": has_tags,
+        "format_ok": bool(has_tags),
+        "bbox_2d": bbox,
+        "candidate_bbox": cand,
+        "boundary": boundary,
+        "is_anomaly": is_anom,
+        "label": None,
+        "text": raw,
+        "strict": True,
+    }
+
+
+def parse_cot_output_tolerant(text: str) -> Dict[str, Any]:
+    """Demo / legacy fallback: also search whole text and JSON if tags are missing."""
     raw = strip_think(text)
     tags = extract_tag_blocks(raw)
     ground_txt = tags.get("ground", "")
@@ -165,6 +192,8 @@ def parse_cot_output(text: str) -> Dict[str, Any]:
 
     boundary = parse_boundary(bound_txt or json_obj.get("boundary") or json_obj.get("D") or "")
     is_anom = parse_final_decision(answer_txt)
+    if is_anom is None and json_obj:
+        is_anom = parse_final_decision(str(json_obj.get("is_anomaly", "")))
 
     has_tags = all(n in tags for n in TAG_NAMES)
     return {
@@ -178,4 +207,5 @@ def parse_cot_output(text: str) -> Dict[str, Any]:
         "is_anomaly": is_anom,
         "label": json_obj.get("label") if json_obj else None,
         "text": raw,
+        "strict": False,
     }

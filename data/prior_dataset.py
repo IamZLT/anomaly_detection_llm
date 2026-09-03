@@ -91,8 +91,9 @@ def build_user_prompt(cfg: dict, class_name: str) -> str:
             "Image 3 is a normal-test patch discrepancy prior H (not a ground-truth label). "
             "Write Grounded Comparative CoT with tags compare, ground, verify, boundary, answer. "
             "Put candidate_bbox=[x1,y1,x2,y2] inside <ground>. "
-            "In <boundary> each edge is exactly one of inward, outward, keep, e.g. left=inward. "
-            "In <answer> write is_anomaly=true or is_anomaly=false, then bbox=[x1,y1,x2,y2] or bbox=null. "
+            "In <boundary> write left=<choice> right=<choice> top=<choice> bottom=<choice>; "
+            "replace each <choice> with exactly one of inward, outward, keep. "
+            "In <answer> write is_anomaly=<true_or_false> and bbox=<box_or_null>. "
             "Coordinates are Qwen 0-1000 on Image 2."
         )
     return tmpl.replace("{class_name}", class_name)

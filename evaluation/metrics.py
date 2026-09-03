@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from reasoning.rewards import box_iou
-from utils.common import qwen_norm1000_to_original_pixels
+from reasoning.rewards import box_iou, qwen1000_to_pixels_strict, valid_bbox_1000
 
 
 def classification_correct(pred_cls, is_anomaly: bool) -> bool:
@@ -18,10 +17,12 @@ def box_ious_from_parsed(parsed: dict, meta: dict):
     iou_f = 0.0
     iou_c = 0.0
     if gt is not None:
-        if parsed.get("bbox_2d") is not None:
-            iou_f = box_iou(qwen_norm1000_to_original_pixels(parsed["bbox_2d"], orig), gt)
-        if parsed.get("candidate_bbox") is not None:
-            iou_c = box_iou(qwen_norm1000_to_original_pixels(parsed["candidate_bbox"], orig), gt)
+        pred = parsed.get("bbox_2d")
+        cand = parsed.get("candidate_bbox")
+        if valid_bbox_1000(pred):
+            iou_f = box_iou(qwen1000_to_pixels_strict(pred, orig), gt)
+        if valid_bbox_1000(cand):
+            iou_c = box_iou(qwen1000_to_pixels_strict(cand, orig), gt)
     rec_ok = classification_correct(parsed.get("is_anomaly", None), bool(meta.get("is_anomaly")))
     return float(iou_c), float(iou_f), rec_ok
 

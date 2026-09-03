@@ -20,35 +20,53 @@ def unwrap_qwen_core(qwen: nn.Module) -> nn.Module:
     return qwen
 
 
-def freeze_vision_encoder(model: nn.Module) -> int:
-    """Freeze vision tower parameters. Call once after load (and after LoRA wrap if needed)."""
+def _unwrap_maybe_ddp(model: nn.Module) -> nn.Module:
+    return model.module if hasattr(model, "module") else model
+
+
+def _vision_modules(model: nn.Module) -> list:
+    m = _unwrap_maybe_ddp(model)
     candidates = []
     for name in ("visual", "vision_tower", "vision_model"):
-        mod = getattr(model, name, None)
+        mod = getattr(m, name, None)
         if mod is not None:
             candidates.append(mod)
-    inner = getattr(model, "model", None)
+    inner = getattr(m, "model", None)
     if inner is not None:
         for name in ("visual", "vision_tower", "vision_model"):
             mod = getattr(inner, name, None)
             if mod is not None:
                 candidates.append(mod)
-    core = unwrap_qwen_core(model)
+    core = unwrap_qwen_core(m)
     visual = getattr(getattr(core, "model", None), "visual", None)
     if visual is not None:
         candidates.append(visual)
-        visual.eval()
-    n = 0
     seen = set()
+    out = []
     for mod in candidates:
         if id(mod) in seen:
             continue
         seen.add(id(mod))
+        out.append(mod)
+    return out
+
+
+def freeze_vision_encoder(model: nn.Module) -> int:
+    """Freeze vision tower parameters. Call once after load (and after LoRA wrap if needed)."""
+    n = 0
+    for mod in _vision_modules(model):
+        mod.eval()
         for p in mod.parameters():
             if p.requires_grad:
                 p.requires_grad = False
                 n += p.numel()
     return n
+
+
+def force_vision_eval(model: nn.Module) -> None:
+    """Keep the vision tower in eval() after model.train() so Dropout cannot leak into H."""
+    for mod in _vision_modules(model):
+        mod.eval()
 
 
 def setup_model_and_processor(
@@ -127,5 +145,9 @@ def setup_model_and_processor(
             f"[setup] Qwen-VL 就绪：总参数 {n_param / 1e6:.1f}M，可训练 {n_train / 1e6:.1f}M",
             flush=True,
         )
-    model.eval() if for_inference else model.train()
+    if for_inference:
+        model.eval()
+    else:
+        model.train()
+        force_vision_eval(model)
     return model, processor

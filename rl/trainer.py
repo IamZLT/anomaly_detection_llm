@@ -26,7 +26,7 @@ from evaluation.evaluator import (
 from evaluation.metrics import is_truncated
 from models.anomaly_prior import AnomalyPrior
 from models.lora import apply_lora
-from models.qwen35 import freeze_vision_encoder, setup_model_and_processor
+from models.qwen35 import freeze_vision_encoder, force_vision_eval, setup_model_and_processor
 from reasoning.parser import parse_cot_output
 from reasoning.rewards import compute_rewards
 from rl.grpo import (
@@ -116,6 +116,7 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
     train_probe = first_anomaly_item(train_set) if is_main_process() else None
     it = iter(loader)
     model.train()
+    force_vision_eval(model)
     t0 = time.time()
     epoch = 0
     opt_step = 0
@@ -164,6 +165,7 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                 texts.append(tok.decode(out_ids[0][prompt_len:], skip_special_tokens=True))
         if was_training:
             m.train()
+            force_vision_eval(m)
         return seqs, texts
 
     def _score_group(texts: List[str], meta: dict):
@@ -276,6 +278,7 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
         clip_v = 0.0
         did_opt = False
         model.train()
+        force_vision_eval(model)
         n_pe = max(policy_epochs, 1)
         opt.zero_grad(set_to_none=True)
         if not all_skipped:
@@ -486,6 +489,7 @@ def setup_prior_model(cfg: dict):
     model = apply_lora(model, cfg)
     if bool(cfg.get("model", {}).get("freeze_vit", True)):
         freeze_vision_encoder(model)
+        force_vision_eval(model)
     if bool(cfg.get("training", {}).get("gradient_checkpointing", True)):
         fn = getattr(model, "gradient_checkpointing_enable", None)
         if fn is not None:

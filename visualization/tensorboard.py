@@ -179,7 +179,7 @@ def format_grpo_group_text(
             f"--- τ[{i}]  Rf={det.get('R_final', 0):.3f} Rg={det.get('R_ground', 0):.3f} "
             f"Rr={det.get('R_reason', 0):.3f} cov={det.get('R_cov', 0):.3f} "
             f"dir={det.get('R_dir', 0):.3f} iou_f={det.get('R_iou', 0):.3f} iou_c={det.get('R_iou_c', 0):.3f} "
-            f"edge={det.get('R_edge', 0):.3f} compact={det.get('R_compact', 0):.3f}{adv}{lp}"
+            f"edge={det.get('R_edge', 0):.3f}{adv}{lp}"
         )
         lines.append((text or "")[:1800])
         lines.append("")
@@ -332,7 +332,6 @@ def log_grpo_scalars(
     writer.add_scalar("grpo/reward_max", float(r.max()), step)
     writer.add_scalar("grpo/reward_min", float(r.min()), step)
     writer.add_scalar("grpo/R_cov", mean("R_cov"), step)
-    writer.add_scalar("grpo/R_compact", mean("R_compact"), step)
     writer.add_scalar("grpo/R_dir", mean("R_dir"), step)
     writer.add_scalar("grpo/R_iou", mean("R_iou"), step)
     writer.add_scalar("grpo/R_edge", mean("R_edge"), step)

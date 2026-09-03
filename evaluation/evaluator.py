@@ -11,10 +11,11 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from evaluation.metrics import box_ious_from_parsed, classification_correct, is_truncated
+from models.qwen35 import force_vision_eval
 from reasoning.parser import parse_cot_output
-from reasoning.rewards import box_iou
+from reasoning.rewards import box_iou, qwen1000_to_pixels_strict, valid_bbox_1000
 from rl.grpo import model_inputs, move_batch, unwrap_model
-from utils.common import qwen_norm1000_to_original_pixels, train_log
+from utils.common import train_log
 from visualization.tensorboard import log_heatmap_and_case
 
 
@@ -98,8 +99,8 @@ def run_simple_eval(
         if is_anom:
             n_anom += 1
             gt = meta.get("gt_box_px")
-            if pred_box is not None and gt is not None:
-                pred_px = qwen_norm1000_to_original_pixels(pred_box, orig)
+            if pred_box is not None and gt is not None and valid_bbox_1000(pred_box):
+                pred_px = qwen1000_to_pixels_strict(pred_box, orig)
                 iou_v = box_iou(pred_px, gt)
                 ious.append(iou_v)
                 if iou_v >= 0.3:
@@ -107,8 +108,8 @@ def run_simple_eval(
             else:
                 ious.append(0.0)
             cand_box = parsed.get("candidate_bbox")
-            if cand_box is not None and gt is not None:
-                iou_c = box_iou(qwen_norm1000_to_original_pixels(cand_box, orig), gt)
+            if cand_box is not None and gt is not None and valid_bbox_1000(cand_box):
+                iou_c = box_iou(qwen1000_to_pixels_strict(cand_box, orig), gt)
             ious_c.append(iou_c)
         if writer is not None and log_images and seen < vis_n:
             vis_dir = os.path.join(
@@ -154,6 +155,7 @@ def run_simple_eval(
         writer.add_scalar("eval/json_parse_rate", parse_ok / n, global_step)
         writer.flush()
     model.train()
+    force_vision_eval(model)
     return {
         "n": seen,
         "rec_acc": rec_ok / n,
@@ -251,3 +253,4 @@ def log_grpo_probe_cot(
     writer.add_scalar(f"{tag_prefix}/truncated", 1.0 if truncated else 0.0, step)
     if was_training:
         model.train()
+        force_vision_eval(model)

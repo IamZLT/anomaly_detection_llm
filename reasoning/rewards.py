@@ -6,7 +6,6 @@ import math
 from typing import Any, Dict, List, Optional, Tuple
 
 from reasoning.parser import EDGE_KEYS
-from utils.common import qwen_norm1000_to_original_pixels
 
 
 def box_iou(a: List[float], b: List[float]) -> float:
@@ -32,10 +31,6 @@ def box_coverage(pred: List[float], gt: List[float]) -> float:
     return float(inter / area_gt) if area_gt > 0 else 0.0
 
 
-def box_area(box: List[float]) -> float:
-    return max(0.0, float(box[2]) - float(box[0])) * max(0.0, float(box[3]) - float(box[1]))
-
-
 def valid_bbox_1000(box) -> bool:
     if box is None or not isinstance(box, (list, tuple)) or len(box) != 4:
         return False
@@ -44,6 +39,12 @@ def valid_bbox_1000(box) -> bool:
     except (TypeError, ValueError):
         return False
     return 0.0 <= x1 < x2 <= 1000.0 and 0.0 <= y1 < y2 <= 1000.0
+
+
+def qwen1000_to_pixels_strict(box, orig_wh: Tuple[int, int]) -> List[float]:
+    w, h = float(max(orig_wh[0], 1)), float(max(orig_wh[1], 1))
+    x1, y1, x2, y2 = map(float, box)
+    return [x1 / 1000.0 * w, y1 / 1000.0 * h, x2 / 1000.0 * w, y2 / 1000.0 * h]
 
 
 def pixels_to_qwen1000(box: List[float], orig_wh: Tuple[int, int]) -> List[int]:
@@ -83,7 +84,7 @@ def edge_precision_reward(pred: List[float], gt: List[float], orig_wh: Tuple[int
 def _to_px(box, orig_wh: Tuple[int, int]) -> Optional[List[float]]:
     if not valid_bbox_1000(box):
         return None
-    return [float(x) for x in qwen_norm1000_to_original_pixels(box, orig_wh)]
+    return qwen1000_to_pixels_strict(box, orig_wh)
 
 
 def compute_rewards(
@@ -120,7 +121,6 @@ def compute_rewards(
         r_dir: float = 0.0,
         r_iou: float = 0.0,
         r_edge: float = 0.0,
-        r_compact: float = 0.0,
         d_star: Optional[dict] = None,
     ) -> Dict[str, Any]:
         return {
@@ -133,7 +133,6 @@ def compute_rewards(
             "R_dir": float(r_dir),
             "R_iou": float(r_iou),
             "R_edge": float(r_edge),
-            "R_compact": float(r_compact),
             "pred_box_px": final_px,
             "cand_box_px": cand_px,
             "pred_cls": pred_cls,
@@ -169,11 +168,6 @@ def compute_rewards(
     r_iou_c = box_iou(cand_px, gt_box_px) if cand_px is not None else 0.0
     r_ground = (w_cov * r_cov + w_cand_iou * r_iou_c) if cand_px is not None else 0.0
 
-    img_area = float(max(orig_wh[0], 1)) * float(max(orig_wh[1], 1))
-    r_compact = 0.0
-    if cand_px is not None:
-        r_compact = float(max(0.0, min(1.0, 1.0 - box_area(cand_px) / max(img_area, 1.0))))
-
     d_star: Dict[str, str] = {}
     r_dir = 0.0
     if cand_px is not None:
@@ -204,6 +198,5 @@ def compute_rewards(
         r_dir=r_dir,
         r_iou=r_iou,
         r_edge=r_edge,
-        r_compact=r_compact,
         d_star=d_star,
     )
