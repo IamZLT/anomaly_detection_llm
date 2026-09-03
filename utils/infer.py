@@ -1,11 +1,10 @@
 import json
 import os
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import torch
 from PIL import Image
-from transformers import AutoImageProcessor
 
 from models.avNet import setup_model_and_processor
 from utils.common import (
@@ -13,6 +12,7 @@ from utils.common import (
     draw_bbox_on_image,
     infer_model_compute_device,
     parse_grounding_output,
+    qwen_norm1000_to_original_pixels,
     smart_resize,
 )
 
@@ -25,63 +25,21 @@ def build_generation_inputs(
     processor,
     image: Image.Image,
     prompt: str,
-    *,
-    dino_processor: Optional[Any] = None,
-    clip_processor: Optional[Any] = None,
+    **_unused,
 ) -> Dict[str, Any]:
-    """
-    与训练/CLI 推理一致：DINO 桥开启时走 dino_pixel_values + clip_pixel_values，否则走 Qwen 原生图文输入。
-    image 需已按 data.max_image_size / factor 做过 smart_resize。
-    若传入已加载的 dino_processor / clip_processor（如 Web 懒加载缓存），可避免每次请求重复 from_pretrained。
-    """
-    use_dino_bridge = bool(cfg.get("dino", {}).get("enabled", True))
-    local_files_only = cfg.get("model", {}).get("local_files_only", True)
-    if use_dino_bridge:
-        if dino_processor is None:
-            dino_processor = AutoImageProcessor.from_pretrained(
-                cfg["dino"]["model_path"],
-                trust_remote_code=True,
-                local_files_only=local_files_only,
-            )
-        if clip_processor is None:
-            clip_processor = AutoImageProcessor.from_pretrained(
-                cfg["clip"]["model_path"],
-                trust_remote_code=True,
-                local_files_only=local_files_only,
-            )
-        messages = [{"role": "user", "content": prompt}]
-        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = processor(text=[text], return_tensors="pt", padding=True)
-        dino_inputs = dino_processor(
-            images=image,
-            return_tensors="pt",
-            do_resize=True,
-            size={
-                "height": int(cfg.get("dino", {}).get("image_size", 512)),
-                "width": int(cfg.get("dino", {}).get("image_size", 512)),
-            },
-        )
-        inputs["dino_pixel_values"] = dino_inputs["pixel_values"]
-        clip_inputs = clip_processor(
-            images=image,
-            return_tensors="pt",
-            do_resize=True,
-            size={
-                "height": int(cfg.get("clip", {}).get("image_size", 224)),
-                "width": int(cfg.get("clip", {}).get("image_size", 224)),
-            },
-        )
-        inputs["clip_pixel_values"] = clip_inputs["pixel_values"]
-    else:
-        messages = [
-            {
-                "role": "user",
-                "content": [{"type": "image", "image": image}, {"type": "text", "text": prompt}],
-            }
-        ]
-        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = processor(text=[text], images=[image], return_tensors="pt", padding=True)
-    return inputs
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": "image", "image": image}, {"type": "text", "text": prompt}],
+        }
+    ]
+    enable_thinking = bool((cfg.get("prompt") or {}).get("enable_thinking", False))
+    kwargs = dict(tokenize=False, add_generation_prompt=True)
+    try:
+        text = processor.apply_chat_template(messages, enable_thinking=enable_thinking, **kwargs)
+    except TypeError:
+        text = processor.apply_chat_template(messages, **kwargs)
+    return processor(text=[text], images=[image], return_tensors="pt", padding=True)
 
 
 def decode_generation_output(
@@ -90,23 +48,11 @@ def decode_generation_output(
     inputs: Dict[str, Any],
     cfg: dict,
 ) -> str:
-    """
-    只解码「模型新生成」的文本，避免把 prompt 混进 answer。
-
-    - **DINO 桥（`dino_pixel_values` 存在）**：`QwenDinoBridgeModel.generate` 内部只用 `inputs_embeds`，
-      HF 侧 `input_ids` 从空序列增长，**返回的 `sequences` 一般就是纯新生成 token**（不含文本 prompt 的
-      重复）。此时**禁止**再按 `inputs["input_ids"]` 长度去切，否则会误切掉回答开头（表现为从
-      `and` / `,` / `which` 等半句起）。
-    - **非桥、标准 `input_ids` 生成**：`sequences` 为 ``[prompt || new]``，应按 ``input_ids.shape[1]`` 切片。
-    """
+    """Decode newly generated tokens only (sequences = prompt || new)."""
     tok = getattr(processor, "tokenizer", processor)
     gen = outputs[0]
     if gen.dim() > 1:
         gen = gen[0]
-
-    use_bridge = bool(cfg.get("dino", {}).get("enabled", True)) and inputs.get("dino_pixel_values") is not None
-    if use_bridge:
-        return tok.decode(gen, skip_special_tokens=True)
 
     if inputs.get("input_ids") is not None:
         plen = int(inputs["input_ids"].shape[1])
@@ -137,18 +83,7 @@ def inference_main(cfg: dict) -> None:
     if not os.path.isdir(model_path):
         raise FileNotFoundError(f"模型目录不存在: {model_path}")
     cfg["inference"]["model_path"] = model_path
-    bridge_bin = os.path.join(model_path, "dino_bridge.bin")
-    if os.path.isfile(bridge_bin):
-        cfg.setdefault("model", {})["bridge_ckpt_path"] = bridge_bin
-    else:
-        print(
-            "[inference] 警告: 未找到 dino_bridge.bin，桥接层为随机初始化；"
-            "Qwen 主干仍从该目录 from_pretrained。"
-        )
-
-    print(
-        f"[inference] Processor + Qwen 主干从同一目录加载（微调权重应在此）: {model_path}"
-    )
+    print(f"[inference] Processor + Qwen-VL: {model_path}")
     model, processor = setup_model_and_processor(
         cfg=cfg,
         for_inference=True,
@@ -189,24 +124,30 @@ def inference_main(cfg: dict) -> None:
     if isinstance(bbox_data, dict):
         bbox = bbox_data.get("bbox_2d") or bbox_data.get("bbox")
     if bbox_data and isinstance(bbox_data, dict) and bbox and len(bbox) == 4:
-        norm01 = bool(cfg.get("data", {}).get("bbox_normalize_01", False))
-        px = bbox_to_processed_pixels(
-            list(map(float, bbox)),
-            image.size,
-            normalized_01=norm01,
-        )
-        inv_scale_x = 1.0 / scale_factor[0]
-        inv_scale_y = 1.0 / scale_factor[1]
-        original_bbox = [
-            int(px[0] * inv_scale_x),
-            int(px[1] * inv_scale_y),
-            int(px[2] * inv_scale_x),
-            int(px[3] * inv_scale_y),
-        ]
-        original_bbox[0] = max(0, min(original_bbox[0], original_size[0]))
-        original_bbox[1] = max(0, min(original_bbox[1], original_size[1]))
-        original_bbox[2] = max(0, min(original_bbox[2], original_size[0]))
-        original_bbox[3] = max(0, min(original_bbox[3], original_size[1]))
+        use_qwen1000 = bool(cfg.get("data", {}).get("bbox_qwen_norm1000", True))
+        if use_qwen1000:
+            original_bbox = qwen_norm1000_to_original_pixels(
+                list(map(float, bbox)), original_size
+            )
+        else:
+            norm01 = bool(cfg.get("data", {}).get("bbox_normalize_01", False))
+            px = bbox_to_processed_pixels(
+                list(map(float, bbox)),
+                image.size,
+                normalized_01=norm01,
+            )
+            inv_scale_x = 1.0 / scale_factor[0]
+            inv_scale_y = 1.0 / scale_factor[1]
+            original_bbox = [
+                int(px[0] * inv_scale_x),
+                int(px[1] * inv_scale_y),
+                int(px[2] * inv_scale_x),
+                int(px[3] * inv_scale_y),
+            ]
+            original_bbox[0] = max(0, min(original_bbox[0], original_size[0]))
+            original_bbox[1] = max(0, min(original_bbox[1], original_size[1]))
+            original_bbox[2] = max(0, min(original_bbox[2], original_size[0]))
+            original_bbox[3] = max(0, min(original_bbox[3], original_size[1]))
         print("\n解析到 bbox:")
         print(json.dumps(bbox_data, ensure_ascii=False, indent=2))
         print(f"映射到原图尺寸 {original_size}: {original_bbox}")
@@ -230,4 +171,3 @@ def inference_main(cfg: dict) -> None:
             print(f"\n可视化已保存: {out_path}")
     else:
         print("\n未解析到有效 bbox。")
-

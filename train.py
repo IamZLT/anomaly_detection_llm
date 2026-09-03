@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Stage-2: 全量训练 Qwen3-VL（图像 + grounding 对话），并加载 Stage-1 的 dino_bridge.bin 作为初始化映射。
+工业异常定位训练 / 推理入口。
 
-约束（按你的要求）：
-- 训练 loss 只保留语言模型 cross-entropy（LM loss）
-- 删除/不使用 DINO↔CLIP align_loss 与 mask_loss（已在 QwenDinoBridgeModel 中移除）
+默认配置 configs/ad_llm_qwen35_2b_prior.yaml：
+  冻结 Qwen3.5 Vision Encoder 多层差异先验 H
+  + 参考图 / 测试图 / H → Grounded Comparative CoT
+  + LoRA Process-Aware Spatial GRPO（无 SFT）。
+
+- runtime.pipeline=prior_cot → utils.train_prior.train_prior_main
+- inference → utils.infer.inference_main
 """
 
 import argparse
@@ -12,10 +16,14 @@ import os
 import subprocess
 import sys
 
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 import torch
 
 from utils.config import apply_runtime_overrides, load_yaml_config
-from utils.train import train_main
+from utils.infer import inference_main
 
 
 def _in_distributed_worker() -> bool:
@@ -24,7 +32,7 @@ def _in_distributed_worker() -> bool:
 
 def _maybe_relaunch_multi_gpu_train(cfg: dict) -> None:
     """
-    避免 HF Trainer 在单进程多 GPU 下走 DataParallel（容易触发 NCCL broadcast 错误）。
+    避免 HF Trainer 在单进程多 GPU 下走 DataParallel。
     当 distributed.num_gpu>1 且当前不是 torchrun worker 时，自动用 torch.distributed.run 重启。
     """
     num_gpu = int(cfg.get("distributed", {}).get("num_gpu", 1))
@@ -35,11 +43,10 @@ def _maybe_relaunch_multi_gpu_train(cfg: dict) -> None:
         return
     if _in_distributed_worker():
         return
-    # best-effort diagnostics
     cuda_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
     print(
-        f"[stage2] relaunch check: distributed.num_gpu={num_gpu} cuda_count={cuda_count} CUDA_VISIBLE_DEVICES={cvd}",
+        f"[train] relaunch check: distributed.num_gpu={num_gpu} cuda_count={cuda_count} CUDA_VISIBLE_DEVICES={cvd}",
         flush=True,
     )
     script = os.path.abspath(sys.argv[0])
@@ -51,17 +58,20 @@ def _maybe_relaunch_multi_gpu_train(cfg: dict) -> None:
         script,
         *sys.argv[1:],
     ]
-    print(f"[stage2] distributed.num_gpu={num_gpu}，正在启动: {' '.join(cmd)}", flush=True)
+    print(f"[train] distributed.num_gpu={num_gpu}，正在启动: {' '.join(cmd)}", flush=True)
     raise SystemExit(subprocess.call(cmd))
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser("AD-LLM Stage-2 (Qwen full training)")
-    p.add_argument("--config", type=str, default="configs/ad_llm_step2.yaml")
+    p = argparse.ArgumentParser("AD-LLM prior-guided CoT (Qwen3.5)")
+    p.add_argument("--config", type=str, default="configs/ad_llm_qwen35_2b_prior.yaml")
     p.add_argument("--mode", type=str, choices=["train", "inference"], default=None)
     p.add_argument("--output_dir", type=str, default=None)
     p.add_argument("--run_name", type=str, default=None)
     p.add_argument("--num-gpu", type=int, default=None, help="覆盖 distributed.num_gpu（训练）")
+    p.add_argument("--model_path", type=str, default=None, help="推理：覆盖 inference.model_path")
+    p.add_argument("--image_path", type=str, default=None, help="推理：覆盖 inference.image_path")
+    p.add_argument("--prompt", type=str, default=None, help="推理：覆盖 inference.prompt")
     return p
 
 
@@ -70,9 +80,10 @@ def main() -> None:
     cfg = load_yaml_config(args.config)
     cfg = apply_runtime_overrides(cfg, args)
 
-    # banner (useful when users still hit DataParallel)
+    mode = cfg.get("runtime", {}).get("mode", "train")
     print(
-        "[stage2] env: "
+        "[train] env: "
+        f"mode={mode} "
         f"LOCAL_RANK={os.environ.get('LOCAL_RANK')} "
         f"RANK={os.environ.get('RANK')} "
         f"WORLD_SIZE={os.environ.get('WORLD_SIZE')} "
@@ -81,23 +92,20 @@ def main() -> None:
         flush=True,
     )
 
+    if mode == "inference":
+        inference_main(cfg)
+        return
+
     _maybe_relaunch_multi_gpu_train(cfg)
+    pipeline = str(cfg.get("runtime", {}).get("pipeline", "prior_cot")).strip().lower()
+    if pipeline not in ("prior_cot", "anomaly_prior"):
+        raise ValueError(
+            f"未知 pipeline={pipeline!r}。旧 DINO/fusion 训练已移除，请用 "
+            "runtime.pipeline=prior_cot 与 configs/ad_llm_qwen35_2b_prior.yaml"
+        )
+    from utils.train_prior import train_prior_main
 
-    # 将 Step1 桥接 ckpt 映射到 model.bridge_ckpt_path（setup_model_and_processor 只认此处）
-    # 支持：model.bridge_ckpt_path、step2.bridge_ckpt_path、bridge.bridge_ckpt_path（与 YAML 中 bridge: 段一致）
-    model_m = cfg.get("model", {}) or {}
-    step2 = cfg.get("step2", {}) or {}
-    bridge_sec = cfg.get("bridge", {}) or {}
-    bridge_ckpt = (
-        model_m.get("bridge_ckpt_path")
-        or step2.get("bridge_ckpt_path")
-        or bridge_sec.get("bridge_ckpt_path")
-    )
-    if bridge_ckpt:
-        cfg.setdefault("model", {})
-        cfg["model"]["bridge_ckpt_path"] = bridge_ckpt
-
-    train_main(cfg)
+    train_prior_main(cfg)
 
 
 if __name__ == "__main__":

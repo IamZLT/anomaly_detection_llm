@@ -38,6 +38,9 @@ pip-wheel-metadata/
 
 # Training artifacts
 logs/
+logs_*/
+logs_qwen35_2b_prior/
+logs_step2/
 outputs/
 runs/
 checkpoints/
@@ -61,16 +64,21 @@ data_processed/
 *.zip
 *.tar
 *.tar.gz
+*.tgz
 *.7z
+
+# Local backups, papers, experiment dumps (do not upload)
+backup_code_*/
+backup_code_20260903/
+papers/
+results/
+exp_llm.bash
 
 # App runtime files
 app/uploads/
 app/static/outputs/
 Anomaly-OneVision-main/
-model_card/
 docs/
-logs/
-logs_step2/
 
 # Notebook checkpoints
 .ipynb_checkpoints/

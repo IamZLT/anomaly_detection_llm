@@ -1,0 +1,38 @@
+# Qwen3.5-9B 零样本缺陷识别/定位（纯 Qwen-VL，无 LoRA）
+paths:
+  dataset_root: /data2/zlt/anomaly_detection_llm/datasets
+  output_dir: ./outputs/qwen35_9b_zeroshot
+
+runtime:
+  mode: inference
+  run_name: qwen35_9b_default_ad
+  auto_create_output_dir: true
+
+model:
+  random_init_llm: false
+  arch: Qwen3.5-9B
+  name: /data2/zlt/anomaly_detection_llm/model_card/Qwen3.5-9B
+  local_files_only: true
+  freeze_vit: true
+  torch_dtype: bfloat16
+
+lora:
+  enabled: false
+
+data:
+  max_image_size: 512
+  factor: 28
+
+inference:
+  model_path: /data2/zlt/anomaly_detection_llm/model_card/Qwen3.5-9B
+  image_path: null
+  prompt: >-
+    Locate every manufacturing defect or anomaly in this image.
+    Report bbox coordinates in JSON format.
+    If no defect is found, output [{"bbox_2d": null, "label": "normal"}].
+  max_new_tokens: 768
+  temperature: 0.0
+  top_p: 0.9
+  do_sample: false
+  save_visualization: true
+  visual_output_dir: ./outputs/qwen35_9b_zeroshot

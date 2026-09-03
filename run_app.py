@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 """
-启动 Flask Web 应用（与 main_qwen3.py 使用同一套 configs/qwen.yaml）。
+启动 Flask Web 应用。
 
 用法:
-  python run_app.py --model-path /path/to/logs/.../final_model
-  python run_app.py --config configs/qwen.yaml   # yaml 里已填写 inference.model_path 时可省略 --model-path
-
-环境变量（可选）:
-  QWEN_WEB_CONFIG      配置文件绝对路径
-  QWEN_WEB_MODEL_PATH  覆盖 inference.model_path
+  python run_app.py --model-path /path/to/logs/.../sft_final
+  python run_app.py --config configs/ad_llm_qwen35_9b_zeroshot.yaml
 """
 
 import argparse
@@ -17,20 +13,19 @@ import sys
 
 project_root = os.path.dirname(os.path.abspath(__file__))
 app_dir = os.path.join(project_root, "app")
-# 与原先一致：先加入 app 目录使 `app.py` 可作为模块 `app` 导入；项目根目录供 utils/models 使用（app.py 内也会加入）
 sys.path.insert(0, project_root)
 sys.path.insert(0, app_dir)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Qwen3-VL 微调模型 Web 推理")
-    default_cfg = os.path.join(project_root, "configs", "qwen.yaml")
-    parser.add_argument("--config", type=str, default=default_cfg, help="YAML 配置（与训练相同）")
+    parser = argparse.ArgumentParser(description="Qwen-VL Web 推理")
+    default_cfg = os.path.join(project_root, "configs", "ad_llm_qwen35_9b_zeroshot.yaml")
+    parser.add_argument("--config", type=str, default=default_cfg, help="YAML 配置")
     parser.add_argument(
         "--model-path",
         type=str,
         default=None,
-        help="微调输出目录（含 dino_bridge.bin 等），覆盖 yaml 中的 inference.model_path",
+        help="覆盖 yaml 中的 inference.model_path（基座或 LoRA 输出目录）",
     )
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=5002)
@@ -43,7 +38,7 @@ def main() -> None:
     from app import app
 
     print("=" * 60)
-    print("Qwen3-VL 微调模型 Web 应用（与训练 / CLI 推理管线一致）")
+    print("Qwen-VL Web 应用")
     print("=" * 60)
     print(f"项目根目录: {project_root}")
     print(f"配置文件: {os.environ['QWEN_WEB_CONFIG']}")

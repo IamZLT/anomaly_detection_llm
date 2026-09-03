@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Flask Web应用 - Qwen3-VL微调模型推理界面
-与 main_qwen3.py 推理管线一致：setup_model_and_processor + build_generation_inputs（含 DINO/CLIP 桥）。
+Flask Web 应用 - Qwen-VL 推理界面。
+与 CLI 一致：models.avNet.setup_model_and_processor + utils.infer.build_generation_inputs。
 """
 
 import argparse
@@ -18,15 +18,13 @@ if _PROJECT_ROOT not in sys.path:
 import torch
 from PIL import Image
 from flask import Flask, render_template, request, jsonify, send_file
-from transformers import AutoImageProcessor
-
-from models.qwen3_text_modeling import setup_model_and_processor
+from models.avNet import setup_model_and_processor
 from utils.infer import build_generation_inputs, decode_generation_output
 from utils.common import (
-    bbox_to_processed_pixels,
     draw_bbox_on_image,
     infer_model_compute_device,
     parse_grounding_output,
+    qwen_norm1000_to_original_pixels,
     smart_resize,
 )
 from utils.config import load_yaml_config, apply_runtime_overrides
@@ -55,8 +53,6 @@ _web_cfg = None
 model = None
 processor = None
 device = None
-_cached_dino_image_processor = None
-_cached_clip_image_processor = None
 
 
 def get_web_cfg():
@@ -66,7 +62,7 @@ def get_web_cfg():
         return _web_cfg
     cfg_path = os.environ.get(
         "QWEN_WEB_CONFIG",
-        os.path.join(_PROJECT_ROOT, "configs", "qwen.yaml"),
+        os.path.join(_PROJECT_ROOT, "configs", "ad_llm_qwen35_9b_zeroshot.yaml"),
     )
     cfg = load_yaml_config(cfg_path)
     mp = os.environ.get("QWEN_WEB_MODEL_PATH")
@@ -84,7 +80,7 @@ def get_web_cfg():
         )
     if not cfg.get("inference", {}).get("model_path"):
         raise ValueError(
-            "未设置 inference.model_path。请在 configs/qwen.yaml 中配置，或使用 "
+            "未设置 inference.model_path。请在 configs/ad_llm_qwen35_9b_zeroshot.yaml 中配置，或使用 "
             "python run_app.py --model-path /path/to/final_model"
         )
     _web_cfg = cfg
@@ -100,8 +96,8 @@ def _infer_model_device(mod: torch.nn.Module) -> str:
 # ============================================================================
 
 def load_model():
-    """与 utils/qwen_infer.inference_main 相同：setup_model_and_processor + 可选桥权重。"""
-    global model, processor, device, _cached_dino_image_processor, _cached_clip_image_processor
+    """与 CLI inference_main 相同：setup_model_and_processor。"""
+    global model, processor, device
 
     if model is None or processor is None:
         cfg = get_web_cfg()
@@ -109,7 +105,7 @@ def load_model():
         def _web_load_log(msg: str) -> None:
             print(f"[Web加载 {time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
-        _web_load_log("开始 setup_model_and_processor（详细步骤见上方 [模型加载 …] 日志）…")
+        _web_load_log("开始 setup_model_and_processor …")
         t0 = time.perf_counter()
         model, processor = setup_model_and_processor(
             cfg=cfg,
@@ -118,29 +114,6 @@ def load_model():
         )
         _web_load_log(f"setup_model_and_processor 返回 (+{time.perf_counter() - t0:.1f}s)")
         device = _infer_model_device(model)
-
-        local_files_only = cfg.get("model", {}).get("local_files_only", True)
-        if bool(cfg.get("dino", {}).get("enabled", True)):
-            _web_load_log(f"⑥ Web 缓存 DINO AutoImageProcessor ← {cfg['dino']['model_path']} …")
-            t1 = time.perf_counter()
-            _cached_dino_image_processor = AutoImageProcessor.from_pretrained(
-                cfg["dino"]["model_path"],
-                trust_remote_code=True,
-                local_files_only=local_files_only,
-            )
-            _web_load_log(f"⑥ DINO ImageProcessor 完成 (+{time.perf_counter() - t1:.1f}s)")
-            _web_load_log(f"⑦ Web 缓存 CLIP AutoImageProcessor ← {cfg['clip']['model_path']} …")
-            t2 = time.perf_counter()
-            _cached_clip_image_processor = AutoImageProcessor.from_pretrained(
-                cfg["clip"]["model_path"],
-                trust_remote_code=True,
-                local_files_only=local_files_only,
-            )
-            _web_load_log(f"⑦ CLIP ImageProcessor 完成 (+{time.perf_counter() - t2:.1f}s)")
-        else:
-            _cached_dino_image_processor = None
-            _cached_clip_image_processor = None
-
         _web_load_log(f"全部就绪，主模型设备: {device}")
 
     return model, processor
@@ -192,14 +165,7 @@ def inference():
             factor=cfg["data"]["factor"],
         )
 
-        inputs = build_generation_inputs(
-            cfg,
-            processor,
-            processed_image,
-            prompt,
-            dino_processor=_cached_dino_image_processor,
-            clip_processor=_cached_clip_image_processor,
-        )
+        inputs = build_generation_inputs(cfg, processor, processed_image, prompt)
         model_device = infer_model_compute_device(model)
         inputs = {
             k: v.to(model_device) if torch.is_tensor(v) else v for k, v in inputs.items()
@@ -215,7 +181,7 @@ def inference():
                 do_sample=cfg["inference"]["do_sample"],
             )
         
-        # 解码（与 CLI 一致：桥接路径不得按 prompt 字符串/错误 token 数切片）
+        # 解码新生成 token
         response = decode_generation_output(processor, outputs, inputs, cfg)
         
         # 解析bbox
@@ -228,28 +194,9 @@ def inference():
         if bbox_data:
             bbox = bbox_data.get("bbox_2d") or bbox_data.get("bbox")
             if bbox and len(bbox) == 4:
-                norm01 = bool(cfg.get("data", {}).get("bbox_normalize_01", False))
-                px = bbox_to_processed_pixels(
-                    list(map(float, bbox)),
-                    processed_image.size,
-                    normalized_01=norm01,
-                )
-                # 将 bbox 从处理后的尺寸映射回原始尺寸
-                inv_scale_x = 1.0 / scale_factor[0]
-                inv_scale_y = 1.0 / scale_factor[1]
-                original_bbox = [
-                    int(px[0] * inv_scale_x),
-                    int(px[1] * inv_scale_y),
-                    int(px[2] * inv_scale_x),
-                    int(px[3] * inv_scale_y),
-                ]
-                
-                # 确保bbox在图像范围内
-                original_bbox[0] = max(0, min(original_bbox[0], original_size[0]))
-                original_bbox[1] = max(0, min(original_bbox[1], original_size[1]))
-                original_bbox[2] = max(0, min(original_bbox[2], original_size[0]))
-                original_bbox[3] = max(0, min(original_bbox[3], original_size[1]))
-                
+                original_bbox = qwen_norm1000_to_original_pixels(
+                    list(map(float, bbox)), original_size
+                ) 
                 # 绘制bbox
                 label = bbox_data.get('label', 'Anomaly')
                 annotated_image = draw_bbox_on_image(annotated_image, original_bbox, label)
@@ -310,7 +257,7 @@ if __name__ == "__main__":
     print(f"应用目录: {APP_DIR}")
     try:
         _c = get_web_cfg()
-        print(f"配置文件: {os.environ.get('QWEN_WEB_CONFIG', os.path.join(_PROJECT_ROOT, 'configs', 'qwen.yaml'))}")
+        print(f"配置文件: {os.environ.get('QWEN_WEB_CONFIG', os.path.join(_PROJECT_ROOT, 'configs', 'ad_llm_qwen35_9b_zeroshot.yaml'))}")
         print(f"模型路径: {_c['inference']['model_path']}")
     except ValueError as e:
         print(f"配置错误: {e}")

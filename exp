@@ -260,3 +260,9 @@ python scripts/analyze_distribution.py
 
 CUDA_VISIBLE_DEVICES=1 HF_ENDPOINT=https://hf-mirror.com torchrun --nproc_per_node=1 main_qwen3.py --config configs/qwen.yaml
  HF_ENDPOINT=https://hf-mirror.com /home/zlt/miniconda3/envs/clip/bin/huggingface-cli download Qwen/Qwen3-VL-0.8B-Instruct --local-dir "/data2/zlt/anomaly_detection_llm/model_card/Qwen3-VL-0.8B-Instruct"
+
+
+# Qwen3.5-2B prior CoT：物理卡 2 和 7
+CUDA_VISIBLE_DEVICES=2,7 python train.py --config configs/ad_llm_qwen35_2b_prior.yaml --num-gpu 2
+
+CUDA_VISIBLE_DEVICES=2 python train.py --config configs/ad_llm_qwen35_2b_prior.yaml --num-gpu 1

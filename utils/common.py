@@ -29,29 +29,6 @@ def set_seed(seed: int) -> None:
     random.seed(seed)
 
 
-def step1_train_style_image_batch(
-    img_rs: Image.Image,
-    dino_image_size: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """
-    与 ``train_ad_llm_step1.VisualPrototypeImageDataset`` / ``test_ad_llm_step1`` 一致：
-    对 ``smart_resize`` 后的 PIL 做 ``Resize(dino) → ToTensor → ImageNet``，得到 ``[1,3,H,W]``。
-    DINO 与 CLIP 编码应共用该张量（再由各自 ``encode_*`` 内部按需插值），与单独测 Step1 对齐。
-    """
-    from torchvision import transforms
-
-    h = w = int(dino_image_size)
-    tfm = transforms.Compose(
-        [
-            transforms.Resize((h, w)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
-    )
-    return tfm(img_rs).unsqueeze(0).to(device)
-
-
 def smart_resize(
     image: Image.Image, max_size: int = 1024, factor: int = 28
 ) -> Tuple[Image.Image, Tuple[int, int], Tuple[float, float]]:
@@ -153,6 +130,33 @@ def bbox_to_processed_pixels(
     if normalized_01:
         return [x1 * pw, y1 * ph, x2 * pw, y2 * ph]
     return [x1, y1, x2, y2]
+
+
+def qwen_norm1000_to_original_pixels(
+    bbox: List[float], original_size: Tuple[int, int]
+) -> List[int]:
+    """
+    Qwen3-VL / Qwen3.5 官方 2D grounding：
+    bbox_2d 为相对原图的 0–1000（千分比），与内部 resize 无关。
+    像素 = coord / 1000 * (W 或 H)。
+    若四个数均 ≤1.5，视为误用 0–1，按原图比例还原。
+    """
+    ow, oh = int(original_size[0]), int(original_size[1])
+    x1, y1, x2, y2 = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+    mx = max(abs(x1), abs(y1), abs(x2), abs(y2))
+    if mx <= 1.5:
+        xs = [x1 * ow, y1 * oh, x2 * ow, y2 * oh]
+    else:
+        xs = [x1 / 1000.0 * ow, y1 / 1000.0 * oh, x2 / 1000.0 * ow, y2 / 1000.0 * oh]
+    x1i = int(max(0, min(ow - 1, round(xs[0]))))
+    y1i = int(max(0, min(oh - 1, round(xs[1]))))
+    x2i = int(max(0, min(ow, round(xs[2]))))
+    y2i = int(max(0, min(oh, round(xs[3]))))
+    if x2i < x1i:
+        x1i, x2i = x2i, x1i
+    if y2i < y1i:
+        y1i, y2i = y2i, y1i
+    return [x1i, y1i, x2i, y2i]
 
 
 def _strip_markdown_json_fence(text: str) -> str:
