@@ -27,7 +27,7 @@ from evaluation.metrics import is_truncated
 from models.anomaly_prior import AnomalyPrior
 from models.lora import apply_lora
 from models.qwen35 import freeze_vision_encoder, force_vision_eval, setup_model_and_processor
-from reasoning.parser import parse_cot_output
+from reasoning.parser import parse_cot_output, rollout_protocol_stats
 from reasoning.rewards import compute_rewards
 from rl.grpo import (
     avg_across_ranks,
@@ -269,7 +269,8 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
         final_bbox_rate = n_bbox / n_g
         cls_tag_rate = n_cls / n_g
         truncation_rate = n_trunc / n_g
-        parse_rate_local = sum(1 for p in parsed_list if p.get("has_tags")) / n_g
+        proto_stats = rollout_protocol_stats(parsed_list, texts)
+        parse_rate_local = proto_stats["protocol_rate"]
 
         loss_v = 0.0
         pg_v = 0.0
@@ -345,6 +346,7 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
         truncation_rate = avg_across_ranks(truncation_rate, device)
         cls_tag_rate = avg_across_ranks(cls_tag_rate, device)
         ref_gap = avg_across_ranks(ref_gap, device)
+        proto_avg = {k: avg_across_ranks(float(v), device) for k, v in proto_stats.items()}
 
         if is_main_process():
             log_grpo_scalars(
@@ -379,6 +381,7 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                     "cls_tag_rate": float(cls_tag_rate),
                     "truncation_rate": float(truncation_rate),
                     "old_ref_logprob_gap": float(ref_gap),
+                    **{k: float(v) for k, v in proto_avg.items()},
                 },
             )
             if log_every > 0 and step % log_every == 0:
@@ -393,6 +396,9 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                     f"iou_f={sum(d.get('R_iou', 0.0) for d in details)/n:.3f} "
                     f"iou_c={sum(d.get('R_iou_c', 0.0) for d in details)/n:.3f} "
                     f"ans={answer_tag_rate:.2f} bbox={final_bbox_rate:.2f} "
+                    f"traj={proto_avg.get('trajectory_valid_rate', 0.0):.2f} "
+                    f"cand={proto_avg.get('candidate_valid_rate', 0.0):.2f} "
+                    f"uniq={proto_avg.get('unique_response_rate', 0.0):.2f} "
                     f"trunc={truncation_rate:.2f} fmt={parse_rate:.2f} rs={resample_n}{skip_s}"
                     + (f" gnorm={last_gnorm:.2f}" if did_opt and last_gnorm is not None else ""),
                     main_only=True,

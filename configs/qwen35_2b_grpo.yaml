@@ -19,7 +19,7 @@ tensorboard:
   host: 0.0.0.0
   port: 5002
   # 默认盯本次 run 的 tb/：loss 曲线和热力图 / CoT 在同一个实验里
-  vis_every_n_steps: 5      # 热力图 / 案例 CoT / bbox 可视化 / GRPO group
+  vis_every_n_steps: 2      # 热力图 / 案例 CoT / bbox 可视化 / GRPO group
   vis_num_samples: 2
   log_heatmap: true
   log_case: true
@@ -89,44 +89,48 @@ prompt:
     Image 2 is the inspection sample.
     Image 3 is a normal-test discrepancy prior H. H is only a spatial hint and is not a defect label.
 
-    Compare Image 2 against Image 1 and determine whether Image 2 contains a true structural or appearance anomaly.
+    Compare Image 2 with Image 1 and determine whether Image 2 contains a true anomaly.
 
     Return exactly five XML blocks in this order:
     <compare>, <ground>, <verify>, <boundary>, <answer>.
-    Do not copy or repeat any instruction text. Always output all five XML blocks.
+
+    Always output all five blocks.
+    Do not copy or repeat the instructions.
 
     In <compare>:
-    Write 1-2 sentences describing concrete visual differences you observe between Image 1 and Image 2.
+    Describe concrete visual differences between Image 1 and Image 2 in 1-2 sentences.
+    Refer to visible shape, structure, texture, color, or surface changes.
 
     In <ground>:
-    Explain the suspected region in 1 sentence.
-    Then write exactly one line:
-    candidate_bbox=[x1,y1,x2,y2]
-    If no anomaly candidate exists, write:
-    candidate_bbox=null
+    Describe the most suspicious region in one sentence.
+    Then output exactly one of:
+    candidate_bbox_2d=[x1,y1,x2,y2]
+    candidate_bbox_2d=null
 
     In <verify>:
-    Re-check the candidate against Image 1 and decide whether it is a true defect or normal variation.
+    Re-check the suspected difference against Image 1 and decide whether it is a true defect or normal variation.
 
     In <boundary>:
-    If candidate_bbox is not null, write exactly four lines:
+    If candidate_bbox_2d is not null, output exactly four lines:
     left=VALUE
     right=VALUE
     top=VALUE
     bottom=VALUE
     where VALUE is exactly one of inward, outward, keep.
-    If candidate_bbox is null, write:
+
+    If candidate_bbox_2d is null, output exactly:
     not_applicable
 
     In <answer>:
-    For an anomalous sample write exactly:
-    is_anomaly=true
-    bbox=[x1,y1,x2,y2]
-    For a normal sample write exactly:
-    is_anomaly=false
-    bbox=null
+    Output exactly one JSON object.
 
-    All bbox coordinates must use the 0-1000 coordinate system of Image 2.
+    For an anomalous sample:
+    {"is_anomaly": true, "bbox_2d": [x1,y1,x2,y2]}
+
+    For a normal sample:
+    {"is_anomaly": false, "bbox_2d": null}
+
+    All bbox coordinates are integers in the 0-1000 coordinate system of Image 2.
 
 training:
   max_length: 2048

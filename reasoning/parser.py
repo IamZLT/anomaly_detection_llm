@@ -6,6 +6,10 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Sequence
 
+BOX_STATE_BOX = "box"
+BOX_STATE_NULL = "null"
+BOX_STATE_MISSING = "missing"
+BOX_STATE_INVALID = "invalid"
 EDGE_KEYS = ("L", "R", "T", "B")
 EDGE_CHOICES = ("inward", "outward", "keep")
 TAG_NAMES = ("compare", "ground", "verify", "boundary", "answer")
@@ -14,7 +18,7 @@ TAG_BLOCK_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _BOX_ASSIGN_RE = re.compile(
-    r"(?:candidate_bbox|bbox_2d|final_bbox|bbox)\s*=\s*(null|none|n/a|\[.*?\])",
+    r"(?:candidate_bbox_2d|candidate_bbox|bbox_2d|final_bbox|bbox)\s*=\s*(null|none|n/a|\[.*?\])",
     re.IGNORECASE | re.DOTALL,
 )
 _BARE_BOX_RE = re.compile(r"\[\s*(-?\d+(?:\.\d+)?\s*,\s*){3}-?\d+(?:\.\d+)?\s*\]")
@@ -127,31 +131,214 @@ def parse_boundary(text_or_dict: Any) -> Dict[str, str]:
     return out
 
 
-def parse_cot_output(text: str) -> Dict[str, Any]:
-    """Strict process-aware parse: Bc from <ground>, D from <boundary>, Bf/ŷ from <answer>."""
-    raw = strip_think(text)
-    tags = extract_tag_blocks(raw)
-    ground_txt = tags.get("ground", "")
-    answer_txt = tags.get("answer", "")
-    bound_txt = tags.get("boundary", "")
-    cand = _box_from_text(ground_txt, prefer=("candidate_bbox", "bbox_c")) if ground_txt else None
-    bbox = _box_from_text(answer_txt, prefer=("bbox_2d", "final_bbox", "bbox")) if answer_txt else None
-    boundary = parse_boundary(bound_txt) if bound_txt else {}
-    is_anom = parse_final_decision(answer_txt) if answer_txt else None
-    has_tags = all(n in tags for n in TAG_NAMES)
+def _valid_bbox_1000(box) -> bool:
+    if box is None or not isinstance(box, (list, tuple)) or len(box) != 4:
+        return False
+    try:
+        x1, y1, x2, y2 = map(float, box)
+    except (TypeError, ValueError):
+        return False
+    return 0.0 <= x1 < x2 <= 1000.0 and 0.0 <= y1 < y2 <= 1000.0
+
+
+def parse_bbox_field(text: str, field_name: str) -> tuple:
+    if not text or not str(text).strip():
+        return BOX_STATE_MISSING, None
+    pat = re.search(
+        rf"(?<![A-Za-z_]){re.escape(field_name)}\s*[:=]\s*(null|none|\[[^\]]*\])",
+        text,
+        re.I | re.S,
+    )
+    if pat is None:
+        return BOX_STATE_MISSING, None
+    raw = pat.group(1).strip()
+    if raw.lower() in ("null", "none"):
+        return BOX_STATE_NULL, None
+    try:
+        value = json.loads(raw)
+    except Exception:
+        return BOX_STATE_INVALID, None
+    if isinstance(value, list) and len(value) == 4 and all(isinstance(x, (int, float)) for x in value):
+        return BOX_STATE_BOX, [float(x) for x in value]
+    return BOX_STATE_INVALID, None
+
+
+def parse_answer_block(answer_txt: str) -> Dict[str, Any]:
+    blob = (answer_txt or "").strip()
+    if not blob:
+        return {
+            "answer_state": BOX_STATE_MISSING,
+            "is_anomaly": None,
+            "final_bbox_state": BOX_STATE_MISSING,
+            "bbox_2d": None,
+        }
+    obj = None
+    try:
+        obj = json.loads(blob)
+    except Exception:
+        m = re.search(r"\{.*\}", blob, re.DOTALL)
+        if m:
+            try:
+                obj = json.loads(m.group(0))
+            except Exception:
+                obj = None
+    if not isinstance(obj, dict):
+        return {
+            "answer_state": BOX_STATE_INVALID,
+            "is_anomaly": None,
+            "final_bbox_state": BOX_STATE_INVALID,
+            "bbox_2d": None,
+        }
+    pred_cls = obj.get("is_anomaly", None)
+    if not isinstance(pred_cls, bool):
+        pred_cls = None
+    if "bbox_2d" not in obj:
+        bbox_state, bbox = BOX_STATE_MISSING, None
+    elif obj["bbox_2d"] is None:
+        bbox_state, bbox = BOX_STATE_NULL, None
+    else:
+        bbox = parse_bbox(obj["bbox_2d"])
+        bbox_state = BOX_STATE_BOX if bbox is not None else BOX_STATE_INVALID
     return {
+        "answer_state": "ok",
+        "is_anomaly": pred_cls,
+        "final_bbox_state": bbox_state,
+        "bbox_2d": bbox,
+    }
+
+
+def parse_boundary_block(bound_txt: str) -> tuple:
+    t = (bound_txt or "").strip()
+    if not t:
+        return BOX_STATE_INVALID, {}
+    if t.lower() == "not_applicable":
+        return "not_applicable", {}
+    boundary = parse_boundary(t)
+    return ("complete" if len(boundary) == 4 else BOX_STATE_INVALID), boundary
+
+
+def _trajectory_valid(
+    *,
+    has_tags: bool,
+    candidate_state: str,
+    candidate_bbox,
+    boundary_state: str,
+    answer: Dict[str, Any],
+) -> bool:
+    pred_cls = answer.get("is_anomaly")
+    if pred_cls is False:
+        return (
+            has_tags
+            and candidate_state == BOX_STATE_NULL
+            and boundary_state == "not_applicable"
+            and answer.get("answer_state") == "ok"
+            and answer.get("final_bbox_state") == BOX_STATE_NULL
+        )
+    if pred_cls is True:
+        return (
+            has_tags
+            and candidate_state == BOX_STATE_BOX
+            and _valid_bbox_1000(candidate_bbox)
+            and boundary_state == "complete"
+            and answer.get("answer_state") == "ok"
+            and answer.get("final_bbox_state") == BOX_STATE_BOX
+            and _valid_bbox_1000(answer.get("bbox_2d"))
+        )
+    return False
+
+
+def _pack_parsed(
+    *,
+    raw: str,
+    tags: Dict[str, str],
+    candidate_state: str,
+    candidate_bbox,
+    boundary_state: str,
+    boundary: dict,
+    answer: Dict[str, Any],
+    strict: bool,
+    extra: Optional[dict] = None,
+) -> Dict[str, Any]:
+    has_tags = all(n in tags for n in TAG_NAMES)
+    cand = candidate_bbox if candidate_state == BOX_STATE_BOX else None
+    out = {
         "raw": tags if tags else raw,
         "tags": tags,
         "has_tags": has_tags,
         "format_ok": bool(has_tags),
-        "bbox_2d": bbox,
+        "candidate_bbox_2d": cand,
         "candidate_bbox": cand,
+        "candidate_bbox_state": candidate_state,
         "boundary": boundary,
-        "is_anomaly": is_anom,
-        "label": None,
+        "boundary_state": boundary_state,
+        "is_anomaly": answer.get("is_anomaly"),
+        "bbox_2d": answer.get("bbox_2d"),
+        "final_bbox_state": answer.get("final_bbox_state"),
+        "answer_state": answer.get("answer_state"),
+        "trajectory_valid": _trajectory_valid(
+            has_tags=has_tags,
+            candidate_state=candidate_state,
+            candidate_bbox=cand,
+            boundary_state=boundary_state,
+            answer=answer,
+        ),
         "text": raw,
-        "strict": True,
+        "strict": strict,
+        "label": None,
     }
+    if extra:
+        out.update(extra)
+    return out
+
+
+def rollout_protocol_stats(parsed_list: Sequence[dict], texts: Optional[Sequence[str]] = None) -> Dict[str, float]:
+    n = max(len(parsed_list), 1)
+
+    def rate(pred) -> float:
+        return float(sum(1 for p in parsed_list if pred(p))) / n
+
+    stats = {
+        "protocol_rate": rate(lambda p: bool(p.get("has_tags"))),
+        "trajectory_valid_rate": rate(lambda p: bool(p.get("trajectory_valid"))),
+        "candidate_box_rate": rate(lambda p: p.get("candidate_bbox_state") == BOX_STATE_BOX),
+        "candidate_valid_rate": rate(
+            lambda p: p.get("candidate_bbox_state") == BOX_STATE_BOX
+            and _valid_bbox_1000(p.get("candidate_bbox_2d") or p.get("candidate_bbox"))
+        ),
+        "final_box_rate": rate(lambda p: p.get("final_bbox_state") == BOX_STATE_BOX),
+        "final_valid_rate": rate(
+            lambda p: p.get("final_bbox_state") == BOX_STATE_BOX and _valid_bbox_1000(p.get("bbox_2d"))
+        ),
+        "boundary_complete_rate": rate(lambda p: p.get("boundary_state") == "complete"),
+        "normal_null_consistency_rate": rate(
+            lambda p: p.get("is_anomaly") is False
+            and p.get("candidate_bbox_state") == BOX_STATE_NULL
+            and p.get("boundary_state") == "not_applicable"
+            and p.get("final_bbox_state") == BOX_STATE_NULL
+        ),
+    }
+    if texts is not None:
+        stats["unique_response_rate"] = float(len(set(texts))) / max(len(texts), 1)
+    return stats
+
+
+def parse_cot_output(text: str) -> Dict[str, Any]:
+    """Strict process-aware parse: Bc from <ground>, D from <boundary>, Bf/ŷ from <answer>."""
+    raw = strip_think(text)
+    tags = extract_tag_blocks(raw)
+    candidate_state, candidate_bbox = parse_bbox_field(tags.get("ground", ""), "candidate_bbox_2d")
+    boundary_state, boundary = parse_boundary_block(tags.get("boundary", ""))
+    answer = parse_answer_block(tags.get("answer", ""))
+    return _pack_parsed(
+        raw=raw,
+        tags=tags,
+        candidate_state=candidate_state,
+        candidate_bbox=candidate_bbox,
+        boundary_state=boundary_state,
+        boundary=boundary,
+        answer=answer,
+        strict=True,
+    )
 
 
 def parse_cot_output_tolerant(text: str) -> Dict[str, Any]:
@@ -179,33 +366,163 @@ def parse_cot_output_tolerant(text: str) -> Dict[str, Any]:
                 except Exception:
                     json_obj = {}
 
-    cand = _box_from_text(ground_txt, prefer=("candidate_bbox", "bbox_c")) if ground_txt else None
-    bbox = _box_from_text(answer_txt, prefer=("bbox_2d", "final_bbox", "bbox")) if answer_txt else None
-    if cand is None:
-        cand = _box_from_text(raw, prefer=("candidate_bbox", "bbox_c"))
-    if cand is None:
-        cand = parse_bbox(json_obj.get("candidate_bbox") or json_obj.get("bbox_c"))
-    if bbox is None:
-        bbox = _box_from_text(raw, prefer=("bbox_2d", "final_bbox", "bbox"))
-    if bbox is None:
-        bbox = parse_bbox(json_obj.get("bbox_2d") or json_obj.get("final_bbox") or json_obj.get("bbox"))
+    candidate_state, candidate_bbox = parse_bbox_field(ground_txt, "candidate_bbox_2d")
+    if candidate_state == BOX_STATE_MISSING:
+        candidate_state, candidate_bbox = parse_bbox_field(ground_txt, "candidate_bbox")
+    if candidate_state == BOX_STATE_MISSING and json_obj:
+        if "candidate_bbox_2d" in json_obj or "candidate_bbox" in json_obj or "bbox_c" in json_obj:
+            raw_c = json_obj.get("candidate_bbox_2d", json_obj.get("candidate_bbox", json_obj.get("bbox_c")))
+            if raw_c is None:
+                candidate_state, candidate_bbox = BOX_STATE_NULL, None
+            else:
+                box = parse_bbox(raw_c)
+                candidate_state = BOX_STATE_BOX if box is not None else BOX_STATE_INVALID
+                candidate_bbox = box
 
-    boundary = parse_boundary(bound_txt or json_obj.get("boundary") or json_obj.get("D") or "")
-    is_anom = parse_final_decision(answer_txt)
-    if is_anom is None and json_obj:
-        is_anom = parse_final_decision(str(json_obj.get("is_anomaly", "")))
+    boundary_state, boundary = parse_boundary_block(bound_txt)
+    if not bound_txt and json_obj:
+        bsrc = json_obj.get("boundary") or json_obj.get("D") or ""
+        if isinstance(bsrc, dict):
+            boundary = parse_boundary(bsrc)
+            boundary_state = "complete" if len(boundary) == 4 else BOX_STATE_INVALID
+        elif bsrc:
+            boundary_state, boundary = parse_boundary_block(str(bsrc))
 
-    has_tags = all(n in tags for n in TAG_NAMES)
-    return {
-        "raw": tags if tags else (json_obj or raw),
-        "tags": tags,
-        "has_tags": has_tags,
-        "format_ok": bool(has_tags),
-        "bbox_2d": bbox,
-        "candidate_bbox": cand,
-        "boundary": boundary,
-        "is_anomaly": is_anom,
-        "label": json_obj.get("label") if json_obj else None,
-        "text": raw,
-        "strict": False,
-    }
+    answer = parse_answer_block(answer_txt)
+    if answer["answer_state"] != "ok":
+        pred = parse_final_decision(answer_txt)
+        st, box = parse_bbox_field(answer_txt, "bbox_2d")
+        if st == BOX_STATE_MISSING:
+            st, box = parse_bbox_field(answer_txt, "bbox")
+        if pred is not None or st != BOX_STATE_MISSING:
+            answer = {
+                "answer_state": "ok" if pred is not None else BOX_STATE_INVALID,
+                "is_anomaly": pred,
+                "final_bbox_state": st,
+                "bbox_2d": box if st == BOX_STATE_BOX else None,
+            }
+    if answer["answer_state"] != "ok" and json_obj:
+        pred = json_obj.get("is_anomaly")
+        if not isinstance(pred, bool):
+            pred = parse_final_decision(str(pred)) if pred is not None else None
+            if pred is None and str(json_obj.get("label", "")).lower() == "normal":
+                pred = False
+        if "bbox_2d" in json_obj:
+            if json_obj["bbox_2d"] is None:
+                st, box = BOX_STATE_NULL, None
+            else:
+                box = parse_bbox(json_obj["bbox_2d"])
+                st = BOX_STATE_BOX if box is not None else BOX_STATE_INVALID
+        elif "bbox" in json_obj:
+            if json_obj["bbox"] is None:
+                st, box = BOX_STATE_NULL, None
+            else:
+                box = parse_bbox(json_obj["bbox"])
+                st = BOX_STATE_BOX if box is not None else BOX_STATE_INVALID
+        else:
+            st, box = BOX_STATE_MISSING, None
+        if pred is not None or st != BOX_STATE_MISSING:
+            answer = {
+                "answer_state": "ok" if pred is not None else BOX_STATE_INVALID,
+                "is_anomaly": pred,
+                "final_bbox_state": st,
+                "bbox_2d": box if st == BOX_STATE_BOX else None,
+            }
+
+    packed = _pack_parsed(
+        raw=raw,
+        tags=tags,
+        candidate_state=candidate_state,
+        candidate_bbox=candidate_bbox,
+        boundary_state=boundary_state,
+        boundary=boundary,
+        answer=answer,
+        strict=False,
+        extra={"label": json_obj.get("label") if json_obj else None},
+    )
+    if json_obj and not tags:
+        packed["raw"] = json_obj
+    return packed
+
+
+_EDGE_CN = {"L": "左", "R": "右", "T": "上", "B": "下"}
+_DIR_CN = {"inward": "向内收", "outward": "向外扩", "keep": "保持"}
+_PROTOCOL_LINE_RE = re.compile(
+    r"^\s*(?:candidate_bbox_2d|candidate_bbox|bbox_2d|final_bbox|bbox|is_anomaly|left|right|top|bottom)\s*=.*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _tag_prose(chunk: str) -> str:
+    s = _PROTOCOL_LINE_RE.sub("", chunk or "").strip()
+    s = re.sub(r"\n{2,}", "\n", s).strip()
+    return s
+
+
+def _box_where(box) -> str:
+    if not isinstance(box, (list, tuple)) or len(box) != 4:
+        return ""
+    try:
+        x1, y1, x2, y2 = map(float, box)
+    except (TypeError, ValueError):
+        return ""
+    cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+    loc_x = "左侧" if cx < 350 else ("右侧" if cx > 650 else "水平居中")
+    loc_y = "上部" if cy < 350 else ("下部" if cy > 650 else "垂直居中")
+    return f"{loc_y}{loc_x}  [{x1:.0f},{y1:.0f},{x2:.0f},{y2:.0f}]"
+
+
+def format_parsed_explain(parsed: Dict[str, Any]) -> str:
+    """Show the model's visual defect description plus compact box/decision summary."""
+    tags = parsed.get("tags") or {}
+    compare = _tag_prose(tags.get("compare", ""))
+    ground = _tag_prose(tags.get("ground", ""))
+    verify = _tag_prose(tags.get("verify", ""))
+    pred = parsed.get("is_anomaly")
+    if pred is True:
+        cls_s = "异常"
+    elif pred is False:
+        cls_s = "正常"
+    else:
+        cls_s = "未判定"
+
+    cand = parsed.get("candidate_bbox_2d")
+    if cand is None:
+        cand = parsed.get("candidate_bbox")
+    final = parsed.get("bbox_2d")
+    bound = parsed.get("boundary") or {}
+    if bound:
+        bound_s = " ".join(f"{_EDGE_CN.get(k, k)}={_DIR_CN.get(v, v)}" for k, v in bound.items())
+    else:
+        bound_s = "无"
+
+    lines = ["=== 缺陷描述 ==="]
+    if compare:
+        lines.append(f"比较: {compare}")
+    else:
+        lines.append("比较: （<compare> 中没有对 Image 1/2 的具体描述）")
+    if ground:
+        lines.append(f"定位: {ground}")
+    else:
+        lines.append("定位: （<ground> 中没有缺陷区域描述）")
+    if verify:
+        lines.append(f"复核: {verify}")
+    else:
+        lines.append("复核: （<verify> 中没有复核说明）")
+    lines.append(f"判定: {cls_s}")
+    lines.append(
+        f"轨迹: tags={bool(parsed.get('has_tags'))} valid={bool(parsed.get('trajectory_valid'))} "
+        f"Bc={parsed.get('candidate_bbox_state')} D={parsed.get('boundary_state')} "
+        f"ans={parsed.get('answer_state')} Bf={parsed.get('final_bbox_state')}"
+    )
+    if cand:
+        lines.append(f"候选区域: {_box_where(cand)}")
+    else:
+        lines.append("候选区域: 无")
+    if final:
+        lines.append(f"最终区域: {_box_where(final)}")
+    else:
+        lines.append("最终区域: 无")
+    lines.append(f"边界调整: {bound_s}")
+    return "\n".join(lines)
+

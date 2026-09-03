@@ -18,7 +18,9 @@ def box_ious_from_parsed(parsed: dict, meta: dict):
     iou_c = 0.0
     if gt is not None:
         pred = parsed.get("bbox_2d")
-        cand = parsed.get("candidate_bbox")
+        cand = parsed.get("candidate_bbox_2d")
+        if cand is None:
+            cand = parsed.get("candidate_bbox")
         if valid_bbox_1000(pred):
             iou_f = box_iou(qwen1000_to_pixels_strict(pred, orig), gt)
         if valid_bbox_1000(cand):

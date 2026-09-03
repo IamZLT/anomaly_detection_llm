@@ -92,12 +92,13 @@ def build_user_prompt(cfg: dict, class_name: str) -> str:
             "Return exactly five XML blocks in order: <compare>, <ground>, <verify>, <boundary>, <answer>. "
             "Do not copy instruction text. Always output all five blocks. "
             "In <compare> write 1-2 sentences of concrete visual differences. "
-            "In <ground> write one sentence then candidate_bbox=[x1,y1,x2,y2] or candidate_bbox=null. "
+            "In <ground> write one sentence then candidate_bbox_2d=[x1,y1,x2,y2] or candidate_bbox_2d=null. "
             "In <verify> decide true defect vs normal variation. "
             "In <boundary>, if candidate exists write four lines left/right/top/bottom=inward|outward|keep; "
-            "if candidate_bbox=null write not_applicable. "
-            "In <answer> write is_anomaly=true and bbox=[x1,y1,x2,y2], or is_anomaly=false and bbox=null. "
-            "Coordinates are Qwen 0-1000 on Image 2."
+            "if candidate_bbox_2d=null write not_applicable. "
+            "In <answer> output JSON {\"is_anomaly\": true, \"bbox_2d\": [x1,y1,x2,y2]} "
+            "or {\"is_anomaly\": false, \"bbox_2d\": null}. "
+            "All bbox coordinates are integers in the 0-1000 system of Image 2."
         )
     return tmpl.replace("{class_name}", class_name)
 

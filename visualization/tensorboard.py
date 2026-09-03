@@ -11,7 +11,7 @@ from PIL import Image, ImageDraw, ImageFont
 from torch.utils.tensorboard import SummaryWriter
 
 from utils.common import qwen_norm1000_to_original_pixels
-from reasoning.parser import parse_cot_output
+from reasoning.parser import format_parsed_explain, parse_cot_output, rollout_protocol_stats
 
 
 def _font(size: int = 16):
@@ -151,10 +151,7 @@ def format_case_text(
         (response or "")[:4000],
         "",
         "=== parsed ===",
-        f"has_tags={parsed.get('has_tags')} is_anomaly={parsed.get('is_anomaly')} label={parsed.get('label')}",
-        f"candidate_bbox={parsed.get('candidate_bbox')}",
-        f"boundary={parsed.get('boundary')}",
-        f"bbox_2d={parsed.get('bbox_2d')}",
+        format_parsed_explain(parsed),
     ]
     return "\n".join(lines)
 
@@ -212,8 +209,11 @@ def log_heatmap_and_case(
     cand_px = None
     if parsed.get("bbox_2d") is not None:
         pred_px = qwen_norm1000_to_original_pixels(parsed["bbox_2d"], orig)
-    if parsed.get("candidate_bbox") is not None:
-        cand_px = qwen_norm1000_to_original_pixels(parsed["candidate_bbox"], orig)
+    cand_box = parsed.get("candidate_bbox_2d")
+    if cand_box is None:
+        cand_box = parsed.get("candidate_bbox")
+    if cand_box is not None:
+        cand_px = qwen_norm1000_to_original_pixels(cand_box, orig)
     gt = meta.get("gt_box_px")
 
     panel = None
@@ -303,20 +303,12 @@ def log_grpo_scalars(
     lp = seq_lp.detach().float().cpu()
     n = max(len(details), 1)
     mean = lambda k: float(sum(float(d.get(k, 0.0)) for d in details) / n)
-    parse_ok = 0
-    box_ok = 0
-    ans_ok = 0
-    cls_ok = 0
-    for t in texts:
-        p = parse_cot_output(t)
-        if p.get("has_tags"):
-            parse_ok += 1
-        if p.get("bbox_2d") is not None:
-            box_ok += 1
-        if "answer" in (p.get("tags") or {}):
-            ans_ok += 1
-        if p.get("is_anomaly") is not None:
-            cls_ok += 1
+    parsed_tb = [parse_cot_output(t) for t in texts]
+    parse_ok = sum(1 for p in parsed_tb if p.get("has_tags"))
+    box_ok = sum(1 for p in parsed_tb if p.get("bbox_2d") is not None)
+    ans_ok = sum(1 for p in parsed_tb if "answer" in (p.get("tags") or {}))
+    cls_ok = sum(1 for p in parsed_tb if p.get("is_anomaly") is not None)
+    proto_stats = rollout_protocol_stats(parsed_tb, texts)
 
     pmap = dict(params or {})
     for name, val in pmap.items():
@@ -346,6 +338,8 @@ def log_grpo_scalars(
     writer.add_scalar("grpo/valid_bbox_rate", box_ok / max(len(texts), 1), step)
     writer.add_scalar("grpo/answer_tag_rate", ans_ok / max(len(texts), 1), step)
     writer.add_scalar("grpo/cls_tag_rate", cls_ok / max(len(texts), 1), step)
+    for name, val in proto_stats.items():
+        writer.add_scalar(f"grpo/{name}", float(val), step)
     if is_anomaly is not None:
         writer.add_scalar("grpo/batch_is_anomaly", 1.0 if is_anomaly else 0.0, step)
     if grad_norm is not None:

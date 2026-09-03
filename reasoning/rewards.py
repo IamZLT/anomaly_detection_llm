@@ -107,7 +107,12 @@ def compute_rewards(
 
     pred_cls = parsed.get("is_anomaly")
     protocol_ok = bool(parsed.get("has_tags", False))
-    cand = parsed.get("candidate_bbox")
+    traj_ok = bool(parsed.get("trajectory_valid", False))
+    cand_state = parsed.get("candidate_bbox_state")
+    bound_state = parsed.get("boundary_state")
+    cand = parsed.get("candidate_bbox_2d")
+    if cand is None:
+        cand = parsed.get("candidate_bbox")
     final_box = parsed.get("bbox_2d")
     cand_px = _to_px(cand, orig_wh)
     final_px = _to_px(final_box, orig_wh)
@@ -138,15 +143,14 @@ def compute_rewards(
             "cand_box_px": cand_px,
             "pred_cls": pred_cls,
             "protocol_ok": bool(protocol_ok),
+            "trajectory_valid": bool(traj_ok),
             "d_star": d_star or {},
         }
 
     if not is_anomaly:
         if pred_cls is True:
             r_final = r_wrong
-        elif not protocol_ok:
-            r_final = r_invalid
-        elif pred_cls is False and final_box is None:
+        elif pred_cls is False and traj_ok:
             r_final = r_ok
         else:
             r_final = r_invalid
@@ -155,7 +159,9 @@ def compute_rewards(
     # Classification error beats protocol: explicit false on an anomaly is -1, not -0.5.
     if pred_cls is False:
         r_final_gate = r_wrong
-    elif not protocol_ok or pred_cls is None or final_px is None:
+    elif pred_cls is None:
+        r_final_gate = r_invalid
+    elif not traj_ok:
         r_final_gate = r_invalid
     else:
         r_final_gate = None
@@ -167,13 +173,14 @@ def compute_rewards(
             r_final=r_invalid if r_final_gate is None else r_final_gate,
         )
 
-    r_cov = box_coverage(cand_px, gt_box_px) if cand_px is not None else 0.0
-    r_iou_c = box_iou(cand_px, gt_box_px) if cand_px is not None else 0.0
-    r_ground = (w_cov * r_cov + w_cand_iou * r_iou_c) if cand_px is not None else 0.0
+    cand_ok = cand_state == "box" and cand_px is not None
+    r_cov = box_coverage(cand_px, gt_box_px) if cand_ok else 0.0
+    r_iou_c = box_iou(cand_px, gt_box_px) if cand_ok else 0.0
+    r_ground = (w_cov * r_cov + w_cand_iou * r_iou_c) if cand_ok else 0.0
 
     d_star: Dict[str, str] = {}
     r_dir = 0.0
-    if cand_px is not None:
+    if cand_ok:
         d_star = boundary_targets(
             pixels_to_qwen1000(cand_px, orig_wh),
             pixels_to_qwen1000(gt_box_px, orig_wh),
@@ -181,7 +188,7 @@ def compute_rewards(
         )
         pred_d = parsed.get("boundary") or {}
         r_dir = sum(1 for k in EDGE_KEYS if pred_d.get(k) == d_star.get(k)) / 4.0
-    r_reason = r_dir
+    r_reason = r_dir if cand_ok and bound_state == "complete" else 0.0
 
     r_iou = 0.0
     r_edge = 0.0

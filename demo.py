@@ -2,7 +2,6 @@
 """Single-image inference demo."""
 
 import argparse
-import json
 import os
 import sys
 import time
@@ -16,7 +15,7 @@ from PIL import Image
 
 from evaluation.infer import build_generation_inputs, decode_generation_output
 from models.qwen35 import setup_model_and_processor
-from reasoning.parser import parse_cot_output_tolerant
+from reasoning.parser import format_parsed_explain, parse_cot_output_tolerant
 from utils.common import (
     draw_bbox_on_image,
     infer_model_compute_device,
@@ -80,7 +79,7 @@ def main() -> None:
     print("\n模型回复:\n")
     print(response)
     parsed = parse_cot_output_tolerant(response)
-    print("\nparsed:", json.dumps({k: parsed.get(k) for k in ("is_anomaly", "candidate_bbox", "bbox_2d", "boundary")}, ensure_ascii=False))
+    print("\n" + format_parsed_explain(parsed))
     bbox = parsed.get("bbox_2d")
     if bbox and len(bbox) == 4:
         original_bbox = qwen_norm1000_to_original_pixels(list(map(float, bbox)), original_size)
