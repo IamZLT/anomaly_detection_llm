@@ -15,7 +15,9 @@ from reasoning.parser import (
     parse_cot_output_tolerant,
 )
 from reasoning.rewards import (
+    box_iou,
     compute_rewards,
+    dense_geometry_reward,
     edge_precision_reward,
     refinement_directions,
 )
@@ -279,14 +281,72 @@ def test_scale_aware_edge():
     assert r_gt_scale < r_old_scale
 
 
+def test_dense_geometry_exact_match_is_one():
+    gt = [100, 200, 300, 400]
+
+    r = dense_geometry_reward(gt, gt)
+
+    assert abs(r - 1.0) < 1e-6
+
+
+def test_dense_geometry_distinguishes_zero_iou_boxes():
+    gt = [100, 600, 250, 800]
+
+    near = [280, 580, 430, 780]
+    far = [700, 100, 850, 300]
+
+    assert box_iou(near, gt) == 0.0
+    assert box_iou(far, gt) == 0.0
+
+    r_near = dense_geometry_reward(near, gt)
+    r_far = dense_geometry_reward(far, gt)
+
+    assert r_near > r_far
+
+
+def test_dense_progress_rewards_better_refinement():
+    gt = [400, 400, 600, 600]
+
+    bc = [650, 400, 850, 600]
+    bf = [560, 400, 760, 600]
+
+    rc = dense_geometry_reward(bc, gt)
+    rf = dense_geometry_reward(bf, gt)
+
+    assert rf > rc
+
+
+def test_dense_reward_does_not_change_normal_gate():
+    cfg = {
+        "grpo": {
+            "reward": {
+                "normal_correct": 1.0,
+                "wrong_decision": -1.0,
+                "invalid_output": -1.0,
+            }
+        }
+    }
+
+    p = parse_cot_output(NORM_REJECT)
+
+    det = compute_rewards(p, None, (1000, 1000), False, cfg)
+
+    assert det["R_final"] == 1.0
+    assert det["R_ground"] == 0.0
+    assert det["R_reason"] == 0.0
+
+
 def test_refinement_direction_from_boxes():
     cfg = {"grpo": {"reward": {}}}
     orig = (1000, 1000)
     gt = [410, 190, 750, 760]
     det = compute_rewards(parse_cot_output(ANOM), gt, orig, True, cfg)
     assert det["R_dir"] == 1.0
-    assert det["R_reason"] == 1.0
+    # R_reason = w_dir*R_dir + w_progress*max(0, dense_f - dense_c): still dominated
+    # by the direction term, but no longer a pure discrete equality.
+    assert 0.0 < det["R_reason"] <= 1.0
     assert "delta_iou" in det
+    assert "delta_dense" in det
     assert "action_consistency" not in det
     dirs = refinement_directions([380, 220, 760, 810], [410, 190, 750, 760], 8.0)
     assert dirs == {"L": "inward", "R": "inward", "T": "outward", "B": "inward"}
@@ -472,6 +532,9 @@ def test_tb_grpo_scalars_are_allowlisted():
         "grpo/raw_iou_f",
         "grpo/raw_iou_c",
         "grpo/R_fmt",
+        "grpo/R_dense_c",
+        "grpo/R_dense_f",
+        "grpo/delta_dense",
         "grpo/protocol_rate",
         "grpo/trajectory_valid_rate",
         "grpo/candidate_valid_rate",

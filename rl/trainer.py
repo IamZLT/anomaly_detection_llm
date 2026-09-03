@@ -342,7 +342,22 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
             std_r = group_std([float(d.get("R_reason", 0.0)) for d in details])
             std_f = group_std([float(d.get("R_final", 0.0)) for d in details])
             std_fmt = group_std([float(d.get("R_fmt", 0.0)) for d in details])
-            if max(std_g, std_r, std_f, std_fmt) >= min_std:
+
+            spatial_std = max(std_g, std_r, std_f)
+            has_spatial_proposal = any(
+                (
+                    p.get("candidate_bbox_state") == "box"
+                    or p.get("final_bbox_state") == "box"
+                )
+                for p in parsed_list
+            )
+
+            if bool(meta.get("is_anomaly")) and has_spatial_proposal:
+                accept_group = spatial_std >= min_std
+            else:
+                accept_group = max(spatial_std, std_fmt) >= min_std
+
+            if accept_group:
                 resample_n = attempt
                 skipped = False
                 break

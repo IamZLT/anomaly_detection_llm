@@ -221,9 +221,17 @@ def format_grpo_group_text(
         adv = f" adv={float(advantages[i]):+.3f}" if advantages is not None else ""
         lp = f" logp={float(logprobs[i]):.3f}" if logprobs is not None else ""
         lines.append(
-            f"--- τ[{i}]  Rf={det.get('R_final', 0):.3f} Rg={det.get('R_ground', 0):.3f} "
-            f"Rr={det.get('R_reason', 0):.3f} cov={det.get('R_cov', 0):.3f} "
-            f"dir={det.get('R_dir', 0):.3f} iou_f={det.get('R_iou', 0):.3f} iou_c={det.get('R_iou_c', 0):.3f} "
+            f"--- τ[{i}]  "
+            f"Rf={det.get('R_final', 0):.3f} "
+            f"Rg={det.get('R_ground', 0):.3f} "
+            f"Rr={det.get('R_reason', 0):.3f} "
+            f"cov={det.get('R_cov', 0):.3f} "
+            f"dir={det.get('R_dir', 0):.3f} "
+            f"dense_c={det.get('R_dense_c', 0):.3f} "
+            f"dense_f={det.get('R_dense_f', 0):.3f} "
+            f"Δdense={det.get('delta_dense', 0):+.3f} "
+            f"iou_c={det.get('R_iou_c', 0):.3f} "
+            f"iou_f={det.get('R_iou', 0):.3f} "
             f"fmt={det.get('R_fmt', 0):.3f} "
             f"edge={det.get('R_edge', 0):.3f}{adv}{lp}"
         )
@@ -454,6 +462,9 @@ def log_grpo_scalars(
     writer.add_scalar("grpo/raw_iou_f", mean("raw_iou_f"), step)
     writer.add_scalar("grpo/raw_iou_c", mean("raw_iou_c"), step)
     writer.add_scalar("grpo/R_fmt", mean("R_fmt"), step)
+    writer.add_scalar("grpo/R_dense_c", mean("R_dense_c"), step)
+    writer.add_scalar("grpo/R_dense_f", mean("R_dense_f"), step)
+    writer.add_scalar("grpo/delta_dense", mean("delta_dense"), step)
 
     writer.add_scalar("grpo/protocol_rate", float(proto.get("protocol_rate", 0.0)), step)
     writer.add_scalar("grpo/trajectory_valid_rate", float(proto.get("trajectory_valid_rate", 0.0)), step)

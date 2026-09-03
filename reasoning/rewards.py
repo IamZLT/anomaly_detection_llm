@@ -31,6 +31,81 @@ def box_coverage(pred: List[float], gt: List[float]) -> float:
     return float(inter / area_gt) if area_gt > 0 else 0.0
 
 
+def box_area(box: List[float]) -> float:
+    x1, y1, x2, y2 = map(float, box)
+    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+
+def box_center(box: List[float]) -> Tuple[float, float]:
+    x1, y1, x2, y2 = map(float, box)
+    return 0.5 * (x1 + x2), 0.5 * (y1 + y2)
+
+
+def box_diag(box: List[float]) -> float:
+    x1, y1, x2, y2 = map(float, box)
+    w = max(0.0, x2 - x1)
+    h = max(0.0, y2 - y1)
+    return math.sqrt(w * w + h * h)
+
+
+def dense_geometry_reward(
+    pred: List[float],
+    gt: List[float],
+    *,
+    w_dist: float = 0.6,
+    w_area: float = 0.4,
+    eps: float = 1e-6,
+) -> float:
+    """Dense localization reward.
+
+    Key property: even when IoU == 0, a box closer to GT receives a larger
+    reward than a far-away box, removing the sparse-reward dead zone.
+    """
+    if pred is None or gt is None:
+        return 0.0
+
+    iou = box_iou(pred, gt)
+
+    cx_p, cy_p = box_center(pred)
+    cx_g, cy_g = box_center(gt)
+
+    dist = math.sqrt(
+        (cx_p - cx_g) ** 2
+        + (cy_p - cy_g) ** 2
+    )
+
+    diag_norm = max(
+        box_diag(pred),
+        box_diag(gt),
+        1.0,
+    )
+
+    s_center = 1.0 - min(
+        1.0,
+        dist / (diag_norm + eps),
+    )
+
+    area_p = box_area(pred)
+    area_g = box_area(gt)
+
+    if area_g <= eps:
+        s_area = 0.0
+    else:
+        rel_err = abs(area_p - area_g) / (area_g + eps)
+        s_area = 1.0 - min(1.0, rel_err)
+
+    norm = max(float(w_dist + w_area), eps)
+    wd = float(w_dist) / norm
+    wa = float(w_area) / norm
+
+    s_geo = wd * s_center + wa * s_area
+    s_geo = max(0.0, min(1.0, s_geo))
+
+    reward = iou + (1.0 - iou) * s_geo
+
+    return float(max(0.0, min(1.0, reward)))
+
+
 def valid_bbox_1000(box) -> bool:
     if box is None or not isinstance(box, (list, tuple)) or len(box) != 4:
         return False
@@ -173,10 +248,17 @@ def compute_rewards(
     cfg: dict,
 ) -> Dict[str, float]:
     rew_cfg = (cfg.get("grpo") or {}).get("reward") or {}
-    w_cov = float(rew_cfg.get("w_cov", 0.6))
-    w_cand_iou = float(rew_cfg.get("w_cand_iou", 0.4))
-    w_iou = float(rew_cfg.get("w_iou", 0.6))
-    w_edge = float(rew_cfg.get("w_edge", 0.4))
+    w_cov = float(rew_cfg.get("w_cov", 0.40))
+    w_dense_c = float(rew_cfg.get("w_dense_c", 0.60))
+
+    dense_w_dist = float(rew_cfg.get("dense_w_dist", 0.60))
+    dense_w_area = float(rew_cfg.get("dense_w_area", 0.40))
+
+    w_dir = float(rew_cfg.get("w_dir", 0.70))
+    w_progress = float(rew_cfg.get("w_progress", 0.30))
+
+    w_dense_f = float(rew_cfg.get("w_dense_f", 0.80))
+    w_edge = float(rew_cfg.get("w_edge", 0.20))
     beta = float(rew_cfg.get("edge_beta", 8.0))
     keep_tol = float(rew_cfg.get("keep_tol_norm1000", 8.0))
     r_ok = float(rew_cfg.get("normal_correct", 1.0))
@@ -216,6 +298,9 @@ def compute_rewards(
         delta_iou: float = 0.0,
         raw_iou_f: float = 0.0,
         raw_iou_c: float = 0.0,
+        r_dense_c: float = 0.0,
+        r_dense_f: float = 0.0,
+        delta_dense: float = 0.0,
         r_fmt: float = 0.0,
         d_star: Optional[dict] = None,
     ) -> Dict[str, Any]:
@@ -232,6 +317,9 @@ def compute_rewards(
             "delta_iou": float(delta_iou),
             "raw_iou_f": float(raw_iou_f),
             "raw_iou_c": float(raw_iou_c),
+            "R_dense_c": float(r_dense_c),
+            "R_dense_f": float(r_dense_f),
+            "delta_dense": float(delta_dense),
             "R_fmt": float(r_fmt),
             "pred_box_px": final_px,
             "cand_box_px": cand_px,
@@ -277,7 +365,17 @@ def compute_rewards(
     cand_ok = cand_state == "box" and cand_px is not None
     r_cov = box_coverage(cand_px, gt_box_px) if cand_ok else 0.0
     r_iou_c = box_iou(cand_px, gt_box_px) if cand_ok else 0.0
-    r_ground = (w_cov * r_cov + w_cand_iou * r_iou_c) if cand_ok else 0.0
+    r_dense_c = (
+        dense_geometry_reward(
+            cand_px,
+            gt_box_px,
+            w_dist=dense_w_dist,
+            w_area=dense_w_area,
+        )
+        if cand_ok
+        else 0.0
+    )
+    r_ground = (w_cov * r_cov + w_dense_c * r_dense_c) if cand_ok else 0.0
 
     d_star: Dict[str, str] = {}
     r_dir = 0.0
@@ -287,7 +385,23 @@ def compute_rewards(
         d_star = refinement_directions(cand, gt_1000, keep_tol)
         d_pred = refinement_directions(cand, final_box, keep_tol)
         r_dir = sum(1 for k in EDGE_KEYS if d_pred.get(k) == d_star.get(k)) / 4.0
-    r_reason = r_dir
+
+    r_dense_f = (
+        dense_geometry_reward(
+            final_px,
+            gt_box_px,
+            w_dist=dense_w_dist,
+            w_area=dense_w_area,
+        )
+        if final_px is not None
+        else 0.0
+    )
+
+    dense_progress = 0.0
+    if cand_ok and final_px is not None:
+        dense_progress = max(0.0, r_dense_f - r_dense_c)
+
+    r_reason = w_dir * r_dir + w_progress * dense_progress
 
     r_iou = 0.0
     r_edge = 0.0
@@ -299,9 +413,10 @@ def compute_rewards(
     else:
         r_iou = iou_f_diag
         r_edge = edge_precision_reward(final_px, gt_box_px, orig_wh, beta, min_frac=edge_min_frac)
-        r_final = w_iou * r_iou + w_edge * r_edge
+        r_final = w_dense_f * r_dense_f + w_edge * r_edge
 
     delta_iou = float(iou_f_diag - r_iou_c)
+    delta_dense = float(r_dense_f - r_dense_c)
 
     return _pack(
         r_ground=r_ground,
@@ -315,6 +430,9 @@ def compute_rewards(
         delta_iou=delta_iou,
         raw_iou_f=float(iou_f_diag),
         raw_iou_c=float(r_iou_c),
+        r_dense_c=float(r_dense_c),
+        r_dense_f=float(r_dense_f),
+        delta_dense=float(delta_dense),
         r_fmt=r_fmt,
         d_star=d_star,
     )

@@ -226,12 +226,18 @@ grpo:
   small_area_thresh: 0.02
   format_advantage_weight: 0.20
   reward:
-    # candidate grounding
-    w_cov: 0.60
-    w_cand_iou: 0.40
-    # final bbox (classification is a gate, not a separate reward)
-    w_iou: 0.60
-    w_edge: 0.40
+    # Candidate localization: preserve GT coverage while removing zero-IoU dead zone.
+    w_cov: 0.40
+    w_dense_c: 0.60
+    # Dense geometry (DCLR-style center + area).
+    dense_w_dist: 0.60
+    dense_w_area: 0.40
+    # Verification/refinement.
+    w_dir: 0.70
+    w_progress: 0.30
+    # Final localization.
+    w_dense_f: 0.80
+    w_edge: 0.20
     edge_beta: 8.0
     edge_min_frac: 0.05          # 边距按 GT 尺寸归一化，floor=0.05 * 图像宽/高
     keep_tol_norm1000: 8.0
