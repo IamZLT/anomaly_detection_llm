@@ -15,7 +15,7 @@ def _seg_role(tag: str) -> str:
     t = tag.lower()
     if t in ("compare", "ground"):
         return "ground"
-    if t in ("verify", "boundary"):
+    if t == "verify":
         return "reason"
     return "answer"
 

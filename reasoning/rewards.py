@@ -1,11 +1,11 @@
-"""Three-level verifiable rewards: candidate grounding, boundary reasoning, final gate."""
+"""Three-level verifiable rewards: candidate grounding, refinement direction, final gate."""
 
 from __future__ import annotations
 
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
-from reasoning.parser import EDGE_KEYS
+EDGE_KEYS = ("L", "R", "T", "B")
 
 
 def box_iou(a: List[float], b: List[float]) -> float:
@@ -58,14 +58,16 @@ def pixels_to_qwen1000(box: List[float], orig_wh: Tuple[int, int]) -> List[int]:
     ]
 
 
-def boundary_targets(candidate: List[float], gt: List[float], keep_tol: float) -> Dict[str, str]:
-    cx1, cy1, cx2, cy2 = candidate
-    gx1, gy1, gx2, gy2 = gt
-    l = "keep" if abs(cx1 - gx1) <= keep_tol else ("inward" if cx1 < gx1 else "outward")
-    r = "keep" if abs(cx2 - gx2) <= keep_tol else ("inward" if cx2 > gx2 else "outward")
-    t = "keep" if abs(cy1 - gy1) <= keep_tol else ("inward" if cy1 < gy1 else "outward")
-    b = "keep" if abs(cy2 - gy2) <= keep_tol else ("inward" if cy2 > gy2 else "outward")
-    return {"L": l, "R": r, "T": t, "B": b}
+def refinement_directions(source_box, target_box, keep_tol: float) -> Dict[str, str]:
+    """φ(B_source, B_target): how each edge of the source box moved to the target."""
+    sx1, sy1, sx2, sy2 = map(float, source_box)
+    tx1, ty1, tx2, ty2 = map(float, target_box)
+    return {
+        "L": "keep" if abs(tx1 - sx1) <= keep_tol else ("inward" if tx1 > sx1 else "outward"),
+        "R": "keep" if abs(tx2 - sx2) <= keep_tol else ("inward" if tx2 < sx2 else "outward"),
+        "T": "keep" if abs(ty1 - sy1) <= keep_tol else ("inward" if ty1 > sy1 else "outward"),
+        "B": "keep" if abs(ty2 - sy2) <= keep_tol else ("inward" if ty2 < sy2 else "outward"),
+    }
 
 
 def edge_precision_reward(
@@ -87,36 +89,6 @@ def edge_precision_reward(
         abs(py2 - gy2) / gh,
     ]
     return float(sum(math.exp(-beta * d) for d in dists) / 4.0)
-
-
-def boundary_action_consistency(cand_1000, final_1000, pred_d: dict, keep_tol: float) -> float:
-    if cand_1000 is None or final_1000 is None or not pred_d:
-        return 0.0
-    cx1, cy1, cx2, cy2 = map(float, cand_1000)
-    fx1, fy1, fx2, fy2 = map(float, final_1000)
-    tol = float(keep_tol)
-    signed = {
-        "L": fx1 - cx1,
-        "R": cx2 - fx2,
-        "T": fy1 - cy1,
-        "B": cy2 - fy2,
-    }
-    ok = 0
-    n = 0
-    for edge in EDGE_KEYS:
-        d = pred_d.get(edge)
-        if d not in ("inward", "outward", "keep"):
-            continue
-        n += 1
-        delta = signed[edge]
-        if d == "keep":
-            hit = abs(delta) <= tol
-        elif d == "inward":
-            hit = delta > tol
-        else:
-            hit = delta < -tol
-        ok += int(hit)
-    return float(ok / n) if n else 0.0
 
 
 def _to_px(box, orig_wh: Tuple[int, int]) -> Optional[List[float]]:
@@ -148,7 +120,6 @@ def compute_rewards(
     protocol_ok = bool(parsed.get("has_tags", False))
     traj_ok = bool(parsed.get("trajectory_valid", False))
     cand_state = parsed.get("candidate_bbox_state")
-    bound_state = parsed.get("boundary_state")
     cand = parsed.get("candidate_bbox_2d")
     if cand is None:
         cand = parsed.get("candidate_bbox")
@@ -167,7 +138,6 @@ def compute_rewards(
         r_iou: float = 0.0,
         r_edge: float = 0.0,
         delta_iou: float = 0.0,
-        action_consistency: float = 0.0,
         d_star: Optional[dict] = None,
     ) -> Dict[str, Any]:
         return {
@@ -181,7 +151,6 @@ def compute_rewards(
             "R_iou": float(r_iou),
             "R_edge": float(r_edge),
             "delta_iou": float(delta_iou),
-            "action_consistency": float(action_consistency),
             "pred_box_px": final_px,
             "cand_box_px": cand_px,
             "pred_cls": pred_cls,
@@ -223,15 +192,13 @@ def compute_rewards(
 
     d_star: Dict[str, str] = {}
     r_dir = 0.0
-    if cand_ok:
-        d_star = boundary_targets(
-            pixels_to_qwen1000(cand_px, orig_wh),
-            pixels_to_qwen1000(gt_box_px, orig_wh),
-            keep_tol,
-        )
-        pred_d = parsed.get("boundary") or {}
-        r_dir = sum(1 for k in EDGE_KEYS if pred_d.get(k) == d_star.get(k)) / 4.0
-    r_reason = r_dir if cand_ok and bound_state == "complete" else 0.0
+    if cand_ok and final_px is not None:
+        # Bc/Bf are already in the 0-1000 system; only GT needs the pixel→1000 map.
+        gt_1000 = pixels_to_qwen1000(gt_box_px, orig_wh)
+        d_star = refinement_directions(cand, gt_1000, keep_tol)
+        d_pred = refinement_directions(cand, final_box, keep_tol)
+        r_dir = sum(1 for k in EDGE_KEYS if d_pred.get(k) == d_star.get(k)) / 4.0
+    r_reason = r_dir
 
     r_iou = 0.0
     r_edge = 0.0
@@ -246,14 +213,6 @@ def compute_rewards(
         r_final = w_iou * r_iou + w_edge * r_edge
 
     delta_iou = float(iou_f_diag - r_iou_c)
-    action_cons = 0.0
-    if cand_ok and final_px is not None:
-        action_cons = boundary_action_consistency(
-            pixels_to_qwen1000(cand_px, orig_wh),
-            pixels_to_qwen1000(final_px, orig_wh),
-            parsed.get("boundary") or {},
-            keep_tol,
-        )
 
     return _pack(
         r_ground=r_ground,
@@ -265,6 +224,5 @@ def compute_rewards(
         r_iou=r_iou,
         r_edge=r_edge,
         delta_iou=delta_iou,
-        action_consistency=action_cons,
         d_star=d_star,
     )

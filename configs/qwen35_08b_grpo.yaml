@@ -1,49 +1,45 @@
-# Qwen3.5-2B：冻结视觉塔多层差异先验 H + LoRA Process-Aware Spatial GRPO（无 SFT）
-# 启动：python train.py --config configs/qwen35_2b_grpo.yaml
-# 指定物理卡 2 和 7：
-#   CUDA_VISIBLE_DEVICES=2,7 python train.py --config configs/qwen35_2b_grpo.yaml --num-gpu 2
-# --num-gpu 必须等于可见 GPU 数量（不是物理编号）。
+# Qwen3.5-0.8B 通路测试：同一套 prior + LoRA GRPO，视觉塔只有 12 层。
+# 单卡：CUDA_VISIBLE_DEVICES=4 python train.py --config configs/qwen35_08b_grpo.yaml --num-gpu 1
+# 正式实验请改回 configs/qwen35_2b_grpo.yaml。
 
 paths:
   dataset_root: /data2/zlt/anomaly_detection_llm/datasets
-  # 实际 run 目录：outputs/train/qwen35_2b_prior/{run_name}_{timestamp}/
-  output_dir: ./outputs/train/qwen35_2b_prior
+  output_dir: ./outputs/train/qwen35_08b_prior
 
 runtime:
   mode: train
-  run_name: qwen35_2b_visa2mvtec
+  run_name: qwen35_08b_visa2mvtec
   auto_create_output_dir: true
 
 tensorboard:
   auto_start: true
   host: 0.0.0.0
   port: 5002
-  # 默认盯本次 run 的 tb/：loss 曲线和热力图 / CoT 在同一个实验里
-  vis_every_n_steps: 50     # 训练 batch 可视化；不要用 MVTec test 当每步盯盘
+  vis_every_n_steps: 2
   vis_num_samples: 2
   log_heatmap: true
   log_case: true
   log_grpo_cot: true
-  log_mvtec_probe: false    # 训练中默认不反复看同一张 MVTec 图
+  log_mvtec_probe: false
 
 model:
   random_init_llm: false
-  arch: Qwen3.5-2B
-  name: /data2/zlt/anomaly_detection_llm/model_card/Qwen3.5-2B
+  arch: Qwen3.5-0.8B
+  name: /data2/zlt/anomaly_detection_llm/model_card/Qwen3.5-0.8B
   local_files_only: true
   freeze_vit: true
   torch_dtype: bfloat16
 
-# 冻结 Vision Encoder：1-based 层号 12/16/20/24 → blocks 11/15/19/23
-# 对齐 DualBrain：pre-merger token + merge-unpack + 逐层 L2/NN + 距离图 softmax 融合
+# 0.8B ViT depth=12，不能再用 2B 的 12/16/20/24。
+# 按 DualBrain 相对深度 50/67/83/100% → 1-based 层 6/8/10/12（blocks 5/7/9/11）。
 prior:
   layer_index_base: 1
-  layer_indices: [12, 16, 20, 24]
-  softmax_temperature: 0.5      # DualBrain fusion_temperature（作用在层间距离图上）
-  neighborhood_radius: 0        # 0 = 对整张正常参考图做全局 patch NN（DualBrain gallery）
-  hint_topk: 5                  # H → K soft spatial anchors in 0-1000
-  hint_nms_radius: 2            # local-max NMS window in patch cells
-  render: colormap              # TensorBoard only; H is not a third RGB image
+  layer_indices: [6, 8, 10, 12]
+  softmax_temperature: 0.5
+  neighborhood_radius: 0
+  hint_topk: 5
+  hint_nms_radius: 2
+  render: colormap
   overlay_alpha: 0.45
 
 lora:
@@ -67,32 +63,26 @@ lora:
     - out_proj
 
 data:
-  # VisA 全量训练（异常+正常全部）→ MVTec test 测试
   train_layout: visa
   train_root: /data2/zlt/anomaly_detection_llm/datasets/VisA
   eval_layout: mvtec
   eval_root: /data2/zlt/anomaly_detection_llm/datasets/mvtec_anomaly_detection
-  visa_max_normal_per_class: null   # null = 每类全部 Normal
-  source_dirname: VisA           # 参考图回退路径用
+  visa_max_normal_per_class: null
+  source_dirname: VisA
   train_anomaly_only: false
-  # 训练时每张图从同类 normal 的 top-k（按宽高比/面积）中随机抽 I_r；eval/test 固定第一张
   random_train_ref: true
   ref_topk: 5
-  # 训练采样：每类 正常:异常。1.0 = 1:1（保留全部异常，下采样正常）；null = 不限制
   normal_anomaly_ratio: 1.0
-  # VisA 类内 holdout 作为 visadev；MVTec test 只在训练结束评一次
   holdout_ratio: 0.1
   max_samples: null
-  max_eval_samples: null            # 完整 MVTec test（约 1725）
-  # Qwen3.5 对齐单位是 patch*merge=32，不是 Qwen2.5-VL 的 28。
-  # 448 是显存安全预算；更高分辨率消融把 max_image_size 改成 768。
+  max_eval_samples: null
   max_image_size: 448
-  factor: null                      # null = 从模型读取 32
+  factor: null
   min_pixels: null
   max_pixels: null
 
 prompt:
-  enable_thinking: false     # CoT 写在 XML 标签里，关闭内置 <think>
+  enable_thinking: false
   user: |
     Image 1 is a defect-free normal reference of a {class_name}.
     Image 2 is the inspection sample.
@@ -146,26 +136,25 @@ training:
   gradient_checkpointing_kwargs:
     use_reentrant: false
   seed: 42
-  eval_every_n_steps: 50
-  eval_num_samples: 32           # 过程中只评 VisA-dev
-  final_eval_num_samples: null   # GRPO 结束后在完整 MVTec test 上评
+  eval_every_n_steps: 20
+  eval_num_samples: 16
+  final_eval_num_samples: 32
 
 grpo:
   group_size: 8
   policy_epochs: 3
-  # 每卡每 step 1 张图。max_steps=null 时按 ceil(N_train * epochs / world_size)
   epochs: 2
   max_steps: null
   learning_rate: 5.0e-6
   gradient_accumulation_steps: 1
   max_new_tokens: 384
-  # 逻辑 group 仍是 8。3090 单卡 24GB 只用了 ~5GB 时用 4/4/2 换速度；OOM 再降回 2/2/1
+  # 0.8B 显存很宽，8 路一次 generate / logprob；actor 4 路带梯度
   rollout_micro_batch_size: 4
   logprob_micro_batch_size: 4
   actor_micro_batch_size: 2
   temperature: 0.9
   top_p: 0.95
-  logging_steps: 1          # 终端打印；TB 的 grpo/* 每步都写（与 param 同一 step）
+  logging_steps: 1
   save_steps: 50
   max_grad_norm: 1.0
   adv_eps: 1.0e-6
@@ -174,30 +163,27 @@ grpo:
   kl_beta: 1.0e-4
   min_reward_std: 0.02
   max_resample_attempts: 2
-  hard_resample_attempts: 4      # tiny GT 额外 resample，避免 skip 掉难例
+  hard_resample_attempts: 4
   small_area_thresh: 0.02
   reward:
-    # candidate grounding
     w_cov: 0.60
     w_cand_iou: 0.40
-    # final bbox (classification is a gate, not a separate reward)
     w_iou: 0.60
     w_edge: 0.40
     edge_beta: 8.0
-    edge_min_frac: 0.05          # 边距按 GT 尺寸归一化，floor=0.05 * 图像宽/高
+    edge_min_frac: 0.05
     keep_tol_norm1000: 8.0
     normal_correct: 1.0
     wrong_decision: -1.0
     invalid_output: -1.0
 
 distributed:
-  num_gpu: 2
+  num_gpu: 1
   deepspeed: null
   local_rank: -1
   ddp_find_unused_parameters: false
 
 inference:
-  # 仅 runtime.mode=inference 时使用；训练中的 generate 会读 max_new_tokens / temperature / top_p / do_sample
   model_path: null
   image_path: null
   prompt: null

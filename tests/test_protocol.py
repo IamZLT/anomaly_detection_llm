@@ -10,11 +10,11 @@ from models.qwen35 import apply_processor_geometry
 from models.vision_cache import expand_cached_image_feats, format_prior_hint, topk_spatial_points
 from reasoning.parser import parse_answer_block, parse_cot_output, parse_bbox_field
 from reasoning.rewards import (
-    boundary_action_consistency,
     compute_rewards,
     edge_precision_reward,
+    refinement_directions,
 )
-from rl.grpo import clipped_pg_kl, expand_gen_in_for_group, model_inputs, padded_completion_tensors
+from rl.grpo import clipped_pg_kl, expand_gen_in_for_group, micro_batch_ranges, model_inputs, padded_completion_tensors
 from utils.common import qwen_smart_hw
 from visualization.tensorboard import log_grpo_scalars
 
@@ -29,12 +29,6 @@ candidate_bbox_2d=[380,220,760,810]
 <verify>
 The irregular structure cannot be explained by illumination or normal appearance and is consistent with a physical defect.
 </verify>
-<boundary>
-left=inward
-right=keep
-top=outward
-bottom=inward
-</boundary>
 <answer>
 {"is_anomaly": true, "bbox_2d": [410,190,750,760], "description": "An irregular structural break is present on the bottle body and is absent from the normal reference."}
 </answer>
@@ -51,9 +45,6 @@ candidate_bbox_2d=null
 <verify>
 The observed variations are consistent with normal appearance.
 </verify>
-<boundary>
-not_applicable
-</boundary>
 <answer>
 {"is_anomaly": false, "bbox_2d": null, "description": "The inspection image is consistent with the normal reference, with no clear defect observed."}
 </answer>
@@ -91,7 +82,7 @@ def test_trajectory_and_prose_gate():
     assert not bad["trajectory_valid"]
     copied = ANOM.replace(
         "The inspection image contains an irregular structural break on the bottle body that is absent from the normal reference.",
-        "Return exactly five XML blocks.",
+        "Return exactly four XML blocks.",
     )
     assert not parse_cot_output(copied)["trajectory_valid"]
 
@@ -99,14 +90,16 @@ def test_trajectory_and_prose_gate():
 def test_answer_description_is_required():
     p = parse_cot_output(ANOM)
     assert p["description_ok"]
+    assert p["description_state"] == "ok"
     assert "bottle body" in p["description"]
     missing = ANOM.replace(
         ', "description": "An irregular structural break is present on the bottle body and is absent from the normal reference."',
         "",
     )
     bad = parse_cot_output(missing)
-    assert bad["is_anomaly"] is True
-    assert bad["bbox_2d"] == [410.0, 190.0, 750.0, 760.0]
+    assert bad["answer_state"] == "invalid"
+    assert bad["is_anomaly"] is None
+    assert bad["bbox_2d"] is None
     assert not bad["description_ok"]
     assert not bad["trajectory_valid"]
     copied = ANOM.replace(
@@ -119,6 +112,39 @@ def test_answer_description_is_required():
         "A defect.",
     )
     assert not parse_cot_output(short)["trajectory_valid"]
+
+
+def test_answer_json_rejects_nonstr_description_and_extra_keys():
+    obj_desc = ANOM.replace(
+        '"description": "An irregular structural break is present on the bottle body and is absent from the normal reference."',
+        '"description": {"foo": "this is not actually a sentence but it is sufficiently long"}',
+    )
+    p = parse_cot_output(obj_desc)
+    assert p["answer_state"] == "invalid"
+    assert p["is_anomaly"] is None
+    assert p["bbox_2d"] is None
+    assert p["description"] is None
+    assert not p["description_ok"]
+    assert not p["trajectory_valid"]
+
+    extra = ANOM.replace(
+        '"description": "An irregular structural break is present on the bottle body and is absent from the normal reference."}',
+        '"description": "An irregular structural break is present on the bottle body and is absent from the normal reference.", "defect_type": "scratch", "confidence": 0.98}',
+    )
+    p = parse_cot_output(extra)
+    assert p["answer_state"] == "invalid"
+    assert p["is_anomaly"] is None
+    assert p["bbox_2d"] is None
+    assert p["description"] is None
+    assert not p["description_ok"]
+    assert not p["trajectory_valid"]
+
+    parsed = parse_answer_block(
+        '{"is_anomaly": true, "bbox_2d": [10,20,30,40], "description": ["long enough list disguised as text"]}'
+    )
+    assert parsed["answer_state"] == "invalid"
+    assert parsed["is_anomaly"] is None
+    assert parsed["description"] is None
 
 
 def test_ground_bbox_only_fails_trajectory():
@@ -157,19 +183,28 @@ def test_scale_aware_edge():
     assert r_gt_scale < r_old_scale
 
 
-def test_action_consistency_and_delta_iou():
+def test_refinement_direction_from_boxes():
     cfg = {"grpo": {"reward": {}}}
     orig = (1000, 1000)
     gt = [410, 190, 750, 760]
     det = compute_rewards(parse_cot_output(ANOM), gt, orig, True, cfg)
-    assert "delta_iou" in det and "action_consistency" in det
-    cons = boundary_action_consistency(
-        [380, 220, 760, 810],
-        [410, 190, 750, 760],
-        {"L": "inward", "R": "keep", "T": "outward", "B": "inward"},
-        keep_tol=8.0,
+    assert det["R_dir"] == 1.0
+    assert det["R_reason"] == 1.0
+    assert "delta_iou" in det
+    assert "action_consistency" not in det
+    dirs = refinement_directions([380, 220, 760, 810], [410, 190, 750, 760], 8.0)
+    assert dirs == {"L": "inward", "R": "inward", "T": "outward", "B": "inward"}
+
+
+def test_leftover_edge_numbers_do_not_invalidate_trajectory():
+    leftover = ANOM.replace(
+        "The irregular structure cannot be explained by illumination or normal appearance and is consistent with a physical defect.",
+        "The candidate is re-checked against Image 1 and refined to the damaged region.\nleft=662\nright=662\ntop=190\nbottom=760",
     )
-    assert cons >= 0.5
+    p = parse_cot_output(leftover)
+    assert p["trajectory_valid"]
+    assert p["candidate_bbox_2d"] == [380.0, 220.0, 760.0, 810.0]
+    assert p["bbox_2d"] == [410.0, 190.0, 750.0, 760.0]
 
 
 def test_size_bins_and_gated_miou():
@@ -262,6 +297,9 @@ def test_prompt_is_two_images_plus_spatial_hint():
     assert "Image 1" in text and "Image 2" in text
     assert "Image 3" not in text
     assert "spatial hint" in text.lower()
+    assert "four XML" in text
+    assert "<boundary>" not in text
+    assert "five XML" not in text
 
 
 def test_model_inputs_drops_image_embeds():
@@ -300,7 +338,7 @@ def test_tb_grpo_scalars_are_allowlisted():
         "R_iou": 0.4,
         "R_iou_c": 0.5,
         "delta_iou": 0.05,
-        "action_consistency": 0.8,
+        "R_dir": 0.8,
     }
     log_grpo_scalars(
         w,
@@ -334,16 +372,45 @@ def test_tb_grpo_scalars_are_allowlisted():
         "grpo/R_iou_c",
         "grpo/R_iou",
         "grpo/delta_iou",
-        "grpo/action_consistency",
+        "grpo/R_dir",
         "grpo/protocol_rate",
         "grpo/trajectory_valid_rate",
         "grpo/candidate_valid_rate",
         "grpo/final_valid_rate",
+        "grpo/box_pair_valid_rate",
         "grpo/unique_response_rate",
         "grpo/resample_n",
         "grpo/skip_rate",
     }
     assert set(w.tags) == want
+
+
+def test_micro_batch_pg_matches_full_group():
+    assert micro_batch_ranges(8, 2) == [(0, 2), (2, 4), (4, 6), (6, 8)]
+    assert micro_batch_ranges(8, 1) == [(i, i + 1) for i in range(8)]
+    new = torch.randn(8, 5)
+    old = torch.randn(8, 5)
+    ref = torch.randn(8, 5)
+    mask = torch.ones(8, 5)
+    adv = torch.randn(8, 5)
+    loss_full, pg_full, kl_full, rho_full, clip_full = clipped_pg_kl(new, mask, old, ref, adv, 0.2, 0.28, 0.1)
+    for micro in (1, 2):
+        loss_acc = pg_acc = kl_acc = rho_acc = clip_acc = 0.0
+        for s, e in micro_batch_ranges(8, micro):
+            loss, pg, kl, rho, clip = clipped_pg_kl(
+                new[s:e], mask[s:e], old[s:e], ref[s:e], adv[s:e], 0.2, 0.28, 0.1
+            )
+            w = (e - s) / 8.0
+            loss_acc += float(loss) * w
+            pg_acc += float(pg) * w
+            kl_acc += float(kl) * w
+            rho_acc += float(rho) * w
+            clip_acc += float(clip) * w
+        assert abs(loss_acc - float(loss_full)) < 1e-5
+        assert abs(pg_acc - float(pg_full)) < 1e-5
+        assert abs(kl_acc - float(kl_full)) < 1e-5
+        assert abs(rho_acc - float(rho_full)) < 1e-5
+        assert abs(clip_acc - float(clip_full)) < 1e-5
 
 
 def test_expand_cached_image_feats_repeats_group():

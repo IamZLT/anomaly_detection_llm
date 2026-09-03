@@ -41,6 +41,7 @@ from rl.grpo import (
     grpo_advantages,
     grpo_param_map,
     group_std,
+    micro_batch_ranges,
     model_inputs,
     move_batch,
     padded_completion_tensors,
@@ -90,8 +91,16 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
     max_resample = int(gcfg.get("max_resample_attempts", 2))
     hard_resample = int(gcfg.get("hard_resample_attempts", 4))
     small_area = float(gcfg.get("small_area_thresh", 0.02))
-    rollout_micro = gcfg.get("rollout_micro_batch_size")
-    rollout_micro = int(rollout_micro) if rollout_micro not in (None, "", "null", "None") else group
+
+    def _micro(key: str, default: int) -> int:
+        v = gcfg.get(key)
+        if v in (None, "", "null", "None"):
+            v = default
+        return max(1, min(int(v), int(group)))
+
+    rollout_micro = _micro("rollout_micro_batch_size", 2)
+    logprob_micro = _micro("logprob_micro_batch_size", 2)
+    actor_micro = _micro("actor_micro_batch_size", 1)
     log_mvtec_probe = bool((cfg.get("tensorboard") or {}).get("log_mvtec_probe", False))
     eval_every = int(cfg.get("training", {}).get("eval_every_n_steps", 50))
     save_every = int(gcfg.get("save_steps", 100))
@@ -144,6 +153,7 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
             f"[grpo] spatial GRPO group={group} K={policy_epochs} lr={lr} T={temperature} "
             f"clip=({clip_low},{clip_high}) kl_beta={kl_beta} min_std={min_std} "
             f"N_train={len(train_set)} world={world} epochs={gcfg.get('epochs', 2)} max_steps={max_steps} "
+            f"rollout_micro={rollout_micro} logprob_micro={logprob_micro} actor_micro={actor_micro} "
             f"log_every={log_every} vis_every={vis_every} eval_every={eval_every}",
             main_only=True,
         )
@@ -158,6 +168,19 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                 sampler.set_epoch(epoch)
             it = iter(loader)
             return next(it)
+
+    stop_criteria = None
+    try:
+        from transformers.generation.stopping_criteria import StopStringCriteria, StoppingCriteriaList
+
+        stop_criteria = StoppingCriteriaList(
+            [StopStringCriteria(tokenizer=tok, stop_strings=["</answer>"])]
+        )
+        if is_main_process():
+            train_log("[grpo] cached stop criteria for </answer>", main_only=True)
+    except Exception as exc:
+        if is_main_process():
+            train_log(f"[grpo] stop criteria unavailable ({type(exc).__name__}), generate without it", main_only=True)
 
     def _generate_group(gen_in, prompt_len: int, image_embeds=None):
         m = unwrap_model(model)
@@ -174,7 +197,13 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                 temperature=temperature,
                 top_p=top_p,
                 num_return_sequences=n,
+                use_cache=True,
             )
+            if stop_criteria is not None:
+                try:
+                    return m.generate(**gen_in, **kw, stopping_criteria=stop_criteria)
+                except TypeError:
+                    pass
             try:
                 return m.generate(**gen_in, **kw, stop_strings=["</answer>"], tokenizer=tok)
             except TypeError:
@@ -190,7 +219,10 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                         if n <= 1:
                             raise
                         torch.cuda.empty_cache()
-                        micro = 4 if n > 4 else max(n // 2, 1)
+                        nxt = 2 if n > 2 else 1
+                        if is_main_process():
+                            train_log(f"[grpo] generate OOM at micro={n}, retry micro={nxt}", main_only=True)
+                        micro = nxt
                         continue
                     if out_ids.dim() == 1:
                         out_ids = out_ids.unsqueeze(0)
@@ -242,6 +274,7 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
         seqs, texts, details, parsed_list = [], [], [], []
         resample_n = 0
         skipped = False
+        t_roll = time.time()
         for attempt in range(attempts + 1):
             seqs, texts = _generate_group(gen_in, prompt_len, vision_cache)
             details, parsed_list = _score_group(texts, meta)
@@ -256,6 +289,7 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
             skipped = True
         if skipped:
             resample_n = attempts
+        t_roll = time.time() - t_roll
 
         r_ground = torch.tensor([float(d.get("R_ground", 0.0)) for d in details], device=device, dtype=torch.float32)
         r_reason = torch.tensor([float(d.get("R_reason", 0.0)) for d in details], device=device, dtype=torch.float32)
@@ -272,6 +306,7 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
 
         outputs, attn, labels = padded_completion_tensors(seqs, prompt_len, int(pad_id), device)
         max_t = int(outputs.shape[1])
+        t_upd = time.time()
 
         if all_skipped:
             t_lp = max(max_t - 1, 1)
@@ -282,11 +317,20 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
             adv_tok = torch.zeros_like(old_lp)
             seq_lp = torch.zeros(group, device=device)
         else:
-            group_gen_in = expand_gen_in_for_group(gen_in, group)
-            with bind_cached_image_features(model, vision_cache, repeat_factor=group):
-                old_lp, lp_mask = token_logprobs_nograd(model, group_gen_in, outputs, attn, labels)
-                with disable_adapter_ctx(model):
-                    ref_lp, _ = token_logprobs_nograd(model, group_gen_in, outputs, attn, labels)
+            old_parts, mask_parts, ref_parts = [], [], []
+            for s, e in micro_batch_ranges(group, logprob_micro):
+                n = e - s
+                chunk_in = expand_gen_in_for_group(gen_in, n)
+                with bind_cached_image_features(model, vision_cache, repeat_factor=n):
+                    lp, mk = token_logprobs_nograd(model, chunk_in, outputs[s:e], attn[s:e], labels[s:e])
+                    with disable_adapter_ctx(model):
+                        rlp, _ = token_logprobs_nograd(model, chunk_in, outputs[s:e], attn[s:e], labels[s:e])
+                old_parts.append(lp)
+                mask_parts.append(mk)
+                ref_parts.append(rlp)
+            old_lp = torch.cat(old_parts, dim=0)
+            lp_mask = torch.cat(mask_parts, dim=0)
+            ref_lp = torch.cat(ref_parts, dim=0)
             ref_gap = float(((old_lp - ref_lp).abs() * lp_mask).sum() / lp_mask.sum().clamp(min=1))
             adv_tok = build_segment_advantages(
                 tok,
@@ -324,52 +368,71 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
         model.train()
         force_vision_eval(model)
         n_pe = max(policy_epochs, 1)
-        opt.zero_grad(set_to_none=True)
+        max_gnorm = float(gcfg.get("max_grad_norm", 1.0))
         if not all_skipped:
-            group_gen_in = expand_gen_in_for_group(gen_in, group)
-            with dropout_eval(model), bind_cached_image_features(model, vision_cache, repeat_factor=group):
+            actor_slices = micro_batch_ranges(group, actor_micro)
+            n_chunk = max(len(actor_slices), 1)
+            with dropout_eval(model):
                 for pe in range(n_pe):
-                    ctx = (
-                        model.no_sync()
-                        if (use_ddp and ((pe + 1) % max(accum, 1) != 0) and pe < n_pe - 1 and hasattr(model, "no_sync"))
-                        else nullcontext()
-                    )
-                    with ctx:
-                        out = forward_with_vision(model, group_gen_in, outputs, attn)
-                        if skipped:
-                            loss = out.logits.float().sum() * 0.0
-                            L_pg = L_kl = loss
-                            rho_mean = torch.zeros((), device=device)
-                            clip_frac = torch.zeros((), device=device)
-                        else:
-                            new_lp, mask = token_logprobs(out.logits, labels)
-                            loss, L_pg, L_kl, rho_mean, clip_frac = clipped_pg_kl(
-                                new_lp,
-                                mask,
-                                old_lp,
-                                ref_lp,
-                                adv_tok,
-                                clip_low,
-                                clip_high,
-                                kl_beta,
-                            )
-                        (loss / float(max(accum, 1))).backward()
+                    if pe % max(accum, 1) == 0:
+                        opt.zero_grad(set_to_none=True)
+                    pg_acc = 0.0
+                    kl_acc = 0.0
+                    rho_acc = 0.0
+                    clip_acc = 0.0
+                    for j, (s, e) in enumerate(actor_slices):
+                        n = e - s
+                        last_chunk = j == n_chunk - 1
+                        do_step = ((pe + 1) % max(accum, 1) == 0) or (pe == n_pe - 1)
+                        sync = bool(do_step and last_chunk)
+                        ctx = (
+                            model.no_sync()
+                            if (use_ddp and not sync and hasattr(model, "no_sync"))
+                            else nullcontext()
+                        )
+                        chunk_in = expand_gen_in_for_group(gen_in, n)
+                        with ctx, bind_cached_image_features(model, vision_cache, repeat_factor=n):
+                            out = forward_with_vision(model, chunk_in, outputs[s:e], attn[s:e])
+                            if skipped:
+                                loss = out.logits.float().sum() * 0.0
+                                L_pg = L_kl = loss
+                                rho_mean = torch.zeros((), device=device)
+                                clip_frac = torch.zeros((), device=device)
+                            else:
+                                new_lp, mask = token_logprobs(out.logits, labels[s:e])
+                                loss, L_pg, L_kl, rho_mean, clip_frac = clipped_pg_kl(
+                                    new_lp,
+                                    mask,
+                                    old_lp[s:e],
+                                    ref_lp[s:e],
+                                    adv_tok[s:e],
+                                    clip_low,
+                                    clip_high,
+                                    kl_beta,
+                                )
+                            w = n / float(group)
+                            (loss * w / float(max(accum, 1))).backward()
+                        pg_acc += float(L_pg.detach()) * w
+                        kl_acc += float(L_kl.detach()) * w
+                        rho_acc += float(rho_mean) * w
+                        clip_acc += float(clip_frac) * w
+                        del out
                     if ((pe + 1) % max(accum, 1) == 0) or (pe == n_pe - 1):
                         grads = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
                         if grads:
-                            last_gnorm = float(torch.nn.utils.clip_grad_norm_(grads, float(gcfg.get("max_grad_norm", 1.0))))
+                            last_gnorm = float(torch.nn.utils.clip_grad_norm_(grads, max_gnorm))
                         opt.step()
-                        opt.zero_grad(set_to_none=True)
                         opt_step += 1
                         did_opt = True
-                    loss_v += float(L_pg.detach() + float(kl_beta) * L_kl.detach())
-                    pg_v += float(L_pg.detach())
-                    kl_v += float(L_kl.detach())
-                    rho_v = float(rho_mean)
-                    clip_v = float(clip_frac)
+                    loss_v += pg_acc + float(kl_beta) * kl_acc
+                    pg_v += pg_acc
+                    kl_v += kl_acc
+                    rho_v = rho_acc
+                    clip_v = clip_acc
             loss_v /= float(n_pe)
             pg_v /= float(n_pe)
             kl_v /= float(n_pe)
+        t_upd = time.time() - t_upd
 
         loss_v = avg_across_ranks(loss_v, device)
         pg_v = avg_across_ranks(pg_v, device)
@@ -436,9 +499,10 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                     f"cand={proto_avg.get('candidate_valid_rate', 0.0):.2f} "
                     f"uniq={proto_avg.get('unique_response_rate', 0.0):.2f} "
                     f"dIoU={sum(d.get('delta_iou', 0.0) for d in details)/n:.3f} "
-                    f"act={sum(d.get('action_consistency', 0.0) for d in details)/n:.2f} "
+                    f"dir={sum(d.get('R_dir', 0.0) for d in details)/n:.2f} "
                     f"sz={size_bin} a={a_gt:.4f} "
-                    f"trunc={truncation_rate:.2f} fmt={parse_rate:.2f} rs={resample_n}{skip_s}"
+                    f"trunc={truncation_rate:.2f} fmt={parse_rate:.2f} rs={resample_n}{skip_s} "
+                    f"gen={t_roll:.1f}s upd={t_upd:.1f}s"
                     + (f" gnorm={last_gnorm:.2f}" if did_opt and last_gnorm is not None else ""),
                     main_only=True,
                 )

@@ -55,6 +55,13 @@ def expand_gen_in_for_group(gen_in: dict, group: int) -> dict:
     return out
 
 
+def micro_batch_ranges(n: int, micro: int) -> List[Tuple[int, int]]:
+    """Split a GRPO group into contiguous [start, end) chunks."""
+    n = max(int(n), 0)
+    micro = max(int(micro), 1)
+    return [(s, min(s + micro, n)) for s in range(0, n, micro)]
+
+
 def forward_with_vision(model, gen_in: dict, input_ids: torch.Tensor, attention_mask: torch.Tensor):
     """Keep processor vision tensors; pad mm_token_type_ids to generated length."""
     n = int(input_ids.shape[0])
