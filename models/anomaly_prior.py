@@ -19,17 +19,11 @@ from PIL import Image
 from torch import nn
 
 
-def _unwrap_qwen_core(qwen: nn.Module) -> nn.Module:
-    if hasattr(qwen, "get_base_model"):
-        try:
-            return qwen.get_base_model()
-        except Exception:
-            pass
-    return qwen
+from models.qwen35 import unwrap_qwen_core
 
 
 def get_qwen_visual(qwen: nn.Module) -> nn.Module:
-    core = _unwrap_qwen_core(qwen)
+    core = unwrap_qwen_core(qwen)
     visual = getattr(getattr(core, "model", None), "visual", None)
     if visual is None:
         visual = getattr(core, "visual", None)

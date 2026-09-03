@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Flask Web 应用 - Qwen-VL 推理界面。
-与 CLI 一致：models.avNet.setup_model_and_processor + utils.infer.build_generation_inputs。
+与 CLI 一致：models.qwen35.setup_model_and_processor + evaluation.infer.build_generation_inputs。
 """
 
 import argparse
@@ -18,8 +18,8 @@ if _PROJECT_ROOT not in sys.path:
 import torch
 from PIL import Image
 from flask import Flask, render_template, request, jsonify, send_file
-from models.avNet import setup_model_and_processor
-from utils.infer import build_generation_inputs, decode_generation_output
+from models.qwen35 import setup_model_and_processor
+from evaluation.infer import build_generation_inputs, decode_generation_output
 from utils.common import (
     draw_bbox_on_image,
     infer_model_compute_device,
@@ -62,7 +62,7 @@ def get_web_cfg():
         return _web_cfg
     cfg_path = os.environ.get(
         "QWEN_WEB_CONFIG",
-        os.path.join(_PROJECT_ROOT, "configs", "ad_llm_qwen35_9b_zeroshot.yaml"),
+        os.path.join(_PROJECT_ROOT, "configs", "qwen35_9b_zeroshot.yaml"),
     )
     cfg = load_yaml_config(cfg_path)
     mp = os.environ.get("QWEN_WEB_MODEL_PATH")
@@ -80,7 +80,7 @@ def get_web_cfg():
         )
     if not cfg.get("inference", {}).get("model_path"):
         raise ValueError(
-            "未设置 inference.model_path。请在 configs/ad_llm_qwen35_9b_zeroshot.yaml 中配置，或使用 "
+            "未设置 inference.model_path。请在 configs/qwen35_9b_zeroshot.yaml 中配置，或使用 "
             "python run_app.py --model-path /path/to/final_model"
         )
     _web_cfg = cfg
@@ -257,7 +257,7 @@ if __name__ == "__main__":
     print(f"应用目录: {APP_DIR}")
     try:
         _c = get_web_cfg()
-        print(f"配置文件: {os.environ.get('QWEN_WEB_CONFIG', os.path.join(_PROJECT_ROOT, 'configs', 'ad_llm_qwen35_9b_zeroshot.yaml'))}")
+        print(f"配置文件: {os.environ.get('QWEN_WEB_CONFIG', os.path.join(_PROJECT_ROOT, 'configs', 'qwen35_9b_zeroshot.yaml'))}")
         print(f"模型路径: {_c['inference']['model_path']}")
     except ValueError as e:
         print(f"配置错误: {e}")

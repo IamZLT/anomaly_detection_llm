@@ -3,8 +3,8 @@
 启动 Flask Web 应用。
 
 用法:
-  python run_app.py --model-path /path/to/logs/.../sft_final
-  python run_app.py --config configs/ad_llm_qwen35_9b_zeroshot.yaml
+  python run_app.py --model-path /path/to/outputs/train/.../grpo_final
+  python run_app.py --config configs/qwen35_9b_zeroshot.yaml
 """
 
 import argparse
@@ -19,7 +19,7 @@ sys.path.insert(0, app_dir)
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Qwen-VL Web 推理")
-    default_cfg = os.path.join(project_root, "configs", "ad_llm_qwen35_9b_zeroshot.yaml")
+    default_cfg = os.path.join(project_root, "configs", "qwen35_9b_zeroshot.yaml")
     parser.add_argument("--config", type=str, default=default_cfg, help="YAML 配置")
     parser.add_argument(
         "--model-path",

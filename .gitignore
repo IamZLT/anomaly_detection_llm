@@ -36,12 +36,10 @@ dist/
 *.egg-info/
 pip-wheel-metadata/
 
-# Training artifacts
+# Training / eval artifacts (all under outputs/)
+outputs/
 logs/
 logs_*/
-logs_qwen35_2b_prior/
-logs_step2/
-outputs/
 runs/
 checkpoints/
 **/events.out.tfevents.*
@@ -67,9 +65,8 @@ data_processed/
 *.tgz
 *.7z
 
-# Local backups, papers, experiment dumps (do not upload)
+# Local backups, papers, leftover dumps (do not upload)
 backup_code_*/
-backup_code_20260903/
 papers/
 results/
 exp_llm.bash

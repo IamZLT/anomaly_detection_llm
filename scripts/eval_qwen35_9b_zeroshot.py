@@ -18,10 +18,10 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from models.avNet import setup_model_and_processor
+from models.qwen35 import setup_model_and_processor
 from utils.common import parse_grounding_output, qwen_norm1000_to_original_pixels, smart_resize
 from utils.config import load_yaml_config
-from utils.infer import build_generation_inputs, decode_generation_output
+from evaluation.infer import build_generation_inputs, decode_generation_output
 
 
 ROOT = "/data2/zlt/anomaly_detection_llm/datasets/mvtec_anomaly_detection"
@@ -197,7 +197,7 @@ def main() -> None:
     parser.add_argument("--with-ref", action="store_true", help="给一张同类别正常参考图做对比")
     args = parser.parse_args()
 
-    cfg_path = os.path.join(PROJECT_ROOT, "configs", "ad_llm_qwen35_9b_zeroshot.yaml")
+    cfg_path = os.path.join(PROJECT_ROOT, "configs", "qwen35_9b_zeroshot.yaml")
     cfg = load_yaml_config(cfg_path)
     cfg.setdefault("lora", {})["enabled"] = False
 
@@ -213,7 +213,7 @@ def main() -> None:
     print(f"[eval] torch threads={nthreads}", flush=True)
 
     out_name = "qwen35_9b_with_ref" if args.with_ref else "qwen35_9b_zeroshot"
-    out_dir = os.path.join(PROJECT_ROOT, "outputs", out_name)
+    out_dir = os.path.join(PROJECT_ROOT, "outputs", "eval", out_name)
     os.makedirs(out_dir, exist_ok=True)
 
     model_path = cfg["inference"]["model_path"]

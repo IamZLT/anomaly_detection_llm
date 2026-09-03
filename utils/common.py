@@ -29,6 +29,24 @@ def set_seed(seed: int) -> None:
     random.seed(seed)
 
 
+def is_main_process() -> bool:
+    r = os.environ.get("RANK")
+    if r is not None:
+        return int(r) == 0
+    lr = os.environ.get("LOCAL_RANK")
+    if lr is not None:
+        return int(lr) == 0
+    return True
+
+
+def train_log(msg: str, main_only: bool = False) -> None:
+    if main_only and not is_main_process():
+        return
+    rank = os.environ.get("RANK", "?")
+    lr = os.environ.get("LOCAL_RANK", "?")
+    print(f"[train rank={rank} local={lr}] {msg}", flush=True)
+
+
 def smart_resize(
     image: Image.Image, max_size: int = 1024, factor: int = 28
 ) -> Tuple[Image.Image, Tuple[int, int], Tuple[float, float]]:
