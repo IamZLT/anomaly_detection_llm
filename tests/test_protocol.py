@@ -335,6 +335,50 @@ def test_dense_progress_rewards_better_refinement():
     assert rf > rc
 
 
+def test_full_image_box_cannot_hack_dense_reward():
+    orig = (1000, 1000)
+
+    gt = [450, 450, 550, 550]
+
+    full = [0, 0, 1000, 1000]
+    near = [400, 400, 500, 500]
+
+    r_full = dense_geometry_reward(full, gt, orig)
+    r_near = dense_geometry_reward(near, gt, orig)
+
+    assert r_full < 0.05
+    assert r_near > r_full
+
+
+def test_full_image_candidate_does_not_get_high_ground_reward():
+    cfg = {"grpo": {"reward": {}}}
+    orig = (1000, 1000)
+    gt = [450, 450, 550, 550]
+
+    text = """
+<compare>
+A localized difference is visible between Image 1 and Image 2.
+</compare>
+<ground>
+The whole image is proposed as a suspicious region.
+candidate_bbox_2d=[0,0,1000,1000]
+</ground>
+<verify>
+The candidate is checked against the reference and refined to the defect.
+</verify>
+<answer>
+{"is_anomaly": true, "bbox_2d": [0,0,1000,1000], "description": "A suspicious region is present in the inspection image relative to the reference."}
+</answer>
+"""
+
+    det = compute_rewards(parse_cot_output(text), gt, orig, True, cfg)
+
+    assert det["R_ground"] < 0.05
+    assert det["R_dense_c"] < 0.05
+    assert det["candidate_area_ratio"] > 0.8
+    assert det["full_image_cand"] == 1.0
+
+
 def test_dense_reward_does_not_change_normal_gate():
     cfg = {
         "grpo": {
@@ -361,7 +405,7 @@ def test_refinement_direction_from_boxes():
     gt = [410, 190, 750, 760]
     det = compute_rewards(parse_cot_output(ANOM), gt, orig, True, cfg)
     assert det["R_dir"] == 1.0
-    # R_reason = w_dir*R_dir + w_progress*(dense_f - dense_c): still dominated by
+    # R_reason = reason_dir_weight*R_dir + (1-w)*delta_dense: still dominated by
     # the direction term, but no longer a pure discrete equality.
     assert 0.0 < det["R_reason"] <= 1.0
     assert "delta_iou" in det
@@ -569,6 +613,10 @@ def test_tb_grpo_scalars_are_allowlisted():
         "grpo/R_dense_c",
         "grpo/R_dense_f",
         "grpo/delta_dense",
+        "grpo/candidate_area_ratio",
+        "grpo/final_area_ratio",
+        "grpo/pred_gt_area_ratio",
+        "grpo/full_image_box_rate",
         "grpo/protocol_rate",
         "grpo/trajectory_valid_rate",
         "grpo/candidate_valid_rate",

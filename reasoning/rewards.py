@@ -46,8 +46,6 @@ def dense_geometry_reward(
     gt: List[float],
     orig_wh: Tuple[int, int],
     *,
-    w_dist: float = 0.6,
-    w_area: float = 0.4,
     eps: float = 1e-6,
 ) -> float:
     """Dense localization reward.
@@ -55,9 +53,10 @@ def dense_geometry_reward(
     Key property: even when IoU == 0, a box closer to GT receives a larger
     reward than a far-away box, removing the sparse-reward dead zone.
 
-    Center distance is normalized by the image diagonal (not the box diagonal)
-    so the gradient stays continuous across the whole image and never plateaus
-    to a constant for far-away boxes.
+    Center distance is normalized by the image diagonal so the gradient stays
+    continuous across the whole image. Scale uses a symmetric min/max ratio,
+    and geometry is multiplicative (S_center * S_scale) so a huge box cannot
+    earn a large reward merely because its center is near the GT center.
     """
     if pred is None or gt is None:
         return 0.0
@@ -84,17 +83,13 @@ def dense_geometry_reward(
     area_p = box_area(pred)
     area_g = box_area(gt)
 
-    if area_g <= eps:
-        s_area = 0.0
+    if area_p <= eps or area_g <= eps:
+        s_scale = 0.0
     else:
-        rel_err = abs(area_p - area_g) / (area_g + eps)
-        s_area = 1.0 - min(1.0, rel_err)
+        s_scale = min(area_p, area_g) / max(area_p, area_g)
 
-    norm = max(float(w_dist + w_area), eps)
-    wd = float(w_dist) / norm
-    wa = float(w_area) / norm
-
-    s_geo = wd * s_center + wa * s_area
+    # Both location and scale must be plausible.
+    s_geo = s_center * s_scale
     s_geo = max(0.0, min(1.0, s_geo))
 
     reward = iou + (1.0 - iou) * s_geo
@@ -244,23 +239,18 @@ def compute_rewards(
     cfg: dict,
 ) -> Dict[str, float]:
     rew_cfg = (cfg.get("grpo") or {}).get("reward") or {}
-    w_cov = float(rew_cfg.get("w_cov", 0.40))
-    w_dense_c = float(rew_cfg.get("w_dense_c", 0.60))
-
-    dense_w_dist = float(rew_cfg.get("dense_w_dist", 0.60))
-    dense_w_area = float(rew_cfg.get("dense_w_area", 0.40))
-
-    w_dir = float(rew_cfg.get("w_dir", 0.70))
-    w_progress = float(rew_cfg.get("w_progress", 0.30))
-
-    w_dense_f = float(rew_cfg.get("w_dense_f", 0.80))
-    w_edge = float(rew_cfg.get("w_edge", 0.20))
+    # Paired convex weights: only one free parameter per pair.
+    w_dir = float(rew_cfg.get("reason_dir_weight", rew_cfg.get("w_dir", 0.70)))
+    w_progress = 1.0 - w_dir
+    w_dense_f = float(rew_cfg.get("final_dense_weight", rew_cfg.get("w_dense_f", 0.80)))
+    w_edge = 1.0 - w_dense_f
     beta = float(rew_cfg.get("edge_beta", 8.0))
     keep_tol = float(rew_cfg.get("keep_tol_norm1000", 8.0))
     r_ok = float(rew_cfg.get("normal_correct", 1.0))
     r_wrong = float(rew_cfg.get("wrong_decision", -1.0))
     r_invalid = float(rew_cfg.get("invalid_output", -1.0))
     edge_min_frac = float(rew_cfg.get("edge_min_frac", 0.05))
+    large_box_area_thresh = float(rew_cfg.get("large_box_area_thresh", 0.80))
     fmt_weights = rew_cfg.get("format_weights") or {
         "compare": 0.2,
         "ground": 0.3,
@@ -280,6 +270,23 @@ def compute_rewards(
     final_px = _to_px(final_box, orig_wh)
 
     r_fmt = format_reward(parsed, fmt_weights)
+
+    img_area = float(max(orig_wh[0], 1) * max(orig_wh[1], 1))
+
+    def _area_ratio(box_px: Optional[List[float]]) -> float:
+        if box_px is None:
+            return 0.0
+        return float(box_area(box_px) / img_area)
+
+    cand_area_ratio = _area_ratio(cand_px)
+    final_area_ratio = _area_ratio(final_px)
+    gt_area = box_area(gt_box_px) if gt_box_px is not None else 0.0
+    if final_px is not None and gt_area > 1e-6:
+        pred_gt_area_ratio = float(box_area(final_px) / gt_area)
+    else:
+        pred_gt_area_ratio = 0.0
+    full_image_cand = float(cand_area_ratio > large_box_area_thresh)
+    full_image_final = float(final_area_ratio > large_box_area_thresh)
 
     def _pack(
         *,
@@ -317,6 +324,11 @@ def compute_rewards(
             "R_dense_f": float(r_dense_f),
             "delta_dense": float(delta_dense),
             "R_fmt": float(r_fmt),
+            "candidate_area_ratio": float(cand_area_ratio),
+            "final_area_ratio": float(final_area_ratio),
+            "pred_gt_area_ratio": float(pred_gt_area_ratio),
+            "full_image_cand": float(full_image_cand),
+            "full_image_final": float(full_image_final),
             "pred_box_px": final_px,
             "cand_box_px": cand_px,
             "pred_cls": pred_cls,
@@ -359,20 +371,15 @@ def compute_rewards(
         )
 
     cand_ok = cand_state == "box" and cand_px is not None
+    # Coverage is diagnostic only; it must not enter R_ground (oversized-box shortcut).
     r_cov = box_coverage(cand_px, gt_box_px) if cand_ok else 0.0
     r_iou_c = box_iou(cand_px, gt_box_px) if cand_ok else 0.0
     r_dense_c = (
-        dense_geometry_reward(
-            cand_px,
-            gt_box_px,
-            orig_wh,
-            w_dist=dense_w_dist,
-            w_area=dense_w_area,
-        )
+        dense_geometry_reward(cand_px, gt_box_px, orig_wh)
         if cand_ok
         else 0.0
     )
-    r_ground = (w_cov * r_cov + w_dense_c * r_dense_c) if cand_ok else 0.0
+    r_ground = float(r_dense_c) if cand_ok else 0.0
 
     d_star: Dict[str, str] = {}
     r_dir = 0.0
@@ -384,13 +391,7 @@ def compute_rewards(
         r_dir = sum(1 for k in EDGE_KEYS if d_pred.get(k) == d_star.get(k)) / 4.0
 
     r_dense_f = (
-        dense_geometry_reward(
-            final_px,
-            gt_box_px,
-            orig_wh,
-            w_dist=dense_w_dist,
-            w_area=dense_w_area,
-        )
+        dense_geometry_reward(final_px, gt_box_px, orig_wh)
         if final_px is not None
         else 0.0
     )

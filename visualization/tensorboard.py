@@ -232,6 +232,8 @@ def format_grpo_group_text(
             f"Δdense={det.get('delta_dense', 0):+.3f} "
             f"iou_c={det.get('R_iou_c', 0):.3f} "
             f"iou_f={det.get('R_iou', 0):.3f} "
+            f"Ac={det.get('candidate_area_ratio', 0):.3f} "
+            f"Af={det.get('final_area_ratio', 0):.3f} "
             f"fmt={det.get('R_fmt', 0):.3f} "
             f"edge={det.get('R_edge', 0):.3f}{adv}{lp}"
         )
@@ -465,6 +467,19 @@ def log_grpo_scalars(
     writer.add_scalar("grpo/R_dense_c", mean("R_dense_c"), step)
     writer.add_scalar("grpo/R_dense_f", mean("R_dense_f"), step)
     writer.add_scalar("grpo/delta_dense", mean("delta_dense"), step)
+    writer.add_scalar("grpo/candidate_area_ratio", mean("candidate_area_ratio"), step)
+    writer.add_scalar("grpo/final_area_ratio", mean("final_area_ratio"), step)
+    writer.add_scalar("grpo/pred_gt_area_ratio", mean("pred_gt_area_ratio"), step)
+    full_image_box_rate = float(
+        sum(
+            1
+            for d in details
+            if float(d.get("full_image_cand", 0.0)) > 0.5
+            or float(d.get("full_image_final", 0.0)) > 0.5
+        )
+        / n
+    )
+    writer.add_scalar("grpo/full_image_box_rate", full_image_box_rate, step)
 
     writer.add_scalar("grpo/protocol_rate", float(proto.get("protocol_rate", 0.0)), step)
     writer.add_scalar("grpo/trajectory_valid_rate", float(proto.get("trajectory_valid_rate", 0.0)), step)

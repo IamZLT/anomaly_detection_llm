@@ -15,7 +15,7 @@ tensorboard:
   auto_start: true
   host: 0.0.0.0
   port: 5002
-  vis_every_n_steps: 2
+  vis_every_n_steps: 10
   vis_num_samples: 2
   log_heatmap: true
   log_case: true
@@ -164,21 +164,15 @@ grpo:
   small_area_thresh: 0.02
   format_advantage_weight: 0.20
   reward:
-    # Candidate localization: preserve GT coverage while removing zero-IoU dead zone.
-    w_cov: 0.20
-    w_dense_c: 0.80
-    # Dense geometry (DCLR-style center + area).
-    dense_w_dist: 0.60
-    dense_w_area: 0.40
-    # Verification/refinement.
-    w_dir: 0.70
-    w_progress: 0.30
-    # Final localization.
-    w_dense_f: 0.80
-    w_edge: 0.20
+    # R_reason = reason_dir_weight * R_dir + (1-w) * delta_dense
+    reason_dir_weight: 0.70
+    # R_final = final_dense_weight * dense(B_f) + (1-w) * edge
+    # R_ground = dense(B_c) only (no coverage term; kills oversized-box shortcut).
+    final_dense_weight: 0.80
     edge_beta: 8.0
     edge_min_frac: 0.05
     keep_tol_norm1000: 8.0
+    large_box_area_thresh: 0.80
     normal_correct: 1.0
     wrong_decision: -1.0
     invalid_output: -1.0
