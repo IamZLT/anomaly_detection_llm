@@ -14,6 +14,9 @@ _ANSWER_AR, _ANSWER_AF = 0.3, 0.7
 
 def _seg_role(tag: str) -> str:
     t = tag.lower()
+    # <understand> is unsupervised native reading: format credit only.
+    if t == "understand":
+        return "understand"
     if t in ("compare", "ground"):
         return "ground"
     if t == "verify":
@@ -22,7 +25,7 @@ def _seg_role(tag: str) -> str:
 
 
 def completion_segment_ids(tokenizer, completion_ids: Sequence[int]) -> List[str]:
-    """Map each completion token to ground / reason / answer."""
+    """Map each completion token to understand / ground / reason / answer."""
     ids = completion_ids.tolist() if hasattr(completion_ids, "tolist") else list(completion_ids)
     if not ids:
         return []
@@ -58,6 +61,10 @@ def mix_segment_advantage(
     is_anomaly: bool,
     fmt_mix: float = 0.20,
 ) -> float:
+    # Unsupervised native understanding: only format advantage.
+    if seg == "understand":
+        return float(a_fmt)
+
     if not is_anomaly:
         base = a_final
     elif seg == "ground":

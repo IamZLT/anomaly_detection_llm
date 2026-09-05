@@ -39,6 +39,8 @@ prior:
   neighborhood_radius: 0
   hint_topk: 5
   hint_nms_radius: 2
+  prior_box_thresh: 0.5
+  prior_box_min_area: 0.0
   render: colormap
   overlay_alpha: 0.45
 
@@ -95,32 +97,43 @@ prompt:
 
     Determine whether Image 2 contains a true anomaly.
 
-    Output format:
+    Write an image-specific scene reading inside <understand>.
+    Write an image-specific comparison inside <compare>.
+    Write candidate_bbox_2d first, then image-specific evidence inside <ground>.
+    Write reference-based verification inside <verify>.
+    Write the final JSON decision inside <answer>.
+
+    Required structure:
+
+    <understand>
+    ...
+    </understand>
 
     <compare>
-    1-2 sentences comparing concrete visual differences.
+    ...
     </compare>
 
     <ground>
-    One sentence describing the suspicious region.
     candidate_bbox_2d=[x1,y1,x2,y2]
+    ...
     </ground>
 
     <verify>
-    One sentence verifying the candidate against Image 1 and deciding
-    whether to refine it or reject it.
+    ...
     </verify>
 
     <answer>
-    {"is_anomaly": true/false, "bbox_2d": [x1,y1,x2,y2] or null, "description": "..."}
+    ...
     </answer>
 
-    Do not copy the instructional phrases above.
-    Write observations specific to the two images.
-
     Rules:
+    - Do not copy these instructions into the blocks.
     - Coordinates are integers in [0,1000] for Image 2.
     - candidate_bbox_2d is a proposal, not a confirmed defect; use null if nothing looks suspicious.
+    - Anomaly answer must be exactly:
+      {"is_anomaly": true, "bbox_2d": [x1,y1,x2,y2], "description": "..."}
+    - Normal answer must be exactly:
+      {"is_anomaly": false, "bbox_2d": null, "description": "..."}
     - For an anomaly, candidate_bbox_2d and bbox_2d are valid boxes.
     - For a normal image, bbox_2d=null (a candidate may be rejected during <verify>).
     - Never skip a block.
@@ -157,7 +170,7 @@ grpo:
   adv_eps: 1.0e-6
   clip_low: 0.20
   clip_high: 0.28
-  kl_beta: 1.0e-4
+  kl_beta: 2.0e-4
   min_reward_std: 0.02
   max_resample_attempts: 2
   hard_resample_attempts: 4
@@ -166,9 +179,19 @@ grpo:
   reward:
     # R_reason = reason_dir_weight * R_dir + (1-w) * delta_dense
     reason_dir_weight: 0.70
-    # R_final = final_dense_weight * dense(B_f) + (1-w) * edge
-    # R_ground = dense(B_c) only (no coverage term; kills oversized-box shortcut).
-    final_dense_weight: 0.80
+    # R_final = final_iou_weight*IoU(B_f) + final_dense_weight*dense(B_f) + final_edge_weight*edge
+    # (weights are normalized to sum to 1). Raw IoU is plateau-free: it forces
+    # B_f to be refined, not copied from B_c.
+    final_iou_weight: 0.40
+    final_dense_weight: 0.50
+    final_edge_weight: 0.10
+    # dense geometry sharpening: s_w/s_h = (min/max)^gamma. Kills the
+    # "right-center-wrong-scale" plateau so imprecise boxes drop below precise ones.
+    dense_scale_gamma: 2.0
+    # H anchoring: R_ground = dense(B_c) + h_anchor_weight*(1-dense)*IoU(B_c, B_prior).
+    # B_prior is the H heatmap's largest-component box. Only shapes the candidate
+    # in the zero-IoU dead zone; GT truth always dominates via (1-dense) damping.
+    h_anchor_weight: 0.15
     edge_beta: 8.0
     edge_min_frac: 0.05
     keep_tol_norm1000: 8.0
@@ -177,10 +200,11 @@ grpo:
     wrong_decision: -1.0
     invalid_output: -1.0
     format_weights:
-      compare: 0.2
-      ground: 0.3
-      verify: 0.2
-      answer: 0.3
+      understand: 0.10
+      compare: 0.15
+      ground: 0.30
+      verify: 0.15
+      answer: 0.30
 
 distributed:
   num_gpu: 1

@@ -149,11 +149,6 @@ def build_train_ref_pool(train_samples: List[dict]) -> Dict[str, List[str]]:
     return pool
 
 
-def _is_test_path(path: str) -> bool:
-    parts = str(path).replace("\\", "/").split("/")
-    return "test" in parts
-
-
 class PriorCoTDataset(Dataset):
     def __init__(
         self,
@@ -222,43 +217,6 @@ class PriorCoTDataset(Dataset):
         item = self._load_pair(self.samples[idx])
         item["prompt"] = build_user_prompt(self.cfg, item["class_name"])
         return item
-
-
-def filter_prior_samples(raw: List[dict], cfg: dict, split: str) -> List[dict]:
-    data_cfg = cfg.get("data") or {}
-    train_anomaly_only = bool(data_cfg.get("train_anomaly_only", False))
-    holdout_ratio = float(data_cfg.get("holdout_ratio", 0.1))
-    max_samples = data_cfg.get("max_samples")
-    seed = int(cfg.get("training", {}).get("seed", 42))
-
-    samples = []
-    for s in raw:
-        p = str(s.get("full_img_path") or s.get("image") or "")
-        if not _is_test_path(p):
-            continue
-        meta = s.get("metadata") or {}
-        if train_anomaly_only and split == "train" and not bool(meta.get("anomaly", False)):
-            continue
-        if not os.path.isfile(str(s.get("full_img_path") or "")):
-            continue
-        samples.append(s)
-
-    rng = random.Random(seed)
-    indexed = list(enumerate(samples))
-    rng.shuffle(indexed)
-    n_hold = int(round(len(indexed) * holdout_ratio))
-    hold_ids = set(i for i, _ in indexed[:n_hold]) if n_hold > 0 else set()
-    if split == "train":
-        out = [s for i, s in enumerate(samples) if i not in hold_ids]
-    else:
-        out = [s for i, s in enumerate(samples) if i in hold_ids] or samples[: min(8, len(samples))]
-
-    if max_samples not in (None, "null", "None", "") and split == "train":
-        out = out[: int(max_samples)]
-    eval_max = data_cfg.get("max_eval_samples")
-    if eval_max not in (None, "null", "None", "") and split != "train":
-        out = out[: int(eval_max)]
-    return out
 
 
 class PriorCollator:
@@ -420,6 +378,7 @@ class PriorCollator:
             "heatmap": heat,
             "hmap_tensor": hmap.detach().cpu(),
             "prior_points": points,
+            "prior_box": vis.get("prior_box"),
             "vision_size": test_rs.size,
             "fallback_triggered": fallback_triggered,
             "points_before": points_before,

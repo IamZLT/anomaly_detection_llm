@@ -12,26 +12,31 @@ from reasoning.parser import (
     parse_answer_block,
     parse_bbox_field,
     parse_cot_output,
-    parse_cot_output_tolerant,
+    parse_cot_output_task,
 )
 from reasoning.rewards import (
     box_iou,
     compute_rewards,
     dense_geometry_reward,
     edge_precision_reward,
+    h_anchor_reward,
     refinement_directions,
 )
+from models.anomaly_prior import prior_box_from_heatmap
 from rl.grpo import clipped_pg_kl, expand_gen_in_for_group, micro_batch_ranges, model_inputs, padded_completion_tensors
 from utils.common import qwen_smart_hw
 from visualization.tensorboard import log_grpo_scalars
 
 ANOM = """
+<understand>
+Image 1 shows an intact bottle body. Image 2 shows the same object with a localized irregular break.
+</understand>
 <compare>
 The inspection image contains an irregular structural break on the bottle body that is absent from the normal reference.
 </compare>
 <ground>
-The most suspicious region is concentrated around the damaged bottle body.
 candidate_bbox_2d=[380,220,760,810]
+The most suspicious region is concentrated around the damaged bottle body.
 </ground>
 <verify>
 The irregular structure cannot be explained by illumination or normal appearance and is consistent with a physical defect.
@@ -42,12 +47,15 @@ The irregular structure cannot be explained by illumination or normal appearance
 """
 
 NORM = """
+<understand>
+Both images show a bottle with consistent overall shape and surface appearance.
+</understand>
 <compare>
 The inspection sample is consistent with the reference in overall shape, texture, and surface appearance.
 </compare>
 <ground>
-No localized difference provides sufficient evidence of a defect.
 candidate_bbox_2d=null
+No localized difference provides sufficient evidence of a defect.
 </ground>
 <verify>
 The observed variations are consistent with normal appearance.
@@ -58,12 +66,15 @@ The observed variations are consistent with normal appearance.
 """
 
 NORM_REJECT = """
+<understand>
+Image 2 has a localized appearance difference relative to the normal reference Image 1.
+</understand>
 <compare>
 Image 2 contains a localized appearance difference relative to Image 1.
 </compare>
 <ground>
-A small region differs from the reference and requires verification.
 candidate_bbox_2d=[280,420,410,560]
+A small region differs from the reference and requires verification.
 </ground>
 <verify>
 After comparison with the normal reference, the candidate is consistent with normal appearance variation rather than a true defect.
@@ -105,7 +116,7 @@ def test_trajectory_and_prose_gate():
     assert not bad["trajectory_valid"]
     copied = ANOM.replace(
         "The inspection image contains an irregular structural break on the bottle body that is absent from the normal reference.",
-        "Return exactly four XML blocks.",
+        "Return exactly five XML blocks.",
     )
     assert not parse_cot_output(copied)["trajectory_valid"]
 
@@ -127,7 +138,7 @@ def test_answer_description_is_required():
     assert not bad["trajectory_valid"]
     copied = ANOM.replace(
         "An irregular structural break is present on the bottle body and is absent from the normal reference.",
-        "One concise sentence describing the defect and its location.",
+        "Do not copy these instructions into the blocks.",
     )
     assert not parse_cot_output(copied)["trajectory_valid"]
     short = ANOM.replace(
@@ -206,7 +217,7 @@ def test_unclosed_answer_is_invalid_in_strict_parser():
     assert not p["has_tags"]
     assert not p["trajectory_valid"]
 
-    pt = parse_cot_output_tolerant(unclosed)
+    pt = parse_cot_output_task(unclosed)
     assert pt["answer_state"] == "ok"
     assert pt["bbox_2d"] == [410.0, 190.0, 750.0, 760.0]
 
@@ -226,7 +237,7 @@ def test_misspelled_candidate_gets_partial_format_reward():
         cfg,
     )
 
-    assert abs(det["R_fmt"] - 0.7) < 1e-6
+    assert abs(det["R_fmt"] - 0.70) < 1e-6
     assert det["R_final"] == -1.0
 
 
@@ -250,6 +261,48 @@ def test_normal_candidate_can_be_rejected():
     assert det["R_final"] == 1.0
 
 
+def test_normal_null_candidate_gets_full_reward():
+    cfg = {"grpo": {"reward": {}}}
+    p = parse_cot_output(NORM)
+    assert p["candidate_bbox_state"] == "null"
+    assert p["is_anomaly"] is False
+    assert p["trajectory_valid"]
+
+    det = compute_rewards(p, None, (1000, 1000), False, cfg)
+    assert det["R_final"] == 1.0
+
+
+def test_normal_full_image_candidate_is_penalized():
+    cfg = {"grpo": {"reward": {}}}
+    text = """
+<understand>
+Image 1 is intact while Image 2 shows only normal appearance variation.
+</understand>
+<compare>
+Image 2 looks the same as Image 1 with no localized defect.
+</compare>
+<ground>
+candidate_bbox_2d=[0,0,1000,1000]
+The whole image is proposed as a suspicious region.
+</ground>
+<verify>
+The whole-image candidate is rejected as normal variation.
+</verify>
+<answer>
+{"is_anomaly": false, "bbox_2d": null, "description": "The inspection image is consistent with the normal reference with no clear defect."}
+</answer>
+"""
+
+    p = parse_cot_output(text)
+    assert p["trajectory_valid"]
+    assert p["is_anomaly"] is False
+    assert p["candidate_bbox_state"] == "box"
+
+    det = compute_rewards(p, None, (1000, 1000), False, cfg)
+    assert det["full_image_cand"] == 1.0
+    assert det["R_final"] == -1.0
+
+
 def test_format_reward_monotonic():
     cfg = {"grpo": {"reward": {"invalid_output": -1.0, "wrong_decision": -1.0}}}
     orig = (1000, 1000)
@@ -260,15 +313,17 @@ def test_format_reward_monotonic():
     only_compare = "<compare>\nImage 2 differs from Image 1.\n</compare>\n"
     p_only = parse_cot_output(only_compare)
     det_only = compute_rewards(p_only, gt, orig, True, cfg)
-    assert det_only["R_fmt"] == 0.2
+    assert abs(det_only["R_fmt"] - 0.15) < 1e-6
     assert det_only["R_final"] == -1.0
     three_blocks = (
+        "<understand>\nBoth images show the same object class.\n</understand>\n"
         "<compare>\nImage 2 differs from Image 1.\n</compare>\n"
-        "<ground>\nThe region is suspicious.\ncandidate_bbox_2d=null\n</ground>\n"
+        "<ground>\ncandidate_bbox_2d=null\nThe region is suspicious.\n</ground>\n"
         "<verify>\nIt is a defect.\n</verify>\n"
     )
     det_three = compute_rewards(parse_cot_output(three_blocks), gt, orig, True, cfg)
-    assert det_three["R_fmt"] == 0.7
+    # understand+compare+ground+verify = 0.10+0.15+0.30+0.15 = 0.70
+    assert abs(det_three["R_fmt"] - 0.70) < 1e-6
     assert det_three["R_fmt"] > det_only["R_fmt"]
 
 
@@ -356,12 +411,15 @@ def test_full_image_candidate_does_not_get_high_ground_reward():
     gt = [450, 450, 550, 550]
 
     text = """
+<understand>
+Image 1 is intact while Image 2 shows a localized defect near the center.
+</understand>
 <compare>
 A localized difference is visible between Image 1 and Image 2.
 </compare>
 <ground>
-The whole image is proposed as a suspicious region.
 candidate_bbox_2d=[0,0,1000,1000]
+The whole image is proposed as a suspicious region.
 </ground>
 <verify>
 The candidate is checked against the reference and refined to the defect.
@@ -377,6 +435,78 @@ The candidate is checked against the reference and refined to the defect.
     assert det["R_dense_c"] < 0.05
     assert det["candidate_area_ratio"] > 0.8
     assert det["full_image_cand"] == 1.0
+
+
+def test_same_center_same_area_wrong_aspect_cannot_get_perfect_dense():
+    gt = [300, 450, 700, 550]  # 400 x 100
+    bad = [450, 300, 550, 700]  # 100 x 400
+
+    r = dense_geometry_reward(bad, gt, (1000, 1000))
+
+    assert r < 0.5
+    assert abs(box_iou(bad, gt)) < 0.2
+
+
+def test_dense_geometry_gamma_sharpens_wrong_scale():
+    gt = [450, 450, 550, 550]
+    # Center matches but box is 3x too large in each side.
+    bad = [300, 300, 700, 700]
+
+    r1 = dense_geometry_reward(bad, gt, (1000, 1000), gamma=1.0)
+    r2 = dense_geometry_reward(bad, gt, (1000, 1000), gamma=2.0)
+
+    assert r2 < r1
+    # An exact box is still a perfect reward regardless of gamma.
+    assert abs(dense_geometry_reward(gt, gt, (1000, 1000), gamma=2.0) - 1.0) < 1e-6
+
+
+def test_final_reward_includes_raw_iou():
+    cfg = {
+        "grpo": {
+            "reward": {
+                "final_iou_weight": 0.4,
+                "final_dense_weight": 0.5,
+                "dense_scale_gamma": 2.0,
+            }
+        }
+    }
+    orig = (1000, 1000)
+    gt = [450, 450, 550, 550]
+    text = ANOM.replace(
+        "candidate_bbox_2d=[380,220,760,810]", "candidate_bbox_2d=[450,450,550,550]"
+    ).replace('"bbox_2d": [410,190,750,760]', '"bbox_2d": [450,450,550,550]')
+    det = compute_rewards(parse_cot_output(text), gt, orig, True, cfg)
+    assert abs(det["R_iou"] - 1.0) < 1e-6
+    assert abs(det["R_final"] - 1.0) < 1e-6
+
+
+def test_final_reward_copying_candidate_is_not_free():
+    # When Bf == Bc and both are imprecise, raw IoU in R_final must prevent the
+    # copy from earning the same reward as a truly refined (exact) box.
+    cfg = {
+        "grpo": {
+            "reward": {
+                "final_iou_weight": 0.4,
+                "final_dense_weight": 0.5,
+                "dense_scale_gamma": 2.0,
+            }
+        }
+    }
+    orig = (1000, 1000)
+    gt = [450, 450, 550, 550]
+    # Candidate = final = a 3x oversized box centered on GT.
+    copy_text = ANOM.replace(
+        "candidate_bbox_2d=[380,220,760,810]", "candidate_bbox_2d=[300,300,700,700]"
+    ).replace('"bbox_2d": [410,190,750,760]', '"bbox_2d": [300,300,700,700]')
+    det_copy = compute_rewards(parse_cot_output(copy_text), gt, orig, True, cfg)
+
+    exact_text = ANOM.replace(
+        "candidate_bbox_2d=[380,220,760,810]", "candidate_bbox_2d=[450,450,550,550]"
+    ).replace('"bbox_2d": [410,190,750,760]', '"bbox_2d": [450,450,550,550]')
+    det_exact = compute_rewards(parse_cot_output(exact_text), gt, orig, True, cfg)
+
+    assert det_copy["R_final"] < det_exact["R_final"]
+    assert det_copy["raw_iou_f"] < det_exact["raw_iou_f"]
 
 
 def test_dense_reward_does_not_change_normal_gate():
@@ -397,6 +527,71 @@ def test_dense_reward_does_not_change_normal_gate():
     assert det["R_final"] == 1.0
     assert det["R_ground"] == 0.0
     assert det["R_reason"] == 0.0
+
+
+def test_h_anchor_reward_is_iou_with_prior_box():
+    prior = [100.0, 100.0, 200.0, 200.0]
+    assert abs(h_anchor_reward([100.0, 100.0, 200.0, 200.0], prior) - 1.0) < 1e-6
+    assert h_anchor_reward(None, prior) == 0.0
+    assert h_anchor_reward([100.0, 100.0, 200.0, 200.0], None) == 0.0
+    assert h_anchor_reward([700.0, 700.0, 800.0, 800.0], prior) == 0.0
+
+
+def test_prior_box_from_heatmap_finds_blob():
+    h = torch.zeros(16, 16)
+    h[4:8, 6:12] = 1.0
+    box = prior_box_from_heatmap(h, thresh_frac=0.5)
+    assert box is not None
+    x1, y1, x2, y2 = box
+    assert 0 <= x1 < x2 <= 1000 and 0 <= y1 < y2 <= 1000
+    # blob spans x in [6,11], y in [4,7] → centers ~ (8.5, 5.5) of 16
+    assert abs(x1 - round(6.5 / 16 * 1000)) < 50
+    assert abs(y2 - round(7.5 / 16 * 1000)) < 50
+
+
+def test_prior_box_from_heatmap_flat_returns_none():
+    assert prior_box_from_heatmap(torch.zeros(8, 8)) is None
+
+
+def test_h_anchor_breaks_dead_zone_ordering():
+    cfg = {"grpo": {"reward": {"h_anchor_weight": 0.2, "dense_scale_gamma": 2.0}}}
+    orig = (1000, 1000)
+    gt = [450, 450, 550, 550]
+    prior = [100, 100, 200, 200]  # H points to the top-left corner
+
+    def det_for(cand):
+        text = ANOM.replace(
+            "candidate_bbox_2d=[380,220,760,810]",
+            f"candidate_bbox_2d=[{','.join(map(str, cand))}]",
+        ).replace(
+            '"bbox_2d": [410,190,750,760]',
+            f'"bbox_2d": [{",".join(map(str, cand))}]',
+        )
+        return compute_rewards(parse_cot_output(text), gt, orig, True, cfg, prior_box=prior)
+
+    d_near = det_for([100, 100, 200, 200])  # on H, zero IoU with GT
+    d_far = det_for([800, 800, 900, 900])   # same size/distance from GT, away from H
+
+    assert d_near["raw_iou_c"] == 0.0 and d_far["raw_iou_c"] == 0.0
+    assert abs(d_near["R_dense_c"] - d_far["R_dense_c"]) < 1e-6
+    assert d_near["h_anchor"] == 1.0
+    assert d_far["h_anchor"] == 0.0
+    assert d_near["R_ground"] > d_far["R_ground"]
+
+
+def test_h_anchor_does_not_override_gt_truth():
+    cfg = {"grpo": {"reward": {"h_anchor_weight": 0.2, "dense_scale_gamma": 2.0}}}
+    orig = (1000, 1000)
+    gt = [450, 450, 550, 550]
+    prior = [100, 100, 200, 200]  # H points AWAY from GT (a wrong hint)
+
+    text = ANOM.replace(
+        "candidate_bbox_2d=[380,220,760,810]", "candidate_bbox_2d=[450,450,550,550]"
+    ).replace('"bbox_2d": [410,190,750,760]', '"bbox_2d": [450,450,550,550]')
+    det = compute_rewards(parse_cot_output(text), gt, orig, True, cfg, prior_box=prior)
+
+    assert det["h_anchor"] == 0.0  # candidate is not on the (wrong) H
+    assert abs(det["R_ground"] - 1.0) < 1e-6  # GT truth still gives a perfect score
 
 
 def test_refinement_direction_from_boxes():
@@ -430,8 +625,8 @@ def test_size_bins_and_gated_miou():
     assert defect_size_bin(0.01, True) == "small"
     assert abs(gt_relative_area([0, 0, 10, 10], (100, 100)) - 0.01) < 1e-9
     rows = [
-        {"is_anomaly": True, "pred_cls": True, "class_name": "a", "iou_f": 0.6, "iou_c": 0.4, "a_gt": 0.2, "rec_ok": True},
-        {"is_anomaly": True, "pred_cls": False, "class_name": "a", "iou_f": 0.9, "iou_c": 0.1, "a_gt": 0.01, "rec_ok": False},
+        {"is_anomaly": True, "pred_is_anomaly": True, "class_name": "a", "iou_f": 0.6, "iou_c": 0.4, "a_gt": 0.2, "rec_ok": True},
+        {"is_anomaly": True, "pred_is_anomaly": False, "class_name": "a", "iou_f": 0.9, "iou_c": 0.1, "a_gt": 0.01, "rec_ok": False},
     ]
     s = summarize_detection_metrics(rows)
     assert abs(s["mean_iou"] - 0.75) < 1e-6
@@ -523,17 +718,21 @@ def test_prompt_is_two_images_plus_spatial_hint():
         "Image 1 is a defect-free normal reference of a {class_name}.\n"
         "Image 2 is the inspection image.\n"
         "These points are only spatial hints, not defect labels.\n"
-        "Output exactly these four blocks, in this order:\n"
-        "<compare>...</compare>\n<ground>...</ground>\n<verify>...</verify>\n<answer>...</answer>\n"
+        "Required structure:\n"
+        "<understand>...</understand>\n"
+        "<compare>...</compare>\n"
+        "<ground>...</ground>\n"
+        "<verify>...</verify>\n"
+        "<answer>...</answer>\n"
     )
     text = build_user_prompt({"prompt": {"user": tmpl}}, "bottle")
     assert "Image 1" in text and "Image 2" in text
     assert "Image 3" not in text
     assert "bottle" in text
     assert "spatial hint" in text.lower()
-    assert "four blocks" in text
+    assert "<understand>" in text
     assert "<boundary>" not in text
-    assert "five" not in text.lower()
+    assert "five XML" not in text.lower()
 
 
 def test_model_inputs_drops_image_embeds():
@@ -617,6 +816,17 @@ def test_tb_grpo_scalars_are_allowlisted():
         "grpo/final_area_ratio",
         "grpo/pred_gt_area_ratio",
         "grpo/full_image_box_rate",
+        "grpo/h_anchor",
+        "grpo/h_follow_rate",
+        "grpo/h_override_rate",
+        "grpo/kl_contrib",
+        "grpo/ref_gap",
+        "protocol/strict_trajectory_rate",
+        "protocol/task_trajectory_rate",
+        "protocol/strict_answer_rate",
+        "protocol/task_answer_rate",
+        "protocol/strict_final_valid_rate",
+        "protocol/task_final_valid_rate",
         "grpo/protocol_rate",
         "grpo/trajectory_valid_rate",
         "grpo/candidate_valid_rate",

@@ -1,0 +1,20 @@
+{
+  "version": "outcome-v1",
+  "head_before": "789cd8815ed2694ad8768fbcffde453cc37790a3",
+  "added_files": {
+    "train_outcome.py": "36b6ec2cce872fa7395927c0e18ab42a95ed41775359e41c6b7a8c1b8ccca67e",
+    "tests/test_outcome.py": "55b0d0661fcdf77780292c308b4f2d518d13315cc40861c280c14f215285e246",
+    "docs/outcome_implementation.md": "a7a62dc39b9f97e23061050f209b89efc432d6fd8e6b42bb39b35644d4434f1c",
+    "outcome/protocol.py": "2c92f8fa46b5c0bac4f711fe077a5a4b2c0e77fe3919aef35b7a5a127a60518c",
+    "outcome/policy.py": "791dabeed9dec1cdeb4297a816305231e992cc31c771871a0667bfa4b17d000a",
+    "outcome/__init__.py": "995cb3c2c7a9dd3209d9461fef86f60776a09f434fb504d98ce770de62b28d4b",
+    "outcome/engine.py": "751fb4674d15e56a4bb6297e5fe618b7ef1673f68fd5d74cea8adcaf4c705f91",
+    "outcome/inputs.py": "ede2614001d69981863552ee2cbff3890bba9f2bcf5f6b53a1f4344c07640c82",
+    "configs/qwen35_08b_outcome.yaml": "2b158254566d1e910769cf55cb977faa8478b0d03b86a440f088de432e56326e",
+    "configs/qwen35_2b_outcome_roi.yaml": "5e954bd9593eb7c4bad89320f7bd3c222caca76a5324d6c0e66099f059a97502",
+    "configs/qwen35_2b_outcome.yaml": "40aedd4f18a1adceb94a014082d77d26520a57aa21d1832b9fd4657a7385c903",
+    "scripts/smoke_outcome.py": "cecc88e856e8abc771cc0097fe9f9fee9a8062d44fc890a23ef4a7695af310b6"
+  },
+  "modified_existing_files": [],
+  "tests": "76 unit/regression tests; 0.8B and 2B disposable integration checks"
+}

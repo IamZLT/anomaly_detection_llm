@@ -1,0 +1,22 @@
+{
+  "protocol_version": "outcome-v1",
+  "source_hashes": {
+    "outcome/inputs.py": "ede2614001d69981863552ee2cbff3890bba9f2bcf5f6b53a1f4344c07640c82",
+    "outcome/protocol.py": "2c92f8fa46b5c0bac4f711fe077a5a4b2c0e77fe3919aef35b7a5a127a60518c",
+    "outcome/policy.py": "3b38655cdf680c149780b2e35da3246a71fb3eee1e39887e4decfd280dfd6505",
+    "outcome/engine.py": "751fb4674d15e56a4bb6297e5fe618b7ef1673f68fd5d74cea8adcaf4c705f91",
+    "outcome/__init__.py": "995cb3c2c7a9dd3209d9461fef86f60776a09f434fb504d98ce770de62b28d4b",
+    "train_outcome.py": "36b6ec2cce872fa7395927c0e18ab42a95ed41775359e41c6b7a8c1b8ccca67e",
+    "rl/grpo.py": "4808caf019a657504d1332da61fa87be4b0cfce41b713c090fe9c74d26ad0966",
+    "models/qwen35.py": "7ba8f70df240d1b3ee82181b9b664ae0db5b33024957108db1385f886ac8a7ea",
+    "models/vision_cache.py": "a4336576c710ea440aca9d4f6c04314a275c8b9bdcfa86801ee58dd9170b5fc5",
+    "models/anomaly_prior.py": "26083bbcde1f9b59790a678ecd945bee04790fd11648b0b00e39698648344243",
+    "data/scan.py": "428405c7c40d068da817f27de505bb37b4a7e733ca0c6a874aed229d68afbe11",
+    "data/prior_dataset.py": "bcb118ed1b202b3e29899503334f077a57b6e5d83aee5b344b342861f8e53a29"
+  },
+  "reference_policy": "frozen_base",
+  "adapter": null,
+  "mode": "eval",
+  "split": "dev",
+  "eval_limit": 2
+}

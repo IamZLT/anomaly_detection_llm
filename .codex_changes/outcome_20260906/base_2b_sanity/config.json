@@ -1,0 +1,132 @@
+{
+  "paths": {
+    "dataset_root": "/data2/zlt/anomaly_detection_llm/datasets",
+    "output_dir": "./outputs/train/qwen35_2b_outcome"
+  },
+  "runtime": {
+    "mode": "train",
+    "run_name": "qwen35_2b_outcome",
+    "auto_create_output_dir": true
+  },
+  "model": {
+    "random_init_llm": false,
+    "arch": "Qwen3.5-2B",
+    "name": "/data2/zlt/anomaly_detection_llm/model_card/Qwen3.5-2B",
+    "local_files_only": true,
+    "freeze_vit": true,
+    "torch_dtype": "bfloat16"
+  },
+  "prior": {
+    "layer_index_base": 1,
+    "layer_indices": [
+      12,
+      16,
+      20,
+      24
+    ],
+    "softmax_temperature": 0.5,
+    "neighborhood_radius": 0,
+    "render": "colormap",
+    "overlay_alpha": 0.45
+  },
+  "lora": {
+    "enabled": true,
+    "skip_visual": true,
+    "r": 16,
+    "alpha": 32,
+    "dropout": 0.0,
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj",
+      "in_proj_qkv",
+      "in_proj_z",
+      "in_proj_a",
+      "in_proj_b",
+      "out_proj"
+    ]
+  },
+  "data": {
+    "train_layout": "visa",
+    "train_root": "/data2/zlt/anomaly_detection_llm/datasets/VisA",
+    "eval_layout": "mvtec",
+    "eval_root": "/data2/zlt/anomaly_detection_llm/datasets/mvtec_anomaly_detection",
+    "visa_max_normal_per_class": null,
+    "source_dirname": "VisA",
+    "train_anomaly_only": false,
+    "random_train_ref": true,
+    "ref_topk": 5,
+    "normal_anomaly_ratio": 1.0,
+    "holdout_ratio": 0.1,
+    "max_samples": null,
+    "max_eval_samples": null,
+    "max_image_size": 448,
+    "factor": null,
+    "min_pixels": null,
+    "max_pixels": null
+  },
+  "prompt": {
+    "enable_thinking": false
+  },
+  "training": {
+    "max_length": 3072,
+    "gradient_checkpointing": true,
+    "gradient_checkpointing_kwargs": {
+      "use_reentrant": false
+    },
+    "seed": 42,
+    "eval_every_n_steps": 100,
+    "eval_num_samples": 2,
+    "final_eval_num_samples": 2
+  },
+  "grpo": {
+    "group_size": 8,
+    "policy_epochs": 1,
+    "epochs": 2,
+    "max_attempts": null,
+    "learning_rate": 1e-06,
+    "gradient_accumulation_steps": 1,
+    "max_new_tokens": 512,
+    "rollout_micro_batch_size": 1,
+    "logprob_micro_batch_size": 1,
+    "actor_micro_batch_size": 1,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 0,
+    "scale_rewards": false,
+    "clip_low": 0.2,
+    "clip_high": 0.28,
+    "kl_beta": 0.0002,
+    "max_grad_norm": 1.0,
+    "save_steps": 100,
+    "logprob_error_tolerance": 0.1
+  },
+  "distributed": {
+    "num_gpu": 1,
+    "deepspeed": null,
+    "local_rank": -1,
+    "ddp_find_unused_parameters": false
+  },
+  "outcome": {
+    "version": "outcome-v1",
+    "protocol_weight": 0.05,
+    "sft_adapter": null,
+    "eval_before_train": true,
+    "final_test": false,
+    "prior": {
+      "condition": "real",
+      "relative_threshold": 0.7,
+      "raw_threshold": null,
+      "max_candidates": 3,
+      "min_cells": 1
+    },
+    "roi": {
+      "enabled": false,
+      "margin": 0.25
+    }
+  }
+}

@@ -129,15 +129,13 @@ def run_simple_eval(
             else:
                 ious.append(0.0)
             cand_box = parsed.get("candidate_bbox_2d")
-            if cand_box is None:
-                cand_box = parsed.get("candidate_bbox")
             if cand_box is not None and gt is not None and valid_bbox_1000(cand_box):
                 iou_c = box_iou(qwen1000_to_pixels_strict(cand_box, orig), gt)
             ious_c.append(iou_c)
         metric_rows.append(
             {
                 "is_anomaly": is_anom,
-                "pred_cls": pred_cls,
+                "pred_is_anomaly": pred_cls,
                 "class_name": meta.get("class_name"),
                 "iou_f": iou_v,
                 "iou_c": iou_c,

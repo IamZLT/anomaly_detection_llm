@@ -1,23 +1,24 @@
-# Qwen3.5-2B：冻结视觉塔多层差异先验 H + LoRA Process-Aware Spatial GRPO（无 SFT）
-# 启动：python train.py --config configs/qwen35_2b_grpo.yaml
-# 指定物理卡 2 和 7：
-#   CUDA_VISIBLE_DEVICES=2,7 python train.py --config configs/qwen35_2b_grpo.yaml --num-gpu 2
+# Qwen3.5-9B：冻结视觉塔多层差异先验 H + LoRA Process-Aware Spatial GRPO（无 SFT）
+# 启动：python train.py --config configs/qwen35_9b_grpo.yaml
+# 9B 显存大，建议 ≥40GB/卡（2 卡）或 80GB 单卡；24GB 卡会 OOM。
+# 指定物理卡示例（2 卡）：
+#   CUDA_VISIBLE_DEVICES=0,1 python train.py --config configs/qwen35_9b_grpo.yaml --num-gpu 2
 # --num-gpu 必须等于可见 GPU 数量（不是物理编号）。
 
 paths:
   dataset_root: /data2/zlt/anomaly_detection_llm/datasets
-  # 实际 run 目录：outputs/train/qwen35_2b_prior/{run_name}_{timestamp}/
-  output_dir: ./outputs/train/qwen35_2b_prior
+  # 实际 run 目录：outputs/train/qwen35_9b_prior/{run_name}_{timestamp}/
+  output_dir: ./outputs/train/qwen35_9b_prior
 
 runtime:
   mode: train
-  run_name: qwen35_2b_visa2mvtec
+  run_name: qwen35_9b_visa2mvtec
   auto_create_output_dir: true
 
 tensorboard:
   auto_start: true
   host: 0.0.0.0
-  port: 5002
+  port: 5003        # 与 0.8B/2B 的 5002 区分，避免多跑同时抢端口
   # 默认盯本次 run 的 tb/：loss 曲线和热力图 / CoT 在同一个实验里
   vis_every_n_steps: 50     # 训练 batch 可视化；不要用 MVTec test 当每步盯盘
   vis_num_samples: 2
@@ -28,17 +29,19 @@ tensorboard:
 
 model:
   random_init_llm: false
-  arch: Qwen3.5-2B
-  name: /data2/zlt/anomaly_detection_llm/model_card/Qwen3.5-2B
+  arch: Qwen3.5-9B
+  name: /data2/zlt/anomaly_detection_llm/model_card/Qwen3.5-9B
   local_files_only: true
   freeze_vit: true
   torch_dtype: bfloat16
 
-# 冻结 Vision Encoder：1-based 层号 12/16/20/24 → blocks 11/15/19/23
+# 冻结 Vision Encoder：9B vision depth=27（0-based blocks 0..26）。
+# 与 0.8B(d=12)/2B(d=24) 一致，按相对深度 50/67/83/100% 取 1-based 层：
+#   13.5→14, 18→18, 22.5→23, 27→27  → blocks 13/17/22/26
 # 对齐 DualBrain：pre-merger token + merge-unpack + 逐层 L2/NN + 距离图 softmax 融合
 prior:
   layer_index_base: 1
-  layer_indices: [12, 16, 20, 24]
+  layer_indices: [14, 18, 23, 27]
   softmax_temperature: 0.5      # DualBrain fusion_temperature（作用在层间距离图上）
   neighborhood_radius: 0        # 0 = 对整张正常参考图做全局 patch NN（DualBrain gallery）
   hint_topk: 5                  # H → K soft spatial anchors in 0-1000
@@ -169,10 +172,11 @@ grpo:
   learning_rate: 5.0e-6
   gradient_accumulation_steps: 1
   max_new_tokens: 384
-  # 逻辑 group 仍是 8。3090 单卡 24GB 只用了 ~5GB 时用 4/4/2 换速度；OOM 再降回 2/2/1
-  rollout_micro_batch_size: 4
-  logprob_micro_batch_size: 4
-  actor_micro_batch_size: 2
+  # 9B 权重 bf16 ≈19GB，仅剩少量显存做激活；全部 micro batch 降到 1。
+  # 单卡 80GB 或 2×40GB 起步；OOM 优先开 DeepSpeed ZeRO 而不是再降 batch。
+  rollout_micro_batch_size: 1
+  logprob_micro_batch_size: 1
+  actor_micro_batch_size: 1
   temperature: 0.9
   top_p: 0.95
   logging_steps: 1          # 终端打印；TB 的 grpo/* 每步都写（与 param 同一 step）

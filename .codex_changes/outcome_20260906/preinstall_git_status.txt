@@ -1,0 +1,24 @@
+ M app/app.py
+ M configs/qwen35_08b_grpo.yaml
+ M configs/qwen35_2b_grpo.yaml
+ M data/prior_dataset.py
+ M demo.py
+ M evaluation/evaluator.py
+ M evaluation/metrics.py
+ M models/anomaly_prior.py
+ M models/qwen35.py
+ M models/vision_cache.py
+ M reasoning/__init__.py
+ M reasoning/parser.py
+ M reasoning/rewards.py
+ M reasoning/segments.py
+ M rl/grpo.py
+ M rl/trainer.py
+ M tests/test_protocol.py
+ M utils/common.py
+ M visualization/tensorboard.py
+?? .codex_changes/
+?? configs/qwen35_9b_grpo.yaml
+?? exp
+?? scripts/check_reward_change.py
+?? scripts/validate_prior_h.py

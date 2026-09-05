@@ -33,7 +33,7 @@ from reasoning.parser import (
     parse_cot_output_task,
     rollout_protocol_stats,
 )
-from reasoning.rewards import compute_rewards, format_reward
+from reasoning.rewards import DEFAULT_FORMAT_WEIGHTS, compute_rewards, format_reward
 from rl.grpo import (
     avg_across_ranks,
     build_segment_advantages,
@@ -299,7 +299,8 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
 
     def _score_group(texts: List[str], meta: dict):
         details = []
-        parsed_list = []
+        strict_list = []
+        task_list = []
         for text in texts:
             strict_parsed = parse_cot_output(text)
             task_parsed = parse_cot_output_task(text)
@@ -310,27 +311,28 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                 tuple(meta["orig_size"]),
                 bool(meta["is_anomaly"]),
                 cfg,
+                prior_box=meta.get("prior_box"),
             )
 
             rew_cfg = (cfg.get("grpo") or {}).get("reward") or {}
-            fmt_weights = rew_cfg.get("format_weights") or {
-                "compare": 0.2,
-                "ground": 0.3,
-                "verify": 0.2,
-                "answer": 0.3,
-            }
+            fmt_weights = rew_cfg.get("format_weights") or DEFAULT_FORMAT_WEIGHTS
 
             # R_fmt must come from the strict parser, while spatial task
             # rewards come from the tolerant task parser.
             det["R_fmt"] = format_reward(strict_parsed, fmt_weights)
             det["protocol_ok"] = bool(strict_parsed.get("has_tags"))
+            det["task_trajectory_valid"] = bool(task_parsed.get("trajectory_valid"))
+            det["task_pred_cls"] = task_parsed.get("is_anomaly")
+            det["task_has_answer"] = "answer" in (task_parsed.get("tags") or {})
+            det["task_has_bbox"] = task_parsed.get("bbox_2d") is not None
 
-            parsed_list.append(strict_parsed)
+            strict_list.append(strict_parsed)
+            task_list.append(task_parsed)
             details.append(det)
 
             if not strict_parsed.get("trajectory_valid"):
                 _dump_parser_debug(text, strict_parsed)
-        return details, parsed_list
+        return details, strict_list, task_list
 
     while step < max_steps:
         attempt_step += 1
@@ -351,13 +353,13 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
         if bool(meta.get("is_anomaly")) and a_gt < small_area:
             attempts = max(attempts, hard_resample)
 
-        seqs, texts, details, parsed_list = [], [], [], []
+        seqs, texts, details, strict_list, task_list = [], [], [], [], []
         resample_n = 0
         skipped = False
         t_roll = time.time()
         for attempt in range(attempts + 1):
             seqs, texts = _generate_group(gen_in, prompt_len, vision_cache)
-            details, parsed_list = _score_group(texts, meta)
+            details, strict_list, task_list = _score_group(texts, meta)
             std_g = group_std([float(d.get("R_ground", 0.0)) for d in details])
             std_r = group_std([float(d.get("R_reason", 0.0)) for d in details])
             std_f = group_std([float(d.get("R_final", 0.0)) for d in details])
@@ -369,7 +371,7 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                     p.get("candidate_bbox_state") == "box"
                     or p.get("final_bbox_state") == "box"
                 )
-                for p in parsed_list
+                for p in task_list
             )
 
             if bool(meta.get("is_anomaly")) and has_spatial_proposal:
@@ -386,6 +388,7 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
         if skipped:
             resample_n = attempts
         t_roll = time.time() - t_roll
+        parsed_list = strict_list
 
         r_ground = torch.tensor([float(d.get("R_ground", 0.0)) for d in details], device=device, dtype=torch.float32)
         r_reason = torch.tensor([float(d.get("R_reason", 0.0)) for d in details], device=device, dtype=torch.float32)
@@ -447,17 +450,21 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                 adv_tok = torch.zeros_like(adv_tok)
             seq_lp = (old_lp * lp_mask).sum(dim=1) / lp_mask.sum(dim=1).clamp(min=1)
 
-        n_ans = sum(1 for p in parsed_list if "answer" in (p.get("tags") or {}))
-        n_bbox = sum(1 for p in parsed_list if p.get("bbox_2d") is not None)
-        n_cls = sum(1 for p in parsed_list if p.get("is_anomaly") is not None)
-        n_trunc = sum(1 for s in seqs if is_truncated(s, prompt_len, max_new, eos_id))
         n_g = max(group, 1)
-        answer_tag_rate = n_ans / n_g
-        final_bbox_rate = n_bbox / n_g
-        cls_tag_rate = n_cls / n_g
+        n_trunc = sum(1 for s in seqs if is_truncated(s, prompt_len, max_new, eos_id))
         truncation_rate = n_trunc / n_g
-        proto_stats = rollout_protocol_stats(parsed_list, texts)
-        parse_rate_local = proto_stats["protocol_rate"]
+
+        strict_stats = rollout_protocol_stats(strict_list, texts)
+        task_stats = rollout_protocol_stats(task_list, texts)
+        s_ans = sum(1 for p in strict_list if "answer" in (p.get("tags") or {})) / n_g
+        s_bbox = sum(1 for p in strict_list if p.get("bbox_2d") is not None) / n_g
+        t_ans = sum(1 for p in task_list if "answer" in (p.get("tags") or {})) / n_g
+        t_bbox = sum(1 for p in task_list if p.get("bbox_2d") is not None) / n_g
+        answer_tag_rate = s_ans
+        final_bbox_rate = s_bbox
+        cls_tag_rate = sum(1 for p in strict_list if p.get("is_anomaly") is not None) / n_g
+        proto_stats = strict_stats
+        parse_rate_local = strict_stats["protocol_rate"]
 
         loss_v = 0.0
         pg_v = 0.0
@@ -545,7 +552,12 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
         truncation_rate = avg_across_ranks(truncation_rate, device)
         cls_tag_rate = avg_across_ranks(cls_tag_rate, device)
         ref_gap = avg_across_ranks(ref_gap, device)
+        s_ans = avg_across_ranks(s_ans, device)
+        s_bbox = avg_across_ranks(s_bbox, device)
+        t_ans = avg_across_ranks(t_ans, device)
+        t_bbox = avg_across_ranks(t_bbox, device)
         proto_avg = {k: avg_across_ranks(float(v), device) for k, v in proto_stats.items()}
+        task_proto_avg = {k: avg_across_ranks(float(v), device) for k, v in task_stats.items()}
 
         if skipped and bool(meta.get("is_anomaly")) and not from_requeue:
             pending_retry = raw_batch
@@ -578,11 +590,24 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                 extra={
                     "loss_pg": pg_v,
                     "loss_kl": kl_v,
+                    "kl_beta": float(kl_beta),
                     "rho_mean": rho_v,
                     "clip_frac": clip_v,
                     "resample": float(resample_n),
                     "skipped": 1.0 if skipped else 0.0,
+                    "ref_gap": float(ref_gap),
+                    "strict_protocol_rate": float(proto_avg.get("protocol_rate", 0.0)),
+                    "strict_trajectory_rate": float(proto_avg.get("trajectory_valid_rate", 0.0)),
+                    "strict_answer_rate": float(s_ans),
+                    "strict_final_valid_rate": float(proto_avg.get("final_valid_rate", 0.0)),
+                    "task_protocol_rate": float(task_proto_avg.get("protocol_rate", 0.0)),
+                    "task_trajectory_rate": float(task_proto_avg.get("trajectory_valid_rate", 0.0)),
+                    "task_answer_rate": float(t_ans),
+                    "task_final_valid_rate": float(task_proto_avg.get("final_valid_rate", 0.0)),
+                    "task_candidate_valid_rate": float(task_proto_avg.get("candidate_valid_rate", 0.0)),
                 },
+                strict_stats=strict_stats,
+                task_stats=task_stats,
             )
             if log_every > 0 and step % log_every == 0:
                 n = max(group, 1)
@@ -595,9 +620,9 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                     f"Rr={sum(d.get('R_reason', 0.0) for d in details)/n:.3f} "
                     f"iou_f={sum(d.get('R_iou', 0.0) for d in details)/n:.3f} "
                     f"iou_c={sum(d.get('R_iou_c', 0.0) for d in details)/n:.3f} "
-                    f"ans={answer_tag_rate:.2f} bbox={final_bbox_rate:.2f} "
-                    f"traj={proto_avg.get('trajectory_valid_rate', 0.0):.2f} "
-                    f"cand={proto_avg.get('candidate_valid_rate', 0.0):.2f} "
+                    f"s_ans={s_ans:.2f} s_bbox={s_bbox:.2f} s_traj={proto_avg.get('trajectory_valid_rate', 0.0):.2f} "
+                    f"t_ans={t_ans:.2f} t_bbox={t_bbox:.2f} t_traj={task_proto_avg.get('trajectory_valid_rate', 0.0):.2f} "
+                    f"cand={task_proto_avg.get('candidate_valid_rate', 0.0):.2f} "
                     f"uniq={proto_avg.get('unique_response_rate', 0.0):.2f} "
                     f"dIoU={sum(d.get('delta_iou', 0.0) for d in details)/n:.3f} "
                     f"dir={sum(d.get('R_dir', 0.0) for d in details)/n:.2f} "
@@ -611,7 +636,10 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
 
         if is_main_process() and vis_every > 0 and step % vis_every == 0:
             def _vis_key(i):
-                p = parsed_list[i]
+                # Prefer task-semantic parse for spatial/class quality; keep
+                # strict trajectory as a secondary format signal.
+                p = task_list[i]
+                sp = strict_list[i]
                 d = details[i]
                 is_anom = bool(meta.get("is_anomaly"))
 
@@ -633,6 +661,7 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
 
                 return (
                     int(bool(p.get("trajectory_valid"))),
+                    int(bool(sp.get("trajectory_valid"))),
                     int(cls_ok),
                     int(spatial_ok),
                     float(d.get("R_final", -1.0)),
@@ -648,10 +677,10 @@ def train_grpo(cfg: dict, model, processor, prior, train_set, eval_loader, outpu
                 tag_prefix="grpo_batch",
                 meta=meta,
                 response=texts[best_i],
-                parsed=parsed_list[best_i],
+                parsed=task_list[best_i],
                 iou=float(details[best_i].get("R_iou", 0.0)),
-                rec_ok=details[best_i].get("pred_cls") is not None
-                and bool(details[best_i].get("pred_cls")) == bool(meta.get("is_anomaly")),
+                rec_ok=details[best_i].get("pred_is_anomaly") is not None
+                and bool(details[best_i].get("pred_is_anomaly")) == bool(meta.get("is_anomaly")),
                 overlay_alpha=alpha,
                 iou_c=float(details[best_i].get("R_iou_c", 0.0)),
                 **tb_vis_flags(cfg),

@@ -15,10 +15,10 @@ from PIL import Image
 
 from evaluation.infer import build_generation_inputs, decode_generation_output
 from models.qwen35 import setup_model_and_processor
-from reasoning.parser import parse_cot_output_tolerant
 from utils.common import (
     draw_bbox_on_image,
     infer_model_compute_device,
+    parse_grounding_output,
     qwen_norm1000_to_original_pixels,
 )
 from utils.config import apply_runtime_overrides, load_yaml_config
@@ -72,8 +72,8 @@ def main() -> None:
         )
     response = decode_generation_output(processor, outputs, inputs, cfg)
     print(response)
-    parsed = parse_cot_output_tolerant(response)
-    bbox = parsed.get("bbox_2d")
+    bbox_data = parse_grounding_output(response)
+    bbox = (bbox_data or {}).get("bbox_2d")
     if bbox and len(bbox) == 4:
         original_bbox = qwen_norm1000_to_original_pixels(list(map(float, bbox)), original_size)
         out_dir = (inf.get("visual_output_dir") or os.path.join(PROJECT_ROOT, "outputs", "eval", "qwen_infer_vis"))

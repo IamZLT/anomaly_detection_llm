@@ -197,7 +197,7 @@ def inference():
                 bbox_info = {
                     "bbox": original_bbox,
                     "label": label,
-                    "processed_bbox": px,
+                    "processed_bbox": original_bbox,
                     "model_bbox_raw": bbox,
                 }
         

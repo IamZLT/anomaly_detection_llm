@@ -7,6 +7,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 EDGE_KEYS = ("L", "R", "T", "B")
 
+DEFAULT_FORMAT_WEIGHTS = {
+    "understand": 0.10,
+    "compare": 0.15,
+    "ground": 0.30,
+    "verify": 0.15,
+    "answer": 0.30,
+}
+
 
 def box_iou(a: List[float], b: List[float]) -> float:
     ax1, ay1, ax2, ay2 = a
@@ -41,11 +49,29 @@ def box_center(box: List[float]) -> Tuple[float, float]:
     return 0.5 * (x1 + x2), 0.5 * (y1 + y2)
 
 
+def h_anchor_reward(
+    cand_box: Optional[List[float]],
+    prior_box: Optional[List[float]],
+) -> float:
+    """IoU between the candidate proposal and the H-derived prior box.
+
+    Both boxes are in the Qwen 0-1000 system. The prior box is a *coarse hint*,
+    not a defect label: this term only shapes the candidate (R_ground) and is
+    damped by (1 - R_dense) so it can never outrank GT truth. It exists purely to
+    break the zero-IoU dead zone — giving near-identical rollouts a group-relative
+    ordering that pulls the candidate toward the H region.
+    """
+    if cand_box is None or prior_box is None:
+        return 0.0
+    return float(box_iou(cand_box, prior_box))
+
+
 def dense_geometry_reward(
     pred: List[float],
     gt: List[float],
     orig_wh: Tuple[int, int],
     *,
+    gamma: float = 1.0,
     eps: float = 1e-6,
 ) -> float:
     """Dense localization reward.
@@ -53,10 +79,15 @@ def dense_geometry_reward(
     Key property: even when IoU == 0, a box closer to GT receives a larger
     reward than a far-away box, removing the sparse-reward dead zone.
 
-    Center distance is normalized by the image diagonal so the gradient stays
-    continuous across the whole image. Scale uses a symmetric min/max ratio,
-    and geometry is multiplicative (S_center * S_scale) so a huge box cannot
-    earn a large reward merely because its center is near the GT center.
+    Center distance is normalized by the image diagonal. Width and height use
+    symmetric min/max ratios raised to `gamma`, and geometry is multiplicative
+    (S_center * S_w * S_h) so neither a huge box nor a same-area wrong-aspect
+    box can earn a large reward from center alone.
+
+    `gamma > 1` sharpens S_w/S_h: a box with the right center but wrong size
+    is pushed down faster, so raw IoU dominates as soon as boxes start to
+    overlap. This kills the "right-center-wrong-scale" reward plateau where
+    imprecise boxes all sit near the same ~0.4 reward and produce ~0 advantage.
     """
     if pred is None or gt is None:
         return 0.0
@@ -80,16 +111,25 @@ def dense_geometry_reward(
         dist / (image_diag + eps),
     )
 
-    area_p = box_area(pred)
-    area_g = box_area(gt)
+    px1, py1, px2, py2 = map(float, pred)
+    gx1, gy1, gx2, gy2 = map(float, gt)
+    wp, hp = max(0.0, px2 - px1), max(0.0, py2 - py1)
+    wg, hg = max(0.0, gx2 - gx1), max(0.0, gy2 - gy1)
 
-    if area_p <= eps or area_g <= eps:
-        s_scale = 0.0
+    gamma = max(float(gamma), 1e-6)
+
+    if wp <= eps or wg <= eps:
+        s_w = 0.0
     else:
-        s_scale = min(area_p, area_g) / max(area_p, area_g)
+        s_w = (min(wp, wg) / max(wp, wg)) ** gamma
 
-    # Both location and scale must be plausible.
-    s_geo = s_center * s_scale
+    if hp <= eps or hg <= eps:
+        s_h = 0.0
+    else:
+        s_h = (min(hp, hg) / max(hp, hg)) ** gamma
+
+    # Location and both side lengths must be plausible.
+    s_geo = s_center * s_w * s_h
     s_geo = max(0.0, min(1.0, s_geo))
 
     reward = iou + (1.0 - iou) * s_geo
@@ -166,6 +206,11 @@ def _to_px(box, orig_wh: Tuple[int, int]) -> Optional[List[float]]:
 def format_reward(parsed: Dict[str, Any], fmt_weights: Dict[str, float]) -> float:
     tags = parsed.get("tags") or {}
 
+    understand_ok = (
+        "understand" in tags
+        and bool(str(tags.get("understand", "")).strip())
+    )
+
     compare_ok = (
         "compare" in tags
         and bool(str(tags.get("compare", "")).strip())
@@ -216,6 +261,7 @@ def format_reward(parsed: Dict[str, Any], fmt_weights: Dict[str, float]) -> floa
     )
 
     components = {
+        "understand": understand_ok,
         "compare": compare_ok,
         "ground": ground_ok,
         "verify": verify_ok,
@@ -237,13 +283,28 @@ def compute_rewards(
     orig_wh: Tuple[int, int],
     is_anomaly: bool,
     cfg: dict,
+    prior_box: Optional[List[float]] = None,
 ) -> Dict[str, float]:
     rew_cfg = (cfg.get("grpo") or {}).get("reward") or {}
     # Paired convex weights: only one free parameter per pair.
-    w_dir = float(rew_cfg.get("reason_dir_weight", rew_cfg.get("w_dir", 0.70)))
+    w_dir = float(rew_cfg.get("reason_dir_weight", 0.70))
     w_progress = 1.0 - w_dir
-    w_dense_f = float(rew_cfg.get("final_dense_weight", rew_cfg.get("w_dense_f", 0.80)))
-    w_edge = 1.0 - w_dense_f
+    # R_final = final_iou_weight * IoU(B_f) + final_dense_weight * dense(B_f)
+    #           + final_edge_weight * edge.
+    # Raw IoU is the only plateau-free term; including it forces B_f to be
+    # genuinely refined instead of copied from B_c. The three weights are
+    # normalized to a convex combination so R_final stays in [0, 1].
+    w_iou_f = float(rew_cfg.get("final_iou_weight", 0.40))
+    w_dense_f = float(rew_cfg.get("final_dense_weight", 0.50))
+    w_edge = float(rew_cfg.get("final_edge_weight", 0.10))
+    _wf = max(w_iou_f, 0.0) + max(w_dense_f, 0.0) + max(w_edge, 0.0)
+    if _wf <= 0.0:
+        w_iou_f, w_dense_f, w_edge = 0.4, 0.5, 0.1
+    else:
+        w_iou_f = max(w_iou_f, 0.0) / _wf
+        w_dense_f = max(w_dense_f, 0.0) / _wf
+        w_edge = max(w_edge, 0.0) / _wf
+    dense_scale_gamma = float(rew_cfg.get("dense_scale_gamma", 2.0))
     beta = float(rew_cfg.get("edge_beta", 8.0))
     keep_tol = float(rew_cfg.get("keep_tol_norm1000", 8.0))
     r_ok = float(rew_cfg.get("normal_correct", 1.0))
@@ -251,20 +312,14 @@ def compute_rewards(
     r_invalid = float(rew_cfg.get("invalid_output", -1.0))
     edge_min_frac = float(rew_cfg.get("edge_min_frac", 0.05))
     large_box_area_thresh = float(rew_cfg.get("large_box_area_thresh", 0.80))
-    fmt_weights = rew_cfg.get("format_weights") or {
-        "compare": 0.2,
-        "ground": 0.3,
-        "verify": 0.2,
-        "answer": 0.3,
-    }
+    h_anchor_weight = float(rew_cfg.get("h_anchor_weight", 0.15))
+    fmt_weights = rew_cfg.get("format_weights") or DEFAULT_FORMAT_WEIGHTS
 
     pred_cls = parsed.get("is_anomaly")
     protocol_ok = bool(parsed.get("has_tags", False))
     traj_ok = bool(parsed.get("trajectory_valid", False))
     cand_state = parsed.get("candidate_bbox_state")
     cand = parsed.get("candidate_bbox_2d")
-    if cand is None:
-        cand = parsed.get("candidate_bbox")
     final_box = parsed.get("bbox_2d")
     cand_px = _to_px(cand, orig_wh)
     final_px = _to_px(final_box, orig_wh)
@@ -305,13 +360,15 @@ def compute_rewards(
         r_dense_f: float = 0.0,
         delta_dense: float = 0.0,
         r_fmt: float = 0.0,
+        h_anchor: float = 0.0,
+        h_follow: float = 0.0,
+        h_override: float = 0.0,
         d_star: Optional[dict] = None,
     ) -> Dict[str, Any]:
         return {
             "R_ground": float(r_ground),
             "R_reason": float(r_reason),
             "R_final": float(r_final),
-            "R": float(r_final),
             "R_cov": float(r_cov),
             "R_iou_c": float(r_iou_c),
             "R_dir": float(r_dir),
@@ -324,6 +381,9 @@ def compute_rewards(
             "R_dense_f": float(r_dense_f),
             "delta_dense": float(delta_dense),
             "R_fmt": float(r_fmt),
+            "h_anchor": float(h_anchor),
+            "h_follow": float(h_follow),
+            "h_override": float(h_override),
             "candidate_area_ratio": float(cand_area_ratio),
             "final_area_ratio": float(final_area_ratio),
             "pred_gt_area_ratio": float(pred_gt_area_ratio),
@@ -331,17 +391,31 @@ def compute_rewards(
             "full_image_final": float(full_image_final),
             "pred_box_px": final_px,
             "cand_box_px": cand_px,
-            "pred_cls": pred_cls,
+            "pred_is_anomaly": pred_cls,
             "protocol_ok": bool(protocol_ok),
             "trajectory_valid": bool(traj_ok),
             "d_star": d_star or {},
         }
 
     if not is_anomaly:
+        # Normal samples have no GT localization target; the supervision is
+        # asymmetric: classify correctly AND reject any localized proposal.
+        # A degenerate full-image candidate is still a false-positive proposal
+        # and must be penalized, otherwise the model can earn the full normal
+        # reward by just answering false while proposing the whole image.
         if pred_cls is True:
             r_final = r_wrong
         elif pred_cls is False and traj_ok:
-            r_final = r_ok
+            if cand_state == "null":
+                # Correct and directly decided: no suspicious proposal at all.
+                r_final = r_ok
+            elif full_image_cand > 0.5:
+                # Degenerate full-image candidate on a normal image.
+                r_final = r_invalid
+            else:
+                # A reasonable localized candidate was proposed then rejected
+                # by verification: this is the desired rejection reasoning.
+                r_final = r_ok
         else:
             r_final = r_invalid
 
@@ -375,11 +449,30 @@ def compute_rewards(
     r_cov = box_coverage(cand_px, gt_box_px) if cand_ok else 0.0
     r_iou_c = box_iou(cand_px, gt_box_px) if cand_ok else 0.0
     r_dense_c = (
-        dense_geometry_reward(cand_px, gt_box_px, orig_wh)
+        dense_geometry_reward(cand_px, gt_box_px, orig_wh, gamma=dense_scale_gamma)
         if cand_ok
         else 0.0
     )
     r_ground = float(r_dense_c) if cand_ok else 0.0
+    # H anchoring: only shapes the candidate in the zero-IoU dead zone. Damped by
+    # (1 - R_dense_c) so it fades out as soon as the candidate overlaps GT — GT
+    # truth always dominates, so a wrong H cannot drag a correct box away.
+    h_anchor = h_anchor_reward(cand, prior_box) if cand_ok else 0.0
+    if cand_ok:
+        r_ground = r_ground + h_anchor_weight * (1.0 - r_dense_c) * h_anchor
+
+    # Monitoring: did the candidate follow H, and did verify refine beyond it?
+    h_follow = 0.0
+    if cand is not None and prior_box is not None:
+        cx, cy = box_center(cand)
+        px1, py1, px2, py2 = prior_box
+        if px1 <= cx <= px2 and py1 <= cy <= py2:
+            h_follow = 1.0
+    h_override = 0.0
+    if final_px is not None and cand_px is not None:
+        iou_f_now = box_iou(final_px, gt_box_px)
+        if iou_f_now > r_iou_c + 1e-6:
+            h_override = 1.0
 
     d_star: Dict[str, str] = {}
     r_dir = 0.0
@@ -391,7 +484,7 @@ def compute_rewards(
         r_dir = sum(1 for k in EDGE_KEYS if d_pred.get(k) == d_star.get(k)) / 4.0
 
     r_dense_f = (
-        dense_geometry_reward(final_px, gt_box_px, orig_wh)
+        dense_geometry_reward(final_px, gt_box_px, orig_wh, gamma=dense_scale_gamma)
         if final_px is not None
         else 0.0
     )
@@ -412,7 +505,7 @@ def compute_rewards(
     else:
         r_iou = iou_f_diag
         r_edge = edge_precision_reward(final_px, gt_box_px, orig_wh, beta, min_frac=edge_min_frac)
-        r_final = w_dense_f * r_dense_f + w_edge * r_edge
+        r_final = w_iou_f * r_iou + w_dense_f * r_dense_f + w_edge * r_edge
 
     delta_iou = float(iou_f_diag - r_iou_c)
 
@@ -432,5 +525,8 @@ def compute_rewards(
         r_dense_f=float(r_dense_f),
         delta_dense=float(delta_dense),
         r_fmt=r_fmt,
+        h_anchor=h_anchor,
+        h_follow=h_follow,
+        h_override=h_override,
         d_star=d_star,
     )

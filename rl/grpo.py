@@ -10,11 +10,8 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
+from models.qwen35 import unwrap_model
 from reasoning.segments import completion_segment_ids, mix_segment_advantage
-
-
-def unwrap_model(m):
-    return m.module if hasattr(m, "module") else m
 
 
 def move_batch(batch: dict, device: torch.device) -> dict:
@@ -267,8 +264,12 @@ def grpo_param_map(gcfg: dict, *, lr: float, accum: int, group: int, temperature
         "min_reward_std": float(gcfg.get("min_reward_std", 0.02)),
         "max_resample_attempts": float(gcfg.get("max_resample_attempts", 2)),
         "epochs": float(gcfg.get("epochs", 2)),
-        "reason_dir_weight": float(rew.get("reason_dir_weight", rew.get("w_dir", 0.70))),
-        "final_dense_weight": float(rew.get("final_dense_weight", rew.get("w_dense_f", 0.80))),
+        "reason_dir_weight": float(rew.get("reason_dir_weight", 0.70)),
+        "final_dense_weight": float(rew.get("final_dense_weight", 0.50)),
+        "final_iou_weight": float(rew.get("final_iou_weight", 0.40)),
+        "final_edge_weight": float(rew.get("final_edge_weight", 0.10)),
+        "dense_scale_gamma": float(rew.get("dense_scale_gamma", 2.0)),
+        "h_anchor_weight": float(rew.get("h_anchor_weight", 0.15)),
         "edge_beta": float(rew.get("edge_beta", 8.0)),
         "keep_tol_norm1000": float(rew.get("keep_tol_norm1000", 8.0)),
         "large_box_area_thresh": float(rew.get("large_box_area_thresh", 0.80)),

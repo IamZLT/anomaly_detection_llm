@@ -3,6 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -11,7 +18,7 @@ from PIL import Image, ImageDraw, ImageFont
 from torch.utils.tensorboard import SummaryWriter
 
 from utils.common import qwen_norm1000_to_original_pixels
-from reasoning.parser import parse_cot_output, rollout_protocol_stats
+from reasoning.parser import parse_cot_output, parse_cot_output_task, rollout_protocol_stats
 
 
 def _font(size: int = 16):
@@ -264,8 +271,6 @@ def _render_case(
     if parsed.get("bbox_2d") is not None:
         pred_px = qwen_norm1000_to_original_pixels(parsed["bbox_2d"], orig)
     cand_box = parsed.get("candidate_bbox_2d")
-    if cand_box is None:
-        cand_box = parsed.get("candidate_bbox")
     if cand_box is not None:
         cand_px = qwen_norm1000_to_original_pixels(cand_box, orig)
     gt = meta.get("gt_box_px")
@@ -432,23 +437,34 @@ def log_grpo_scalars(
     opt_step: Optional[int] = None,
     is_anomaly: Optional[bool] = None,
     extra: Optional[Dict[str, float]] = None,
+    strict_stats: Optional[Dict[str, float]] = None,
+    task_stats: Optional[Dict[str, float]] = None,
 ) -> None:
     """Write the small GRPO dashboard (same x-axis). Config lives in grpo/0_config text."""
     if writer is None:
         return
-    _ = (params, opt_step, is_anomaly, seq_lp, advantages)
+    _ = (params, opt_step, seq_lp, advantages)
     r = rewards.detach().float().cpu()
     n = max(len(details), 1)
     mean = lambda k: float(sum(float(d.get(k, 0.0)) for d in details) / n)
-    proto = rollout_protocol_stats([parse_cot_output(t) for t in texts], texts)
+    strict_proto = strict_stats or rollout_protocol_stats(
+        [parse_cot_output(t) for t in texts], texts
+    )
+    task_proto = task_stats or rollout_protocol_stats(
+        [parse_cot_output_task(t) for t in texts], texts
+    )
     extra = extra or {}
 
     writer.add_scalar("grpo/loss", float(loss), step)
     writer.add_scalar("grpo/lr", float(lr), step)
     if grad_norm is not None:
         writer.add_scalar("grpo/grad_norm", float(grad_norm), step)
+    kl_raw = float(extra.get("loss_kl", extra.get("kl", 0.0)))
+    kl_beta = float(extra.get("kl_beta", 1.0e-4))
     writer.add_scalar("grpo/pg_loss", float(extra.get("loss_pg", extra.get("pg_loss", 0.0))), step)
-    writer.add_scalar("grpo/kl", float(extra.get("loss_kl", extra.get("kl", 0.0))), step)
+    writer.add_scalar("grpo/kl", kl_raw, step)
+    writer.add_scalar("grpo/kl_contrib", kl_beta * kl_raw, step)
+    writer.add_scalar("grpo/ref_gap", float(extra.get("ref_gap", 0.0)), step)
     writer.add_scalar("grpo/rho", float(extra.get("rho_mean", extra.get("rho", 1.0))), step)
     writer.add_scalar("grpo/clip_frac", float(extra.get("clip_frac", 0.0)), step)
 
@@ -481,26 +497,77 @@ def log_grpo_scalars(
     )
     writer.add_scalar("grpo/full_image_box_rate", full_image_box_rate, step)
 
-    writer.add_scalar("grpo/protocol_rate", float(proto.get("protocol_rate", 0.0)), step)
-    writer.add_scalar("grpo/trajectory_valid_rate", float(proto.get("trajectory_valid_rate", 0.0)), step)
-    writer.add_scalar("grpo/candidate_valid_rate", float(proto.get("candidate_valid_rate", 0.0)), step)
-    writer.add_scalar("grpo/final_valid_rate", float(proto.get("final_valid_rate", 0.0)), step)
-    writer.add_scalar("grpo/box_pair_valid_rate", float(proto.get("box_pair_valid_rate", 0.0)), step)
-    writer.add_scalar("grpo/unique_response_rate", float(proto.get("unique_response_rate", 0.0)), step)
+    writer.add_scalar("grpo/h_anchor", mean("h_anchor"), step)
+    writer.add_scalar("grpo/h_follow_rate", mean("h_follow"), step)
+    writer.add_scalar("grpo/h_override_rate", mean("h_override"), step)
+
+    # Dual parser observability (strict vs task-semantic).
+    writer.add_scalar(
+        "protocol/strict_trajectory_rate",
+        float(extra.get("strict_trajectory_rate", strict_proto.get("trajectory_valid_rate", 0.0))),
+        step,
+    )
+    writer.add_scalar(
+        "protocol/task_trajectory_rate",
+        float(extra.get("task_trajectory_rate", task_proto.get("trajectory_valid_rate", 0.0))),
+        step,
+    )
+    writer.add_scalar(
+        "protocol/strict_answer_rate",
+        float(extra.get("strict_answer_rate", strict_proto.get("protocol_rate", 0.0))),
+        step,
+    )
+    writer.add_scalar(
+        "protocol/task_answer_rate",
+        float(extra.get("task_answer_rate", 0.0)),
+        step,
+    )
+    writer.add_scalar(
+        "protocol/strict_final_valid_rate",
+        float(extra.get("strict_final_valid_rate", strict_proto.get("final_valid_rate", 0.0))),
+        step,
+    )
+    writer.add_scalar(
+        "protocol/task_final_valid_rate",
+        float(extra.get("task_final_valid_rate", task_proto.get("final_valid_rate", 0.0))),
+        step,
+    )
+
+    # Keep legacy names for continuity; they remain strict-parser based.
+    writer.add_scalar("grpo/protocol_rate", float(strict_proto.get("protocol_rate", 0.0)), step)
+    writer.add_scalar("grpo/trajectory_valid_rate", float(strict_proto.get("trajectory_valid_rate", 0.0)), step)
+    writer.add_scalar("grpo/candidate_valid_rate", float(task_proto.get("candidate_valid_rate", 0.0)), step)
+    writer.add_scalar("grpo/final_valid_rate", float(strict_proto.get("final_valid_rate", 0.0)), step)
+    writer.add_scalar("grpo/box_pair_valid_rate", float(strict_proto.get("box_pair_valid_rate", 0.0)), step)
+    writer.add_scalar("grpo/unique_response_rate", float(strict_proto.get("unique_response_rate", 0.0)), step)
     writer.add_scalar("grpo/resample_n", float(extra.get("resample", extra.get("resample_n", 0.0))), step)
     writer.add_scalar("grpo/skip_rate", float(extra.get("skipped", extra.get("skip_rate", 0.0))), step)
+
+    # Split spatial vs classification curves by GT class of the current step.
+    if is_anomaly is True:
+        writer.add_scalar("grpo_anomaly/R_ground", mean("R_ground"), step)
+        writer.add_scalar("grpo_anomaly/R_dense_c", mean("R_dense_c"), step)
+        writer.add_scalar("grpo_anomaly/R_dense_f", mean("R_dense_f"), step)
+        writer.add_scalar("grpo_anomaly/raw_iou_c", mean("raw_iou_c"), step)
+        writer.add_scalar("grpo_anomaly/raw_iou_f", mean("raw_iou_f"), step)
+        writer.add_scalar("grpo_anomaly/pred_gt_area_ratio", mean("pred_gt_area_ratio"), step)
+        writer.add_scalar("grpo_anomaly/full_image_box_rate", full_image_box_rate, step)
+        writer.add_scalar("grpo_anomaly/h_anchor", mean("h_anchor"), step)
+        writer.add_scalar("grpo_anomaly/h_follow_rate", mean("h_follow"), step)
+        writer.add_scalar("grpo_anomaly/h_override_rate", mean("h_override"), step)
+    elif is_anomaly is False:
+        writer.add_scalar("grpo_normal/R_final", mean("R_final"), step)
+        pred_normal_rate = float(
+            sum(1 for d in details if d.get("pred_is_anomaly") is False) / n
+        )
+        writer.add_scalar("grpo_normal/pred_normal_rate", pred_normal_rate, step)
+        writer.add_scalar(
+            "grpo_normal/task_trajectory_rate",
+            float(extra.get("task_trajectory_rate", task_proto.get("trajectory_valid_rate", 0.0))),
+            step,
+        )
+
     writer.flush()
-
-
-
-import os
-import re
-import shutil
-import signal
-import socket
-import subprocess
-import time
-from typing import Optional as _Optional
 
 
 def tensorboard_event_dir(output_dir: str) -> str:

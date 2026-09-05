@@ -1,0 +1,43 @@
+{
+  "n": 2,
+  "n_anomaly": 2,
+  "n_normal": 0,
+  "task_valid_rate": 1.0,
+  "protocol_valid_rate": 0.5,
+  "anomaly_recall": 1.0,
+  "normal_fpr": null,
+  "normal_correct_rate": null,
+  "invalid_decision_rate": 0.0,
+  "balanced_accuracy": null,
+  "anomaly_gated_miou": 0.0,
+  "acc_at_05": 0.0,
+  "truncation_rate": 0.0,
+  "mean_new_tokens": 245.5,
+  "mean_seconds": 13.736836241499986,
+  "mean_candidate_to_final_delta": -0.01547996818813284,
+  "n_small": 2,
+  "miou_small": 0.0,
+  "n_medium": 0,
+  "miou_medium": null,
+  "n_large": 0,
+  "miou_large": null,
+  "mean_image_count": 2.0,
+  "mean_prompt_tokens": 952.5,
+  "mean_visual_tokens": 352.0,
+  "mean_prior_hint_tokens": 274.5,
+  "per_class": {
+    "pcb3": {
+      "n": 1,
+      "n_anomaly": 1,
+      "miou": 0.0,
+      "normal_fpr": null
+    },
+    "pipe_fryum": {
+      "n": 1,
+      "n_anomaly": 1,
+      "miou": 0.0,
+      "normal_fpr": null
+    }
+  },
+  "macro_miou": 0.0
+}

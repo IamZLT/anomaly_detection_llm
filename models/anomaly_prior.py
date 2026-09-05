@@ -108,6 +108,65 @@ def overlay_heatmap_on_image(image: Image.Image, heatmap: torch.Tensor, alpha: f
     return Image.blend(image.convert("RGB"), heat, alpha=float(np.clip(alpha, 0.0, 1.0)))
 
 
+def prior_box_from_heatmap(
+    anomaly: torch.Tensor,
+    thresh_frac: float = 0.5,
+    min_area_frac: float = 0.0,
+) -> Optional[List[float]]:
+    """Fused anomaly patch map [H,W] → largest connected component bbox in 0-1000.
+
+    The fused map `anomaly` is a per-patch distance map (higher = more anomalous).
+    We threshold it at a fraction of its own range, keep the largest connected
+    component, and return its bounding box mapped into the Qwen 0-1000 system as
+    [x1, y1, x2, y2]. Returns None when the map is flat or the component is too small.
+
+    This box is a *coarse hint* used for candidate anchoring (R_ground) only; it is
+    never treated as a defect label.
+    """
+    from scipy import ndimage as ndi
+
+    if anomaly is None:
+        return None
+    if anomaly.ndim == 3:
+        anomaly = anomaly.squeeze(0)
+    x = anomaly.detach().float()
+    ht, wt = int(x.shape[0]), int(x.shape[1])
+    if ht <= 0 or wt <= 0:
+        return None
+    lo, hi = float(x.min()), float(x.max())
+    if hi - lo < 1e-8:
+        return None
+    thresh = lo + (hi - lo) * float(max(0.0, min(1.0, thresh_frac)))
+    mask = (x >= thresh).cpu().numpy()
+    labeled, n = ndi.label(mask)
+    if n <= 0:
+        return None
+    sizes = ndi.sum(mask, labeled, range(1, n + 1))
+    best = int(sizes.argmax()) + 1
+    ys, xs = np.nonzero(labeled == best)
+    if int(xs.size) == 0:
+        return None
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    frac = float((x1 - x0 + 1) * (y1 - y0 + 1)) / float(ht * wt)
+    if frac < float(max(0.0, min_area_frac)):
+        return None
+
+    qx0 = int(round((x0 + 0.5) / float(wt) * 1000.0))
+    qy0 = int(round((y0 + 0.5) / float(ht) * 1000.0))
+    qx1 = int(round((x1 + 0.5) / float(wt) * 1000.0))
+    qy1 = int(round((y1 + 0.5) / float(ht) * 1000.0))
+    qx0, qx1 = min(qx0, qx1), max(qx0, qx1)
+    qy0, qy1 = min(qy0, qy1), max(qy0, qy1)
+    qx0 = max(0, min(1000, qx0))
+    qy0 = max(0, min(1000, qy0))
+    qx1 = max(0, min(1000, qx1))
+    qy1 = max(0, min(1000, qy1))
+    if qx1 <= qx0 or qy1 <= qy0:
+        return None
+    return [float(qx0), float(qy0), float(qx1), float(qy1)]
+
+
 class AnomalyPrior(nn.Module):
     """Frozen vision encoder → H from layers 12/16/20/24, plus merger tokens V_r, V_t."""
 
@@ -126,6 +185,8 @@ class AnomalyPrior(nn.Module):
         )
         self.hint_topk = int(prior_cfg.get("hint_topk", 5))
         self.hint_nms_radius = int(prior_cfg.get("hint_nms_radius", 2))
+        self.prior_box_thresh = float(prior_cfg.get("prior_box_thresh", 0.5))
+        self.prior_box_min_area = float(prior_cfg.get("prior_box_min_area", 0.0))
 
         for p in self.visual.parameters():
             p.requires_grad = False
@@ -255,6 +316,11 @@ class AnomalyPrior(nn.Module):
         if upsample_size is not None:
             heatmap = F.interpolate(heatmap, size=upsample_size, mode="bilinear", align_corners=False)
         prior_points = topk_spatial_points(anomaly, k=self.hint_topk, nms_radius=self.hint_nms_radius)
+        prior_box = prior_box_from_heatmap(
+            anomaly,
+            thresh_frac=self.prior_box_thresh,
+            min_area_frac=self.prior_box_min_area,
+        )
         return {
             "heatmap": heatmap.squeeze(0).squeeze(0),
             "patch_map": anomaly,
@@ -264,6 +330,7 @@ class AnomalyPrior(nn.Module):
             "test_merged": v_t,
             "merged_embeddings": torch.cat([v_r, v_t], dim=0),
             "prior_points": prior_points,
+            "prior_box": prior_box,
         }
 
     @torch.no_grad()
@@ -289,34 +356,3 @@ class AnomalyPrior(nn.Module):
             image_grid_thw[1:2],
             upsample_size=upsample_size,
         )
-
-    @torch.no_grad()
-    def heatmap_image(
-        self,
-        processor,
-        ref_image: Image.Image,
-        test_image: Image.Image,
-        device: torch.device,
-        render: str = "colormap",
-        overlay_alpha: float = 0.45,
-    ) -> Tuple[Image.Image, torch.Tensor]:
-        """Encode two PIL images with the Qwen processor and return a prior RGB image."""
-        img_proc = getattr(processor, "image_processor", processor)
-        ref_enc = img_proc(images=ref_image, return_tensors="pt")
-        test_enc = img_proc(images=test_image, return_tensors="pt")
-        pv_r = ref_enc["pixel_values"].to(device)
-        pv_t = test_enc["pixel_values"].to(device)
-        g_r = ref_enc.get("image_grid_thw")
-        g_t = test_enc.get("image_grid_thw")
-        if g_r is None or g_t is None:
-            raise KeyError(f"image_grid_thw missing; keys={list(ref_enc.keys())}")
-        g_r = g_r.to(device)
-        g_t = g_t.to(device)
-        th, tw = test_image.size[1], test_image.size[0]
-        out = self.forward(pv_r, g_r, pv_t, g_t, upsample_size=(th, tw))
-        hmap = out["heatmap"]
-        if render == "overlay":
-            vis = overlay_heatmap_on_image(test_image, hmap, alpha=overlay_alpha)
-        else:
-            vis = heatmap_to_pil(hmap, test_image.size)
-        return vis, hmap

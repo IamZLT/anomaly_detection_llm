@@ -6,32 +6,39 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Sequence
 
+from reasoning.rewards import valid_bbox_1000
+
 BOX_STATE_BOX = "box"
 BOX_STATE_NULL = "null"
 BOX_STATE_MISSING = "missing"
 BOX_STATE_INVALID = "invalid"
-TAG_NAMES = ("compare", "ground", "verify", "answer")
+TAG_NAMES = ("understand", "compare", "ground", "verify", "answer")
 ANSWER_JSON_KEYS = frozenset({"is_anomaly", "bbox_2d", "description"})
 _COPY_MARKERS = (
     "return exactly five",
     "return exactly four",
     "do not copy",
     "xml blocks",
+    "required structure",
     "output exactly one json",
     "candidate_bbox_2d=[x1,y1,x2,y2]",
     "only spatial hints",
     "not defect labels",
     "high_response_points_2d",
-    "one concise sentence describing the defect",
-    "one concise sentence stating that no clear defect",
+    "write an image-specific",
+    "write candidate_bbox_2d first",
+    "write reference-based verification",
+    "write the final json",
+    "one sentence describing the suspicious region",
+    "one sentence verifying the candidate",
+    "1-2 sentences comparing concrete visual differences",
 )
 ANSWER_DESC_MIN_CHARS = 24
 TAG_BLOCK_RE = re.compile(
-    r"<(compare|ground|verify|answer)\s*>(.*?)</\1>",
+    r"<(understand|compare|ground|verify|answer)\s*>(.*?)</\1>",
     re.IGNORECASE | re.DOTALL,
 )
 _BARE_BOX_RE = re.compile(r"\[\s*(-?\d+(?:\.\d+)?\s*,\s*){3}-?\d+(?:\.\d+)?\s*\]")
-_FINAL_CLS_RE = re.compile(r"is_anomaly\s*[:=]\s*(true|false)", re.IGNORECASE)
 
 
 def strip_think(text: str) -> str:
@@ -91,23 +98,6 @@ def parse_bbox(v) -> Optional[List[float]]:
         except (TypeError, ValueError):
             return None
     return None
-
-
-def parse_final_decision(answer: str) -> Optional[bool]:
-    m = _FINAL_CLS_RE.search(answer or "")
-    if not m:
-        return None
-    return m.group(1).lower() == "true"
-
-
-def _valid_bbox_1000(box) -> bool:
-    if box is None or not isinstance(box, (list, tuple)) or len(box) != 4:
-        return False
-    try:
-        x1, y1, x2, y2 = map(float, box)
-    except (TypeError, ValueError):
-        return False
-    return 0.0 <= x1 < x2 <= 1000.0 and 0.0 <= y1 < y2 <= 1000.0
 
 
 def parse_bbox_field(text: str, field_name: str) -> tuple:
@@ -223,7 +213,8 @@ def _trajectory_valid(
 ) -> bool:
     pred_cls = answer.get("is_anomaly")
     prose_ok = (
-        structural_prose_ok(tags.get("compare", ""))
+        structural_prose_ok(tags.get("understand", ""))
+        and structural_prose_ok(tags.get("compare", ""))
         and structural_prose_ok(tags.get("ground", ""))
         and structural_prose_ok(tags.get("verify", ""))
     )
@@ -233,7 +224,7 @@ def _trajectory_valid(
             candidate_state == BOX_STATE_NULL
             or (
                 candidate_state == BOX_STATE_BOX
-                and _valid_bbox_1000(candidate_bbox)
+                and valid_bbox_1000(candidate_bbox)
             )
         )
 
@@ -251,10 +242,10 @@ def _trajectory_valid(
             and prose_ok
             and desc_ok
             and candidate_state == BOX_STATE_BOX
-            and _valid_bbox_1000(candidate_bbox)
+            and valid_bbox_1000(candidate_bbox)
             and answer.get("answer_state") == "ok"
             and answer.get("final_bbox_state") == BOX_STATE_BOX
-            and _valid_bbox_1000(answer.get("bbox_2d"))
+            and valid_bbox_1000(answer.get("bbox_2d"))
         )
     return False
 
@@ -284,7 +275,6 @@ def _pack_parsed(
         "has_tags": has_tags,
         "format_ok": bool(has_tags),
         "candidate_bbox_2d": cand,
-        "candidate_bbox": cand,
         "candidate_bbox_state": candidate_state,
         "is_anomaly": answer.get("is_anomaly"),
         "bbox_2d": answer.get("bbox_2d"),
@@ -293,7 +283,8 @@ def _pack_parsed(
         "description_ok": _answer_description_ok(answer),
         "final_bbox_state": answer.get("final_bbox_state"),
         "answer_state": answer.get("answer_state"),
-        "prose_ok": structural_prose_ok(tags.get("compare", ""))
+        "prose_ok": structural_prose_ok(tags.get("understand", ""))
+        and structural_prose_ok(tags.get("compare", ""))
         and structural_prose_ok(tags.get("ground", ""))
         and structural_prose_ok(tags.get("verify", "")),
         "trajectory_valid": _trajectory_valid(
@@ -324,18 +315,18 @@ def rollout_protocol_stats(parsed_list: Sequence[dict], texts: Optional[Sequence
         "candidate_box_rate": rate(lambda p: p.get("candidate_bbox_state") == BOX_STATE_BOX),
         "candidate_valid_rate": rate(
             lambda p: p.get("candidate_bbox_state") == BOX_STATE_BOX
-            and _valid_bbox_1000(p.get("candidate_bbox_2d") or p.get("candidate_bbox"))
+            and valid_bbox_1000(p.get("candidate_bbox_2d"))
         ),
         "final_box_rate": rate(lambda p: p.get("final_bbox_state") == BOX_STATE_BOX),
         "final_valid_rate": rate(
-            lambda p: p.get("final_bbox_state") == BOX_STATE_BOX and _valid_bbox_1000(p.get("bbox_2d"))
+            lambda p: p.get("final_bbox_state") == BOX_STATE_BOX and valid_bbox_1000(p.get("bbox_2d"))
         ),
         "box_pair_valid_rate": rate(
             lambda p: p.get("is_anomaly") is True
             and p.get("candidate_bbox_state") == BOX_STATE_BOX
-            and _valid_bbox_1000(p.get("candidate_bbox_2d") or p.get("candidate_bbox"))
+            and valid_bbox_1000(p.get("candidate_bbox_2d"))
             and p.get("final_bbox_state") == BOX_STATE_BOX
-            and _valid_bbox_1000(p.get("bbox_2d"))
+            and valid_bbox_1000(p.get("bbox_2d"))
         ),
         "normal_null_consistency_rate": rate(
             lambda p: p.get("is_anomaly") is False
@@ -349,7 +340,7 @@ def rollout_protocol_stats(parsed_list: Sequence[dict], texts: Optional[Sequence
         "normal_candidate_rejection_rate": rate(
             lambda p: p.get("is_anomaly") is False
             and p.get("candidate_bbox_state") == BOX_STATE_BOX
-            and _valid_bbox_1000(p.get("candidate_bbox_2d"))
+            and valid_bbox_1000(p.get("candidate_bbox_2d"))
             and p.get("final_bbox_state") == BOX_STATE_NULL
         ),
     }
@@ -404,105 +395,3 @@ def parse_cot_output_task(text: str) -> Dict[str, Any]:
         answer=answer,
         strict=False,
     )
-
-
-def parse_cot_output_tolerant(text: str) -> Dict[str, Any]:
-    """Demo / legacy fallback: also search whole text and JSON if tags are missing."""
-    raw = strip_think(text)
-    tags = extract_tag_blocks_tolerant(raw)
-    ground_txt = tags.get("ground", "")
-    answer_txt = tags.get("answer", "")
-    json_obj: Dict[str, Any] = {}
-    if not tags:
-        try:
-            obj = json.loads(raw)
-            if isinstance(obj, list) and obj and isinstance(obj[0], dict):
-                obj = obj[0]
-            if isinstance(obj, dict):
-                json_obj = obj
-        except Exception:
-            m = re.search(r"\{.*\}", raw, re.DOTALL)
-            if m:
-                try:
-                    obj = json.loads(m.group(0))
-                    if isinstance(obj, dict):
-                        json_obj = obj
-                except Exception:
-                    json_obj = {}
-
-    candidate_state, candidate_bbox = parse_bbox_field(ground_txt, "candidate_bbox_2d")
-    if candidate_state == BOX_STATE_MISSING:
-        candidate_state, candidate_bbox = parse_bbox_field(ground_txt, "candidate_bbox")
-    if candidate_state == BOX_STATE_MISSING and json_obj:
-        if "candidate_bbox_2d" in json_obj or "candidate_bbox" in json_obj or "bbox_c" in json_obj:
-            raw_c = json_obj.get("candidate_bbox_2d", json_obj.get("candidate_bbox", json_obj.get("bbox_c")))
-            if raw_c is None:
-                candidate_state, candidate_bbox = BOX_STATE_NULL, None
-            else:
-                box = parse_bbox(raw_c)
-                candidate_state = BOX_STATE_BOX if box is not None else BOX_STATE_INVALID
-                candidate_bbox = box
-
-    answer = parse_answer_block(answer_txt)
-    if answer["answer_state"] != "ok":
-        pred = parse_final_decision(answer_txt)
-        st, box = parse_bbox_field(answer_txt, "bbox_2d")
-        if st == BOX_STATE_MISSING:
-            st, box = parse_bbox_field(answer_txt, "bbox")
-        if pred is not None or st != BOX_STATE_MISSING:
-            answer = {
-                "answer_state": "ok" if pred is not None else BOX_STATE_INVALID,
-                "is_anomaly": pred,
-                "final_bbox_state": st,
-                "bbox_2d": box if st == BOX_STATE_BOX else None,
-                "description": None,
-                "description_state": BOX_STATE_MISSING,
-            }
-    if answer["answer_state"] != "ok" and json_obj:
-        pred = json_obj.get("is_anomaly")
-        if not isinstance(pred, bool):
-            pred = parse_final_decision(str(pred)) if pred is not None else None
-            if pred is None and str(json_obj.get("label", "")).lower() == "normal":
-                pred = False
-        if "bbox_2d" in json_obj:
-            if json_obj["bbox_2d"] is None:
-                st, box = BOX_STATE_NULL, None
-            else:
-                box = parse_bbox(json_obj["bbox_2d"])
-                st = BOX_STATE_BOX if box is not None else BOX_STATE_INVALID
-        elif "bbox" in json_obj:
-            if json_obj["bbox"] is None:
-                st, box = BOX_STATE_NULL, None
-            else:
-                box = parse_bbox(json_obj["bbox"])
-                st = BOX_STATE_BOX if box is not None else BOX_STATE_INVALID
-        else:
-            st, box = BOX_STATE_MISSING, None
-        desc = json_obj.get("description")
-        if not isinstance(desc, str):
-            desc = None
-            desc_state = BOX_STATE_MISSING if "description" not in json_obj else BOX_STATE_INVALID
-        else:
-            desc_state = "ok"
-        if pred is not None or st != BOX_STATE_MISSING:
-            answer = {
-                "answer_state": "ok" if pred is not None else BOX_STATE_INVALID,
-                "is_anomaly": pred,
-                "final_bbox_state": st,
-                "bbox_2d": box if st == BOX_STATE_BOX else None,
-                "description": desc,
-                "description_state": desc_state,
-            }
-
-    packed = _pack_parsed(
-        raw=raw,
-        tags=tags,
-        candidate_state=candidate_state,
-        candidate_bbox=candidate_bbox,
-        answer=answer,
-        strict=False,
-        extra={"label": json_obj.get("label") if json_obj else None},
-    )
-    if json_obj and not tags:
-        packed["raw"] = json_obj
-    return packed

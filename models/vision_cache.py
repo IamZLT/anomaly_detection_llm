@@ -13,11 +13,7 @@ from typing import Iterator, List, Optional, Sequence
 import torch
 import torch.nn.functional as F
 
-from models.qwen35 import unwrap_qwen_core
-
-
-def _unwrap_model(m):
-    return m.module if hasattr(m, "module") else m
+from models.qwen35 import unwrap_model, unwrap_qwen_core
 
 
 def topk_spatial_points(
@@ -91,7 +87,7 @@ def format_prior_hint(points: Sequence[Sequence[int]]) -> str:
 
 
 def _qwen_vl(model):
-    m = _unwrap_model(model)
+    m = unwrap_model(model)
     m = unwrap_qwen_core(m)
     return m
 

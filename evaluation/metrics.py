@@ -38,8 +38,6 @@ def box_ious_from_parsed(parsed: dict, meta: dict):
     if gt is not None:
         pred = parsed.get("bbox_2d")
         cand = parsed.get("candidate_bbox_2d")
-        if cand is None:
-            cand = parsed.get("candidate_bbox")
         if valid_bbox_1000(pred):
             iou_f = box_iou(qwen1000_to_pixels_strict(pred, orig), gt)
         if valid_bbox_1000(cand):
@@ -62,18 +60,18 @@ def _mean(xs: Sequence[float]) -> float:
 
 
 def summarize_detection_metrics(rows: List[dict]) -> Dict[str, float]:
-    """rows: is_anomaly, pred_cls, class_name, iou_f, iou_c, a_gt, rec_ok, trajectory_valid."""
+    """rows: is_anomaly, pred_is_anomaly, class_name, iou_f, iou_c, a_gt, rec_ok, trajectory_valid."""
     n = max(len(rows), 1)
     rec = sum(1 for r in rows if r.get("rec_ok"))
     anom = [r for r in rows if r.get("is_anomaly")]
     raw_ious = [float(r.get("iou_f") or 0.0) for r in anom]
     gated_ious = [
-        float(r.get("iou_f") or 0.0) if r.get("pred_cls") is True else 0.0
+        float(r.get("iou_f") or 0.0) if r.get("pred_is_anomaly") is True else 0.0
         for r in anom
     ]
     strict_gated_ious = [
         float(r.get("iou_f") or 0.0)
-        if (r.get("pred_cls") is True and r.get("trajectory_valid"))
+        if (r.get("pred_is_anomaly") is True and r.get("trajectory_valid"))
         else 0.0
         for r in anom
     ]
@@ -91,7 +89,7 @@ def summarize_detection_metrics(rows: List[dict]) -> Dict[str, float]:
         cls = str(r.get("class_name") or "_")
         b = str(r.get("size_bin") or defect_size_bin(float(r.get("a_gt") or 0.0), True))
         raw = float(r.get("iou_f") or 0.0)
-        gated = raw if r.get("pred_cls") is True else 0.0
+        gated = raw if r.get("pred_is_anomaly") is True else 0.0
         by_cls[cls].append(gated)
         by_bin[b].append(raw)
         by_bin_gated[b].append(gated)

@@ -1,0 +1,26 @@
+cd /data2/zlt/anomaly_detection_llm
+
+CUDA_VISIBLE_DEVICES=2,7 python train.py \
+  --config configs/qwen35_2b_grpo.yaml \
+  --num-gpu 2
+
+
+CUDA_VISIBLE_DEVICES=4 python train.py \
+  --config configs/qwen35_08b_grpo.yaml \
+  --num-gpu 1
+  CUDA_VISIBLE_DEVICES=3,4 python train.py --config configs/qwen35_2b_grpo.yaml --num-gpu 2
+CUDA_VISIBLE_DEVICES=4 python train.py --config configs/qwen35_2b_grpo.yaml --num-gpu 1
+
+CUDA_VISIBLE_DEVICES=4 python train.py \
+  --config configs/qwen35_08b_grpo.yaml \
+  --num-gpu 1
+
+
+  CUDA_VISIBLE_DEVICES=2 python train.py \
+  --config configs/qwen35_2b_grpo.yaml \
+  --num-gpu 1
+
+
+cd /data2/zlt/anomaly_detection_llm
+CUDA_VISIBLE_DEVICES=1 /home/zlt/miniconda3/bin/python train_outcome.py \
+  --config configs/qwen35_2b_outcome.yaml --mode eval --split dev

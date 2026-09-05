@@ -98,12 +98,12 @@ def unwrap_qwen_core(qwen: nn.Module) -> nn.Module:
     return qwen
 
 
-def _unwrap_maybe_ddp(model: nn.Module) -> nn.Module:
+def unwrap_model(model: nn.Module) -> nn.Module:
     return model.module if hasattr(model, "module") else model
 
 
 def _vision_modules(model: nn.Module) -> list:
-    m = _unwrap_maybe_ddp(model)
+    m = unwrap_model(model)
     candidates = []
     for name in ("visual", "vision_tower", "vision_model"):
         mod = getattr(m, name, None)
