@@ -9,6 +9,9 @@ from typing import Optional
 VERSION = 'outcome-v1'
 TAGS = ('understand', 'compare', 'ground', 'verify', 'answer')
 BLOCK = re.compile(r'<(understand|compare|ground|verify|answer)>(.*?)</\1>', re.S)
+CAND = re.compile(r'candidate_bbox_2d\s*=\s*(null|\[[^\[\]]*\])', re.I)
+VERIFY = re.compile(r'^\s*(keep|refine|reject|discover|none)\b\s*[;:,\-]?\s*(.*)$', re.I)
+VERIFY_ACTIONS = ('keep', 'refine', 'reject', 'discover', 'none')
 
 
 def valid_box(box, upper=1000.0):
@@ -34,57 +37,116 @@ def load_object(text):
     return obj
 
 
-def parse_output(text: str) -> dict:
-    """Final fields do not depend on rationale lengths or candidate correctness.
+def parse_candidate(text: str):
+    """Return (state, box) where state in {'box','null','missing','invalid'}.
 
-    Exactly one closed answer is required, with no trailing non-whitespace.
-    No recovery of truncated answers or ambiguous duplicate JSON fields.
+    The <ground> block is a single plain line: candidate_bbox_2d=[x1,y1,x2,y2]
+    or candidate_bbox_2d=null. Prose may surround it in lenient parsing.
     """
-    result = dict(task_valid=False, protocol_valid=False, decision_valid=False,
-                  final_geometry_valid=False, is_anomaly=None, bbox_2d=None,
-                  candidate_bbox_2d=None, description='', action=None, tags={})
+    m = CAND.search(text)
+    if not m:
+        return 'missing', None
+    raw = m.group(1).strip()
+    if raw.lower() == 'null':
+        return 'null', None
+    inner = raw[1:-1]
+    parts = [p.strip() for p in inner.split(',')]
+    if len(parts) != 4:
+        return 'invalid', None
+    try:
+        vals = [float(p) for p in parts]
+    except ValueError:
+        return 'invalid', None
+    if valid_box(vals):
+        return 'box', vals
+    return 'invalid', None
+
+
+def parse_verify(text: str):
+    """Return (action, evidence). Action is None when no known keyword found.
+
+    The <verify> block is 'action; evidence' (e.g. 'refine; tighten to the edge').
+    """
+    stripped = text.strip()
+    m = VERIFY.match(stripped)
+    if m:
+        return m.group(1).lower(), m.group(2).strip()
+    for action in VERIFY_ACTIONS:
+        if re.search(rf'\b{action}\b', text, re.I):
+            return action, stripped
+    return None, stripped
+
+
+def parse_output(text: str) -> dict:
+    """Parse the 5-block output. Only <answer> is strict JSON.
+
+    ``task_valid`` reflects only the final answer decision + geometry.
+    ``protocol_core`` is a lenient structural check (5 stages in order, candidate
+    parseable, verify action parseable, valid answer) used for a weak format
+    reward. ``protocol_strict`` is the canonical exact-format check, recorded for
+    diagnosis only and never fed into the reward.
+    """
+    result = dict(task_valid=False, decision_valid=False, final_geometry_valid=False,
+                  is_anomaly=None, bbox_2d=None, candidate_bbox_2d=None, candidate_state='missing',
+                  verify_action=None, verify_evidence='', action=None, description='', tags={},
+                  answer_keys=[], protocol_core=False, protocol_strict=False)
     blocks = list(BLOCK.finditer(text))
     result['tags'] = {m[1]: m[2].strip() for m in blocks}
     answers = list(re.finditer(r'<answer>(.*?)</answer>', text, re.S))
-    if (len(answers) != 1 or text.count('<answer>') != 1 or text.count('</answer>') != 1
-            or text[answers[0].end():].strip()):
-        return result
-    try:
-        obj = load_object(answers[0][1])
-    except (ValueError, TypeError):
-        return result
-    pred = obj.get('is_anomaly')
-    result['decision_valid'] = type(pred) is bool
-    result['is_anomaly'] = pred if type(pred) is bool else None
-    box = obj.get('bbox_2d')
-    geom = ('bbox_2d' in obj and ((pred is True and valid_box(box))
-                                or (pred is False and box is None)))
-    result['final_geometry_valid'] = geom
-    result['bbox_2d'] = box if valid_box(box) else None
-    result['task_valid'] = result['decision_valid'] and geom
-    desc = obj.get('description', '')
-    result['description'] = desc if isinstance(desc, str) else ''
-    structure = ([m[1] for m in blocks] == list(TAGS)
+    if (len(answers) == 1 and text.count('<answer>') == 1 and text.count('</answer>') == 1
+            and not text[answers[0].end():].strip()):
+        try:
+            obj = load_object(answers[0][1])
+            result['answer_keys'] = sorted(obj)
+            pred = obj.get('is_anomaly')
+            result['decision_valid'] = type(pred) is bool
+            result['is_anomaly'] = pred if type(pred) is bool else None
+            box = obj.get('bbox_2d')
+            geom = ('bbox_2d' in obj and ((pred is True and valid_box(box))
+                                          or (pred is False and box is None)))
+            result['final_geometry_valid'] = geom
+            result['bbox_2d'] = box if valid_box(box) else None
+            result['task_valid'] = result['decision_valid'] and geom
+            desc = obj.get('description', '')
+            result['description'] = desc if isinstance(desc, str) else ''
+        except (ValueError, TypeError):
+            pass
+
+    ground_text = result['tags'].get('ground', '')
+    cstate, cbox = parse_candidate(ground_text)
+    result['candidate_state'] = cstate
+    result['candidate_bbox_2d'] = cbox
+
+    verify_text = result['tags'].get('verify', '')
+    vaction, vevidence = parse_verify(verify_text)
+    result['verify_action'] = vaction
+    result['action'] = vaction
+    result['verify_evidence'] = vevidence
+
+    ordered = [m[1] for m in blocks] == list(TAGS)
+    structure = (ordered
                  and not BLOCK.sub('', text).strip()
-                 and all(text.count(f'<{t}>') == text.count(f'</{t}>') == 1 for t in TAGS)
-                 and all('<' not in m[2] and '>' not in m[2] for m in blocks))
-    candidate_ok = verify_ok = False
-    try:
-        ground = load_object(result['tags'].get('ground', ''))
-        c = ground.get('candidate_bbox_2d')
-        candidate_ok = set(ground) == {'candidate_bbox_2d'} and (c is None or valid_box(c))
-        result['candidate_bbox_2d'] = c if valid_box(c) else None
-        verify = load_object(result['tags'].get('verify', ''))
-        result['action'] = verify.get('action')
-        verify_ok = (set(verify) == {'action', 'evidence'}
-                     and verify.get('action') in ('keep', 'refine', 'reject', 'discover', 'none')
-                     and isinstance(verify.get('evidence'), str) and bool(verify['evidence'].strip()))
-    except (ValueError, TypeError):
-        pass
-    result['protocol_valid'] = bool(structure and result['task_valid'] and candidate_ok and verify_ok
-        and result['tags'].get('understand') and result['tags'].get('compare')
-        and isinstance(desc, str) and desc.strip()
-        and set(obj) == {'is_anomaly', 'bbox_2d', 'description'})
+                 and all(text.count(f'<{t}>') == text.count(f'</{t}>') == 1 for t in TAGS))
+    candidate_ok = cstate in ('box', 'null')
+    verify_ok = vaction is not None
+    understand_ok = bool((result['tags'].get('understand') or '').strip())
+    compare_ok = bool((result['tags'].get('compare') or '').strip())
+    desc_ok = bool(result['description'].strip())
+
+    # Lenient: presence + order + parseable candidate/action + valid answer.
+    result['protocol_core'] = bool(
+        ordered and result['task_valid'] and candidate_ok and verify_ok and desc_ok)
+
+    # Canonical exact-format: nothing outside blocks, one occurrence each, and
+    # ground/verify exactly in the machine line form.
+    ground_strict = bool(re.fullmatch(r'\s*candidate_bbox_2d\s*=\s*(null|\[[^\[\]]*\])\s*', ground_text, re.I))
+    verify_strict = bool(re.fullmatch(r'\s*(keep|refine|reject|discover|none)\s*;\s*\S.*', verify_text, re.I))
+    answer_strict = (result['task_valid'] and set(result['answer_keys']) == {'is_anomaly', 'bbox_2d', 'description'}
+                     and desc_ok)
+    result['protocol_strict'] = bool(
+        structure and result['task_valid'] and candidate_ok and verify_ok
+        and ground_strict and verify_strict and answer_strict
+        and understand_ok and compare_ok)
     return result
 
 
@@ -116,22 +178,22 @@ def validate_gt(meta):
         raise ValueError('normal sample must have null GT bbox')
 
 
+def _loc_empty():
+    return dict(loc_reward=0.0, raw_iou=0.0, s_center=0.0, s_w=0.0, s_h=0.0, s_geo=0.0)
+
+
 def localization_reward(pred_box, gt_box, orig_size, iou_threshold=0.30, geometry_weight=0.30):
     """DCLR-style dense localization, active only below an IoU threshold.
 
-    Above the threshold the reward is exactly IoU, so geometry shaping cannot
-    keep a low-IoU box on a plateau once real overlap is achieved. Below it, a
-    multiplicative center x width x height geometry term provides a gradient
-    that raw IoU cannot (zero-overlap predictions would otherwise all score 0).
+    Returns a dict of all internal components so the training loop can log them
+    and distinguish a strong center signal from a vanishing width/height match.
     """
     if pred_box is None or gt_box is None:
-        return 0.0
+        return _loc_empty()
     pred_px = to_pixels(pred_box, orig_size)
     if pred_px is None:
-        return 0.0
+        return _loc_empty()
     iou_val = iou(pred_px, gt_box)
-    if iou_val >= iou_threshold:
-        return iou_val
     w, h = orig_size[0], orig_size[1]
     img_diag = math.hypot(w, h)
     pcx = (pred_px[0] + pred_px[2]) / 2.0
@@ -147,10 +209,21 @@ def localization_reward(pred_box, gt_box, orig_size, iou_threshold=0.30, geometr
     s_w = min(pw, gw) / max(pw, gw) if pw > 0 and gw > 0 else 0.0
     s_h = min(ph, gh) / max(ph, gh) if ph > 0 and gh > 0 else 0.0
     s_geo = s_center * s_w * s_h
-    return iou_val + geometry_weight * (1.0 - iou_val) * s_geo
+    if iou_val >= iou_threshold:
+        reward = iou_val
+    else:
+        reward = iou_val + geometry_weight * (1.0 - iou_val) * s_geo
+    return dict(loc_reward=float(max(0.0, min(1.0, reward))), raw_iou=float(iou_val),
+                s_center=float(s_center), s_w=float(s_w), s_h=float(s_h), s_geo=float(s_geo))
 
 
-def score_output(parsed, meta, protocol_weight=0.05, localization=None):
+def score_output(parsed, meta, protocol_weight=0.01, localization=None):
+    """Reward plumbing.
+
+    R_task = -1 (wrong/invalid), 0 (correct normal), R_loc (correct anomaly).
+    R_total = R_task + protocol_weight * protocol_core.
+    protocol_strict is recorded but never enters the reward.
+    """
     validate_gt(meta)
     if not 0 <= protocol_weight <= 0.1:
         raise ValueError('protocol_weight must be in [0, 0.1]')
@@ -159,19 +232,22 @@ def score_output(parsed, meta, protocol_weight=0.05, localization=None):
     geometry_weight = float(loc.get('geometry_weight', 0.30))
     correct = parsed['task_valid'] and parsed['is_anomaly'] == bool(meta['is_anomaly'])
     raw_iou = iou(to_pixels(parsed['bbox_2d'], meta['orig_size']), meta.get('gt_box_px'))
-    loc_reward = (localization_reward(parsed['bbox_2d'], meta.get('gt_box_px'), meta['orig_size'],
-                                      iou_threshold, geometry_weight)
-                  if meta['is_anomaly'] and correct else 0.0)
+    locd = localization_reward(parsed['bbox_2d'], meta.get('gt_box_px'), meta['orig_size'],
+                               iou_threshold, geometry_weight)
+    loc_reward = locd['loc_reward'] if (meta['is_anomaly'] and correct) else 0.0
     if not correct:
         task = -1.0
     elif not meta['is_anomaly']:
-        task = 1.0
+        task = 0.0
     else:
         task = loc_reward
-    protocol = float(parsed['protocol_valid'])
-    return dict(task=task, protocol=protocol, total=task+protocol_weight*protocol,
+    protocol_core = float(parsed['protocol_core'])
+    return dict(task=task, protocol=protocol_core, protocol_core=protocol_core,
+                protocol_strict=float(parsed['protocol_strict']),
+                total=task + protocol_weight * protocol_core,
                 iou=raw_iou if correct and meta['is_anomaly'] else 0.0,
-                raw_iou=raw_iou, loc_reward=loc_reward, correct=bool(correct))
+                raw_iou=raw_iou, loc_reward=loc_reward, correct=bool(correct),
+                s_center=locd['s_center'], s_w=locd['s_w'], s_h=locd['s_h'], s_geo=locd['s_geo'])
 
 
 def prompt(class_name: str, roi: bool) -> str:
@@ -179,15 +255,25 @@ def prompt(class_name: str, roi: bool) -> str:
 H contains coarse discrepancy proposals, not labels or anomaly probabilities. H may be empty or wrong.
 Compare the images; reject normal variations and search outside H too.
 {('Image 3, if supplied, is a crop from the ORIGINAL inspection image. Its full-image bounds are given in roi. The reference is not registered: do not assume matching pixel positions.' if roi else 'Use the two full images to check candidate regions.')}
-Return these five SHORT blocks, with at most one short observation per prose field:
-<understand>object and relevant structure</understand>
-<compare>specific visible difference or consistency</compare>
-<ground>{{"candidate_bbox_2d": null}}</ground>
-<verify>{{"action": "none", "evidence": "brief visible evidence"}}</verify>
-<answer>{{"is_anomaly": false, "bbox_2d": null, "description": "brief result"}}</answer>
-Replace examples with your observations. Candidate is a provisional full-image box or null.
-Verification action: keep, refine, reject, discover (outside the supplied candidate), or none.
-ALL boxes refer to Image 2 FULL IMAGE, coordinates [x1,y1,x2,y2] in [0,1000], x1<x2 and y1<y2.
-For anomaly=true, final bbox encloses ALL detected defects under the single union-box benchmark.
-For anomaly=false, final bbox MUST be null. Empty H/absent crop does not establish normality.
+Return these five SHORT blocks, in this exact order:
+<understand>
+brief object/structure observation
+</understand>
+<compare>
+brief reference-test difference
+</compare>
+<ground>
+candidate_bbox_2d=[x1,y1,x2,y2]
+</ground>
+<verify>
+action; brief reference-based evidence
+</verify>
+<answer>
+{{"is_anomaly": false, "bbox_2d": null, "description": "brief result"}}
+</answer>
+Replace examples with your observations.
+candidate_bbox_2d is a provisional box in [0,1000], or null if nothing suspicious.
+Verification action is one of: keep, refine, reject, discover, none, followed by a semicolon and a short evidence.
+For anomaly=true, bbox_2d is the single union box covering ALL defects; for anomaly=false, bbox_2d MUST be null.
+Coordinates are integers [x1,y1,x2,y2] in [0,1000] for Image 2 FULL IMAGE, with x1<x2 and y1<y2.
 Do not repeat blocks. Stop immediately after </answer>.'''

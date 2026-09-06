@@ -100,10 +100,13 @@ def make_record(parsed, score, meta, completion, prompt_len, elapsed):
     delta_refine = (iou_f - iou_c) if iou_f is not None and iou_c is not None else None
     return dict(image_path=meta['image_path'], ref_path=meta['ref_path'], class_name=meta['class_name'],
         is_anomaly=anomaly, pred=parsed['is_anomaly'], task_valid=parsed['task_valid'],
-        protocol_valid=parsed['protocol_valid'], iou=score['iou'], reward=score['total'],
-        gt_box_px=gt, bbox_2d=parsed['bbox_2d'],
+        protocol_core=parsed['protocol_core'], protocol_strict=parsed['protocol_strict'],
+        candidate_state=parsed['candidate_state'], verify_action=parsed['verify_action'],
+        iou=score['iou'], reward=score['total'], loc_reward=score['loc_reward'],
+        gt_box_px=gt, bbox_2d=parsed['bbox_2d'], candidate_bbox_2d=parsed['candidate_bbox_2d'],
         iou_h_top1=iou_h_top1, iou_h_bestk=iou_h_bestk, iou_c=iou_c, iou_f=iou_f,
         delta_refine=delta_refine,
+        s_center=score['s_center'], s_w=score['s_w'], s_h=score['s_h'], s_geo=score['s_geo'],
         size_bin='normal' if not anomaly else 'small' if area < .02 else 'medium' if area < .1 else 'large',
         prior_candidates=candidates, roi=meta.get('roi'), prior_condition=meta.get('prior_condition'),
         image_count=meta.get('image_count'), prompt_tokens=meta.get('prompt_tokens'),
@@ -120,9 +123,12 @@ def summarize(rows):
     abnormal = [r for r in rows if r['is_anomaly']]
     recall = mean(r['pred'] is True for r in abnormal)
     tnr = mean(r['pred'] is False for r in normal)
+    def zfill_iou(key):
+        return mean((r[key] if r.get(key) is not None else 0.0) for r in abnormal)
     out = dict(n=len(rows), n_anomaly=len(abnormal), n_normal=len(normal),
         task_valid_rate=mean(r['task_valid'] for r in rows),
-        protocol_valid_rate=mean(r['protocol_valid'] for r in rows),
+        protocol_core_rate=mean(r['protocol_core'] for r in rows),
+        protocol_strict_rate=mean(r['protocol_strict'] for r in rows),
         anomaly_recall=recall, normal_fpr=mean(r['pred'] is True for r in normal),
         normal_correct_rate=tnr,
         invalid_decision_rate=mean(r['pred'] is None for r in rows),
@@ -133,8 +139,14 @@ def summarize(rows):
         mean_new_tokens=mean(r['new_tokens'] for r in rows), mean_seconds=mean(r['seconds'] for r in rows),
         mean_iou_h_top1=mean(r['iou_h_top1'] for r in abnormal if r['iou_h_top1'] is not None),
         mean_iou_h_bestk=mean(r['iou_h_bestk'] for r in abnormal if r['iou_h_bestk'] is not None),
+        prior_recall_at_01=mean((r['iou_h_bestk'] or 0.0) >= .1 for r in abnormal),
+        prior_recall_at_03=mean((r['iou_h_bestk'] or 0.0) >= .3 for r in abnormal),
+        candidate_box_valid_rate=mean(r['candidate_bbox_2d'] is not None for r in abnormal),
+        final_box_valid_rate=mean(r['bbox_2d'] is not None for r in abnormal),
         mean_iou_c=mean(r['iou_c'] for r in abnormal if r['iou_c'] is not None),
         mean_iou_f=mean(r['iou_f'] for r in abnormal if r['iou_f'] is not None),
+        iou_c_all=zfill_iou('iou_c'),
+        iou_f_all=zfill_iou('iou_f'),
         mean_delta_refine=mean(r['delta_refine'] for r in rows if r['delta_refine'] is not None))
     for size in ('small','medium','large'):
         subset = [r for r in abnormal if r['size_bin'] == size]
@@ -224,7 +236,7 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
         loc_cfg = oc.get('localization') or {}
         resample_cfg = oc.get('resampling') or {}
         max_group_resamples = int(resample_cfg.get('max_group_resamples', 3))
-        min_task_std = float(resample_cfg.get('min_task_std', 0.02))
+        min_loc_range = float(resample_cfg.get('min_loc_range', 0.001))
         with (output_dir/'rollouts.jsonl').open('w') as stream:
             for attempt in range(1, attempts+1):
                 if not order:
@@ -234,26 +246,35 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                 meta = batch['_meta'][0]
                 is_anomaly = bool(meta.get('is_anomaly'))
                 completions = parsed = scores = None
-                task_std = 0.0
+                task_std = loc_std = loc_range = 0.0
                 for resamples in range(max_group_resamples + 1):
                     completions = generate_group(model, processor, batch, cfg, group=int(gc['group_size']), sample=True)
                     parsed = [parse_output(c.text) for c in completions]
                     scores = [score_output(p, meta, float(oc['protocol_weight']), loc_cfg) for p in parsed]
                     task_rewards = torch.tensor([s['task'] for s in scores], device=device)
+                    loc_rewards = torch.tensor([s['loc_reward'] for s in scores], device=device)
                     task_std = float(task_rewards.std(unbiased=False))
-                    if not is_anomaly or task_std >= min_task_std:
+                    loc_std = float(loc_rewards.std(unbiased=False))
+                    loc_range = float(loc_rewards.max() - loc_rewards.min())
+                    # DifferAD-R1 style: resample only on localization collapse,
+                    # not on classification-driven total-reward spread.
+                    if not is_anomaly or loc_range >= min_loc_range:
                         break
                 rewards = torch.tensor([s['total'] for s in scores], device=device)
                 advantages = group_advantages(rewards, bool(gc.get('scale_rewards', False)))
                 zero = bool(advantages.abs().max().item() <= 1e-8)
                 skipped += int(zero)
-                zero_task_variance = float(is_anomaly and task_std < min_task_std)
+                loc_collapsed_group = float(is_anomaly and loc_range < min_loc_range)
+                loc_nonzero_rate = float((loc_rewards > 1e-6).float().mean())
                 metrics = dict(attempts=attempt, updates=updates, skipped_total=skipped, zero_advantage_group=float(zero),
                     reward_mean=float(rewards.mean()), reward_std=float(rewards.std(unbiased=False)),
                     task_reward_mean=sum(s['task'] for s in scores)/len(scores),
-                    task_reward_std=task_std, resamples_used=resamples, zero_task_variance=zero_task_variance,
+                    task_reward_std=task_std, resamples_used=resamples, loc_collapsed_group=loc_collapsed_group,
+                    loc_reward_mean=float(loc_rewards.mean()), loc_reward_std=loc_std, loc_reward_range=loc_range,
+                    loc_nonzero_rate=loc_nonzero_rate,
                     task_valid_rate=sum(p['task_valid'] for p in parsed)/len(parsed),
-                    protocol_valid_rate=sum(p['protocol_valid'] for p in parsed)/len(parsed),
+                    protocol_core_rate=sum(p['protocol_core'] for p in parsed)/len(parsed),
+                    protocol_strict_rate=sum(p['protocol_strict'] for p in parsed)/len(parsed),
                     truncation_rate=sum(c.stop_reason == 'length' for c in completions)/len(completions))
                 metrics.update(prompt_tokens=meta['prompt_tokens'], visual_tokens=meta['visual_tokens'],
                                prior_hint_tokens=meta['prior_hint_tokens'],
@@ -263,7 +284,8 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                 rows = [make_record(p,s,meta,c,int(batch['prompt_len'][0]),0.) for p,s,c in zip(parsed,scores,completions)]
                 stream.write(json.dumps(dict(attempt=attempt, update_before=updates, zero_advantage=zero,
                                              task_reward_std=task_std, resamples_used=resamples,
-                                             zero_task_variance=zero_task_variance,
+                                             loc_reward_mean=float(loc_rewards.mean()), loc_reward_std=loc_std,
+                                             loc_reward_range=loc_range, loc_collapsed_group=loc_collapsed_group,
                                              advantages=advantages.cpu().tolist(), trajectories=rows), ensure_ascii=False)+'\n')
                 stream.flush()
                 for name,value in metrics.items():
@@ -293,7 +315,6 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                 mean_delta = _mean('delta_refine', anom_rows)
                 mean_iou_h = _mean('iou_h_bestk', anom_rows)
                 mean_loc = sum(s['loc_reward'] for s in scores) / len(scores)
-                mean_raw = sum(s['raw_iou'] for s in scores) / len(scores)
 
                 if loss_stats is not None:
                     ls = loss_stats
@@ -310,11 +331,12 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                     return f'{v:.3f}' if v is not None else '--'
 
                 print(f'[outcome] a={attempt}/{attempts} up={updates} sk={skipped} '
-                      f'rw={metrics["reward_mean"]:.3f} tstd={task_std:.3f} '
-                      f'loc={_f(mean_loc)} iou_f={_f(mean_iou_f)} iou_c={_f(mean_iou_c)} '
+                      f'rw={metrics["reward_mean"]:.3f} loc={_f(mean_loc)} lrng={loc_range:.4f} '
+                      f'lz={loc_nonzero_rate:.2f} lc={loc_collapsed_group:.0f} '
+                      f'iou_f={_f(mean_iou_f)} iou_c={_f(mean_iou_c)} '
                       f'delta={_f(mean_delta)} iou_h={_f(mean_iou_h)} '
                       f'rs={resamples} tv={metrics["task_valid_rate"]:.2f} '
-                      f'pv={metrics["protocol_valid_rate"]:.2f} '
+                      f'pc={metrics["protocol_core_rate"]:.2f} ps={metrics["protocol_strict_rate"]:.2f} '
                       f'tok={metrics["mean_new_tokens"]:.0f} '
                       f'{loss_part} '
                       f'({time.perf_counter()-started:.1f}s)', flush=True)

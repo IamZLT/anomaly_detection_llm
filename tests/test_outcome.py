@@ -20,8 +20,8 @@ def answer(anomaly=True, box=None):
 
 def full(anomaly=True):
     return ('<understand>x</understand><compare>y</compare>'
-            '<ground>{"candidate_bbox_2d":null}</ground>'
-            '<verify>{"action":"discover","evidence":"z"}</verify>'+answer(anomaly))
+            '<ground>candidate_bbox_2d=null</ground>'
+            '<verify>discover; z</verify>'+answer(anomaly))
 
 
 def meta(anomaly=True):
@@ -30,7 +30,7 @@ def meta(anomaly=True):
 
 def test_exact_bbox_gets_full_task_reward_without_rationale():
     p = parse_output(answer())
-    assert p['task_valid'] and not p['protocol_valid']
+    assert p['task_valid'] and not p['protocol_core']
     s = score_output(p, meta())
     assert s['task'] == 1. and s['protocol'] == 0. and s['total'] == 1. and s['correct']
     assert s['iou'] == 1. and s['raw_iou'] == 1. and s['loc_reward'] == 1.
@@ -38,8 +38,8 @@ def test_exact_bbox_gets_full_task_reward_without_rationale():
 
 def test_one_character_prose_has_no_min_length_gate():
     p = parse_output(full())
-    assert p['task_valid'] and p['protocol_valid']
-    assert score_output(p,meta())['total'] == 1.05
+    assert p['task_valid'] and p['protocol_core'] and p['protocol_strict']
+    assert score_output(p,meta())['total'] == 1.01
 
 
 @pytest.mark.parametrize('text', [answer()+answer(), answer()+'garbage', answer().replace('</answer>',''),
@@ -57,12 +57,39 @@ def test_ambiguous_truncated_or_invalid_final_is_failure(text):
 
 def test_duplicate_prose_only_affects_protocol():
     p = parse_output('<understand>extra</understand>'+full())
-    assert p['task_valid'] and not p['protocol_valid']
+    assert p['task_valid'] and not p['protocol_core']
     assert score_output(p,meta())['task'] == 1
 
 
+def test_protocol_core_is_lenient_but_strict_is_exact():
+    text = ('<understand>x</understand><compare>y</compare>'
+            '<ground>region is candidate_bbox_2d=[100,200,300,400] here</ground>'
+            '<verify>refine; tighten</verify>'
+            + answer(box=[100,200,300,400]))
+    p = parse_output(text)
+    assert p['task_valid']
+    assert p['protocol_core']
+    assert not p['protocol_strict']
+    # strict only requires the exact machine line, nothing else
+    exact = ('<understand>x</understand><compare>y</compare>'
+             '<ground>candidate_bbox_2d=[100,200,300,400]</ground>'
+             '<verify>refine; tighten</verify>'
+             + answer(box=[100,200,300,400]))
+    assert parse_output(exact)['protocol_strict']
+
+
+def test_normal_verify_none_passes_core():
+    text = ('<understand>x</understand><compare>y</compare>'
+            '<ground>candidate_bbox_2d=null</ground>'
+            '<verify>none; no defect</verify>'
+            + answer(False))
+    p = parse_output(text)
+    assert p['task_valid'] and p['protocol_core']
+    assert p['verify_action'] == 'none'
+
+
 def test_normal_rejection_and_misclassification():
-    assert score_output(parse_output(full(False)),meta(False))['task'] == 1
+    assert score_output(parse_output(full(False)),meta(False))['task'] == 0
     assert score_output(parse_output(full(False)),meta(True))['task'] == -1
     assert score_output(parse_output(full(True)),meta(False))['task'] == -1
 
@@ -87,16 +114,16 @@ def test_gt_missing_fails_loudly():
 def test_localization_reward_is_iou_above_threshold():
     from outcome.protocol import localization_reward
     # Exact box: IoU=1 >= threshold, geometry is ignored.
-    assert localization_reward([100,100,200,200], [100,100,200,200], (1000,1000)) == 1.0
+    assert localization_reward([100,100,200,200], [100,100,200,200], (1000,1000))['loc_reward'] == 1.0
     # IoU=0.64 >= threshold returns the raw IoU, not a shaped value.
     assert localization_reward([100,100,180,180], [100,100,200,200], (1000,1000),
-                               iou_threshold=0.3, geometry_weight=0.3) == pytest.approx(0.64)
+                               iou_threshold=0.3, geometry_weight=0.3)['loc_reward'] == pytest.approx(0.64)
 
 
 def test_full_image_box_cannot_hack_localization_reward():
     from outcome.protocol import localization_reward
-    r_full = localization_reward([0,0,1000,1000], [100,100,110,110], (1000,1000))
-    r_near = localization_reward([100,100,110,110], [100,100,110,110], (1000,1000))
+    r_full = localization_reward([0,0,1000,1000], [100,100,110,110], (1000,1000))['loc_reward']
+    r_near = localization_reward([100,100,110,110], [100,100,110,110], (1000,1000))['loc_reward']
     assert r_full < 0.01
     assert r_near > r_full
 
@@ -105,8 +132,19 @@ def test_localization_reward_same_center_same_area_wrong_aspect():
     from outcome.protocol import localization_reward
     gt = [300, 450, 700, 550]       # 400 x 100
     bad = [450, 300, 550, 700]      # 100 x 400, same center and area
-    r = localization_reward(bad, gt, (1000,1000))
+    r = localization_reward(bad, gt, (1000,1000))['loc_reward']
     assert r < 0.5
+
+
+def test_localization_reward_reports_internal_components():
+    from outcome.protocol import localization_reward
+    gt = [400, 400, 600, 600]
+    r = localization_reward([400, 400, 600, 600], gt, (1000, 1000))
+    for key in ('loc_reward', 'raw_iou', 's_center', 's_w', 's_h', 's_geo'):
+        assert key in r
+    # exact overlap => all geometry terms ~1
+    assert r['raw_iou'] == pytest.approx(1.0)
+    assert r['s_center'] > 0.9 and r['s_w'] == pytest.approx(1.0) and r['s_h'] == pytest.approx(1.0)
 
 
 def test_candidate_metrics_split_h_c_and_f():
@@ -116,8 +154,8 @@ def test_candidate_metrics_split_h_c_and_f():
              image_path='a', ref_path='r', class_name='a',
              prior_candidates=[{'bbox_2d':[100,100,200,200]}, {'bbox_2d':[500,500,510,510]}])
     text = ('<understand>x</understand><compare>y</compare>'
-            '<ground>{"candidate_bbox_2d":[110,110,190,190]}</ground>'
-            '<verify>{"action":"refine","evidence":"z"}</verify>'
+            '<ground>candidate_bbox_2d=[110,110,190,190]</ground>'
+            '<verify>refine; z</verify>'
             + answer(box=[100,100,200,200]))
     parsed = parse_output(text)
     score = score_output(parsed, m)
@@ -129,7 +167,7 @@ def test_candidate_metrics_split_h_c_and_f():
     assert rec['delta_refine'] == pytest.approx(0.36)
 
 
-def test_anomaly_zero_task_variance_triggers_resampling(tmp_path, monkeypatch):
+def test_anomaly_loc_collapse_triggers_resampling(tmp_path, monkeypatch):
     import outcome.engine as engine
     from outcome.policy import Completion
     state = {'calls': 0, 'optimized': 0}
@@ -245,8 +283,9 @@ def test_centered_advantage_does_not_amplify_format_noise():
 
 
 def test_metrics_count_invalid_normal_separately_from_true_negative():
-    common=dict(task_valid=True,protocol_valid=False,iou=0.,class_name='a',size_bin='normal',
+    common=dict(task_valid=True,protocol_core=False,protocol_strict=False,iou=0.,class_name='a',size_bin='normal',
                 iou_h_top1=None,iou_h_bestk=None,iou_c=None,iou_f=None,delta_refine=None,
+                candidate_bbox_2d=None,bbox_2d=None,
                 new_tokens=5,seconds=1,stop_reason='eos')
     rows=[dict(common,is_anomaly=False,pred=None,task_valid=False),
           dict(common,is_anomaly=False,pred=True),

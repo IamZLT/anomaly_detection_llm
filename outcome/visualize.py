@@ -2,7 +2,7 @@
 
 Reuses the low-level PIL helpers from visualization.tensorboard so the panels
 look identical to the legacy GRPO runs, but adapts to the outcome parse_output
-schema (0-1000 coordinates, JSON blocks, task_valid/protocol_valid).
+schema (0-1000 coordinates, one JSON answer block, task_valid/protocol_core/strict).
 """
 from __future__ import annotations
 
@@ -43,8 +43,8 @@ def format_outcome_case_text(
         f"iou_f={iou:.3f} loc_reward={loc_reward:.3f}",
         f"pred={parsed.get('is_anomaly')} bbox_2d={_fmt_box(parsed.get('bbox_2d'))} "
         f"candidate_bbox_2d={_fmt_box(parsed.get('candidate_bbox_2d'))}",
-        f"task_valid={parsed.get('task_valid')} protocol_valid={parsed.get('protocol_valid')} "
-        f"action={parsed.get('action')}",
+        f"task_valid={parsed.get('task_valid')} core={parsed.get('protocol_core')} "
+        f"strict={parsed.get('protocol_strict')} action={parsed.get('action')}",
         f"description={parsed.get('description') or ''}",
         "",
         response or "",
@@ -132,7 +132,7 @@ def log_outcome_eval_grid(
             title = (
                 f"#{ci} {m.get('class_name')} gt_anom={m.get('is_anomaly')} "
                 f"pred={c['parsed'].get('is_anomaly')} iou={float(c.get('iou', 0.0)):.2f} "
-                f"proto={c['parsed'].get('protocol_valid')}"
+                f"core={c['parsed'].get('protocol_core')} strict={c['parsed'].get('protocol_strict')}"
             )
             rows.append((title, hstack_labeled(parts)))
         cot_parts.append(cot)

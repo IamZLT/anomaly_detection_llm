@@ -100,12 +100,12 @@ distributed:
   ddp_find_unused_parameters: false
 outcome:
   version: outcome-v1
-  protocol_weight: 0.05
+  protocol_weight: 0.01
   localization:
     iou_threshold: 0.30
     geometry_weight: 0.30
   resampling:
-    min_task_std: 0.02
+    min_loc_range: 0.001
     max_group_resamples: 3
   sft_adapter: null
   eval_before_train: true
