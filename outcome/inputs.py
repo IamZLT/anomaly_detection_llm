@@ -133,7 +133,7 @@ class OutcomeDataset(PriorCoTDataset):
         item = self._load_pair(self.samples[index])
         if Path(item['image_path']).resolve() == Path(item['ref_path']).resolve():
             raise ValueError('normal reference must not be the inspection image')
-        validate_gt(item)
+        getattr(self, 'validate_gt_fn', validate_gt)(item)
         return item
 
 
@@ -179,7 +179,7 @@ class OutcomeCollator(PriorCollator):
         hint = dict(coordinates='full_inspection_0_1000', candidates=proposals,
                     score_meaning='raw feature discrepancy, not probability', threshold_mode=threshold_mode,
                     roi=roi_info)
-        text = prompt(item['class_name'], bool(roi_cfg.get('enabled', False)))+'\n<prior_hint>'+json.dumps(hint, separators=(',', ':'))+'</prior_hint>'
+        text = getattr(self, 'prompt_fn', prompt)(item['class_name'], bool(roi_cfg.get('enabled', False)))+'\n<prior_hint>'+json.dumps(hint, separators=(',', ':'))+'</prior_hint>'
         user = dict(role='user', content=[dict(type='image', image=im) for im in images]+[dict(type='text', text=text)])
         rendered = apply_chat_template_safe(self.processor, [user], True, False)
         full = self.processor(text=[rendered], images=images, return_tensors='pt', truncation=False)
@@ -202,7 +202,7 @@ class OutcomeCollator(PriorCollator):
         else:
             full['image_embeds'] = torch.cat(caches)
         full['prompt_len'] = torch.tensor([length])
-        full['_meta'] = [{key: item.get(key) for key in ('orig_size','gt_box_px','is_anomaly','image_path','ref_path','class_name','defect_type')}]
+        full['_meta'] = [{key: item.get(key) for key in ('orig_size','gt_box_px','is_anomaly','image_path','ref_path','class_name','defect_type','component_bboxes','num_components','mask_area_fraction','union_area_fraction')}]
         full['_meta'][0].update(prior_candidates=proposals, roi=roi_info, prior_condition=condition,
                                 prior_threshold_mode=threshold_mode, h_min=float(hmap.min()), h_max=float(hmap.max()),
                                 image_count=len(images), prompt_tokens=int(length),

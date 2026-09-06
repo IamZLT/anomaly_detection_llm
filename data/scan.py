@@ -31,6 +31,64 @@ def extract_bbox_from_mask(mask_path: str) -> Optional[List[int]]:
         return None
 
 
+def extract_targets_from_mask(mask_path: str) -> Optional[dict]:
+    """Component-aware mask parsing (8-connected, matching diagnose_gt_multibox.py).
+
+    Returns None for missing/empty masks, else a dict with:
+      bbox                 : global union bounding box (back-compat single box)
+      component_bboxes     : list of per-connected-component boxes [x1,y1,x2,y2]
+      num_components       : number of connected components
+      mask_area_fraction   : defect pixels / (W*H)
+      union_area_fraction  : union box area / (W*H)
+    """
+    if mask_path is None or not os.path.exists(mask_path):
+        return None
+    try:
+        from scipy import ndimage
+
+        mask = Image.open(mask_path).convert("L")
+        arr = np.array(mask) > 0
+        if not arr.any():
+            return None
+        H, W = arr.shape
+        labels, num = ndimage.label(arr, structure=np.ones((3, 3)))
+        comps = []
+        for i in range(1, int(num) + 1):
+            ys, xs = np.where(labels == i)
+            comps.append([int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1])
+        rows = np.any(arr, axis=1)
+        cols = np.any(arr, axis=0)
+        ys = np.where(rows)[0]
+        xs = np.where(cols)[0]
+        union = [int(xs[0]), int(ys[0]), int(xs[-1]) + 1, int(ys[-1]) + 1]
+        union_area = (union[2] - union[0]) * (union[3] - union[1])
+        return dict(
+            bbox=union,
+            component_bboxes=comps,
+            num_components=int(num),
+            mask_area_fraction=float(arr.sum()) / (W * H),
+            union_area_fraction=float(union_area) / (W * H),
+        )
+    except Exception:
+        return None
+
+
+def compute_max_boxes(samples: List[dict], quantile: float = 0.95) -> int:
+    """Freeze max_boxes from train-only component counts (never MVTec test).
+
+    Uses a high quantile of num_components over anomaly samples so the frozen
+    value covers most cases without chasing the rare extreme (e.g. 95 components).
+    """
+    counts = [
+        int((s.get("metadata") or {}).get("num_components") or 0)
+        for s in samples
+        if (s.get("metadata") or {}).get("anomaly", False)
+    ]
+    if not counts:
+        return 1
+    return max(1, int(np.percentile(np.asarray(counts, dtype=float), quantile * 100.0)))
+
+
 def _optional_int(v) -> Optional[int]:
     if v in (None, "null", "None", ""):
         return None
@@ -79,7 +137,7 @@ def scan_visa(root: str, *, max_normal_per_class: Optional[int] = None, seed: in
         for name in _list_images(img_anom):
             stem = os.path.splitext(name)[0]
             mask = _mask_for_stem(mask_dir, stem)
-            bbox = extract_bbox_from_mask(mask) if mask else None
+            targets = extract_targets_from_mask(mask) if mask else None
             samples.append(
                 {
                     "id": f"visa_{cls}_anom_{stem}",
@@ -89,7 +147,11 @@ def scan_visa(root: str, *, max_normal_per_class: Optional[int] = None, seed: in
                         "class": cls,
                         "anomaly": True,
                         "defect_type": "anomaly",
-                        "bbox": bbox,
+                        "bbox": targets["bbox"] if targets else None,
+                        "component_bboxes": targets["component_bboxes"] if targets else [],
+                        "num_components": targets["num_components"] if targets else 0,
+                        "mask_area_fraction": targets["mask_area_fraction"] if targets else 0.0,
+                        "union_area_fraction": targets["union_area_fraction"] if targets else 0.0,
                         "full_mask_path": mask,
                         "layout": "visa",
                         "ref_dir": img_norm,
@@ -111,6 +173,10 @@ def scan_visa(root: str, *, max_normal_per_class: Optional[int] = None, seed: in
                         "anomaly": False,
                         "defect_type": "good",
                         "bbox": None,
+                        "component_bboxes": [],
+                        "num_components": 0,
+                        "mask_area_fraction": 0.0,
+                        "union_area_fraction": 0.0,
                         "full_mask_path": None,
                         "layout": "visa",
                         "ref_dir": img_norm,
@@ -142,7 +208,7 @@ def scan_mvtec(root: str, split: str = "test") -> List[dict]:
             for name in _list_images(img_dir):
                 stem = os.path.splitext(name)[0]
                 mask = _mask_for_stem(gt_dir, stem) if is_anom else None
-                bbox = extract_bbox_from_mask(mask) if mask else None
+                targets = extract_targets_from_mask(mask) if mask else None
                 samples.append(
                     {
                         "id": f"mvtec_{cls}_{defect}_{stem}",
@@ -152,7 +218,11 @@ def scan_mvtec(root: str, split: str = "test") -> List[dict]:
                             "class": cls,
                             "anomaly": is_anom,
                             "defect_type": defect,
-                            "bbox": bbox,
+                            "bbox": targets["bbox"] if targets else None,
+                            "component_bboxes": targets["component_bboxes"] if targets else [],
+                            "num_components": targets["num_components"] if targets else 0,
+                            "mask_area_fraction": targets["mask_area_fraction"] if targets else 0.0,
+                            "union_area_fraction": targets["union_area_fraction"] if targets else 0.0,
                             "full_mask_path": mask,
                             "layout": "mvtec",
                             "ref_dir": ref_dir,
