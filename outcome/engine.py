@@ -20,6 +20,7 @@ from models.qwen35 import setup_model_and_processor, freeze_vision_encoder, forc
 from outcome.inputs import OutcomeCollator, OutcomeDataset
 from outcome.policy import generate_group, group_advantages, optimize_group
 from outcome.protocol import VERSION, iou, parse_output, score_output, to_pixels
+from outcome.visualize import log_outcome_eval_grid, log_outcome_single_case
 from rl.grpo import move_batch
 from utils.common import set_seed
 
@@ -86,12 +87,23 @@ def make_record(parsed, score, meta, completion, prompt_len, elapsed):
     gt = meta.get('gt_box_px')
     area = ((gt[2]-gt[0])*(gt[3]-gt[1])/(meta['orig_size'][0]*meta['orig_size'][1])) if anomaly else 0
     candidates = meta.get('prior_candidates') or []
-    candidate_iou = iou(to_pixels(candidates[0]['bbox_2d'], meta['orig_size']), gt) if candidates and anomaly else None
+    if anomaly and gt is not None:
+        h_ious = [iou(to_pixels(c['bbox_2d'], meta['orig_size']), gt) for c in candidates]
+        iou_h_top1 = h_ious[0] if h_ious else None
+        iou_h_bestk = max(h_ious) if h_ious else None
+    else:
+        iou_h_top1 = iou_h_bestk = None
+    iou_c = (iou(to_pixels(parsed['candidate_bbox_2d'], meta['orig_size']), gt)
+             if anomaly and parsed.get('candidate_bbox_2d') is not None and gt is not None else None)
+    iou_f = (iou(to_pixels(parsed['bbox_2d'], meta['orig_size']), gt)
+             if anomaly and gt is not None and parsed.get('bbox_2d') is not None else None)
+    delta_refine = (iou_f - iou_c) if iou_f is not None and iou_c is not None else None
     return dict(image_path=meta['image_path'], ref_path=meta['ref_path'], class_name=meta['class_name'],
         is_anomaly=anomaly, pred=parsed['is_anomaly'], task_valid=parsed['task_valid'],
         protocol_valid=parsed['protocol_valid'], iou=score['iou'], reward=score['total'],
-        gt_box_px=gt, bbox_2d=parsed['bbox_2d'], candidate_iou=candidate_iou,
-        candidate_to_final_delta=(score['iou']-candidate_iou) if candidate_iou is not None else None,
+        gt_box_px=gt, bbox_2d=parsed['bbox_2d'],
+        iou_h_top1=iou_h_top1, iou_h_bestk=iou_h_bestk, iou_c=iou_c, iou_f=iou_f,
+        delta_refine=delta_refine,
         size_bin='normal' if not anomaly else 'small' if area < .02 else 'medium' if area < .1 else 'large',
         prior_candidates=candidates, roi=meta.get('roi'), prior_condition=meta.get('prior_condition'),
         image_count=meta.get('image_count'), prompt_tokens=meta.get('prompt_tokens'),
@@ -119,7 +131,11 @@ def summarize(rows):
         acc_at_05=mean(r['iou'] >= .5 for r in abnormal),
         truncation_rate=mean(r['stop_reason'] == 'length' for r in rows),
         mean_new_tokens=mean(r['new_tokens'] for r in rows), mean_seconds=mean(r['seconds'] for r in rows),
-        mean_candidate_to_final_delta=mean(r['candidate_to_final_delta'] for r in rows if r['candidate_to_final_delta'] is not None))
+        mean_iou_h_top1=mean(r['iou_h_top1'] for r in abnormal if r['iou_h_top1'] is not None),
+        mean_iou_h_bestk=mean(r['iou_h_bestk'] for r in abnormal if r['iou_h_bestk'] is not None),
+        mean_iou_c=mean(r['iou_c'] for r in abnormal if r['iou_c'] is not None),
+        mean_iou_f=mean(r['iou_f'] for r in abnormal if r['iou_f'] is not None),
+        mean_delta_refine=mean(r['delta_refine'] for r in rows if r['delta_refine'] is not None))
     for size in ('small','medium','large'):
         subset = [r for r in abnormal if r['size_bin'] == size]
         out[f'n_{size}'] = len(subset)
@@ -144,6 +160,7 @@ def evaluate(cfg, model, processor, prior, dataset, output_path, limit=None, wri
     collator = OutcomeCollator(processor, prior, cfg)
     device = next(model.parameters()).device
     rows = []
+    cases = []
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.with_suffix('.jsonl').open('w') as stream:
@@ -153,9 +170,13 @@ def evaluate(cfg, model, processor, prior, dataset, output_path, limit=None, wri
             completion = generate_group(model, processor, batch, cfg)[0]
             parsed = parse_output(completion.text)
             meta = batch['_meta'][0]
-            reward = score_output(parsed, meta, float(cfg['outcome']['protocol_weight']))
+            reward = score_output(parsed, meta, float(cfg['outcome']['protocol_weight']),
+                                  cfg['outcome'].get('localization'))
             row = make_record(parsed, reward, meta, completion, int(batch['prompt_len'][0]), time.perf_counter()-started)
             rows.append(row)
+            cases.append(dict(meta=meta, parsed=parsed, response=completion.text,
+                              iou=reward['iou'], loc_reward=reward['loc_reward'],
+                              correct=reward['correct']))
             stream.write(json.dumps(row, ensure_ascii=False)+'\n'); stream.flush()
             if index % 10 == 0:
                 print(f'[{namespace}] {index+1}/{count}', flush=True)
@@ -165,6 +186,7 @@ def evaluate(cfg, model, processor, prior, dataset, output_path, limit=None, wri
         for name, value in stats.items():
             if isinstance(value, (float,int)):
                 writer.add_scalar(f'{namespace}/{name}', value, step)
+        log_outcome_eval_grid(writer, step=step, cases=cases)
         writer.flush()
     return stats
 
@@ -181,6 +203,13 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
         raise ValueError('max_attempts must be positive')
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=float(gc['learning_rate']), weight_decay=0.)
     writer = SummaryWriter(str(Path(output_dir)/'tb'))
+    # Dump hyperparams into TEXT so they sit next to the curves.
+    writer.add_text('outcome/0_config', json.dumps({
+        'outcome': oc, 'grpo': gc, 'lora': cfg.get('lora'),
+        'prior': cfg.get('prior'), 'training': cfg.get('training'),
+        'tensorboard': cfg.get('tensorboard'),
+    }, ensure_ascii=False, indent=2, default=str), 0)
+    writer.flush()
     updates = skipped = 0
     rng = random.Random(int(cfg['training']['seed']))
     order = []
@@ -192,23 +221,37 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
         if oc.get('eval_before_train', True) and len(dev_set):
             evaluate(cfg, model, processor, prior, dev_set, output_dir/'dev_initial.json',
                      cfg['training'].get('eval_num_samples'), writer, 0, 'dev')
+        loc_cfg = oc.get('localization') or {}
+        resample_cfg = oc.get('resampling') or {}
+        max_group_resamples = int(resample_cfg.get('max_group_resamples', 3))
+        min_task_std = float(resample_cfg.get('min_task_std', 0.02))
         with (output_dir/'rollouts.jsonl').open('w') as stream:
             for attempt in range(1, attempts+1):
                 if not order:
                     order = list(range(len(train_set))); rng.shuffle(order)
                 batch = move_batch(collator([train_set[order.pop()]]), device)
                 started = time.perf_counter()
-                completions = generate_group(model, processor, batch, cfg, group=int(gc['group_size']), sample=True)
                 meta = batch['_meta'][0]
-                parsed = [parse_output(c.text) for c in completions]
-                scores = [score_output(p, meta, float(oc['protocol_weight'])) for p in parsed]
+                is_anomaly = bool(meta.get('is_anomaly'))
+                completions = parsed = scores = None
+                task_std = 0.0
+                for resamples in range(max_group_resamples + 1):
+                    completions = generate_group(model, processor, batch, cfg, group=int(gc['group_size']), sample=True)
+                    parsed = [parse_output(c.text) for c in completions]
+                    scores = [score_output(p, meta, float(oc['protocol_weight']), loc_cfg) for p in parsed]
+                    task_rewards = torch.tensor([s['task'] for s in scores], device=device)
+                    task_std = float(task_rewards.std(unbiased=False))
+                    if not is_anomaly or task_std >= min_task_std:
+                        break
                 rewards = torch.tensor([s['total'] for s in scores], device=device)
                 advantages = group_advantages(rewards, bool(gc.get('scale_rewards', False)))
                 zero = bool(advantages.abs().max().item() <= 1e-8)
                 skipped += int(zero)
+                zero_task_variance = float(is_anomaly and task_std < min_task_std)
                 metrics = dict(attempts=attempt, updates=updates, skipped_total=skipped, zero_advantage_group=float(zero),
                     reward_mean=float(rewards.mean()), reward_std=float(rewards.std(unbiased=False)),
                     task_reward_mean=sum(s['task'] for s in scores)/len(scores),
+                    task_reward_std=task_std, resamples_used=resamples, zero_task_variance=zero_task_variance,
                     task_valid_rate=sum(p['task_valid'] for p in parsed)/len(parsed),
                     protocol_valid_rate=sum(p['protocol_valid'] for p in parsed)/len(parsed),
                     truncation_rate=sum(c.stop_reason == 'length' for c in completions)/len(completions))
@@ -219,11 +262,18 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                 # Log every attempted group BEFORE any skip or optimizer failure.
                 rows = [make_record(p,s,meta,c,int(batch['prompt_len'][0]),0.) for p,s,c in zip(parsed,scores,completions)]
                 stream.write(json.dumps(dict(attempt=attempt, update_before=updates, zero_advantage=zero,
+                                             task_reward_std=task_std, resamples_used=resamples,
+                                             zero_task_variance=zero_task_variance,
                                              advantages=advantages.cpu().tolist(), trajectories=rows), ensure_ascii=False)+'\n')
                 stream.flush()
                 for name,value in metrics.items():
                     writer.add_scalar(f'train/{name}', value, attempt)
+                # Split curves by GT class so anomaly/normal trends are separable.
+                split_prefix = 'train_anomaly' if is_anomaly else 'train_normal'
+                for name,value in metrics.items():
+                    writer.add_scalar(f'{split_prefix}/{name}', value, attempt)
                 writer.flush()
+                loss_stats = None
                 if not zero:
                     loss_stats = optimize_group(model, processor, batch, completions, advantages, opt, cfg)
                     updates += 1
@@ -231,9 +281,58 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                         writer.add_scalar(f'optimizer/{name}', value, updates)
                 writer.add_scalar('train/updates_after', updates, attempt)
                 writer.add_scalar('train/seconds_per_attempt', time.perf_counter()-started, attempt)
-                print(f'[outcome] attempt={attempt}/{attempts} updates={updates} skipped={skipped} '
-                      f"reward={metrics['reward_mean']:.3f} task_valid={metrics['task_valid_rate']:.3f}", flush=True)
+
+                # --- richer per-attempt console line (loss + localization + H) ---
+                def _mean(key, rows):
+                    vals = [r[key] for r in rows if r.get(key) is not None]
+                    return sum(vals) / len(vals) if vals else None
+
+                anom_rows = [r for r in rows if r.get('is_anomaly')]
+                mean_iou_f = _mean('iou_f', anom_rows)
+                mean_iou_c = _mean('iou_c', anom_rows)
+                mean_delta = _mean('delta_refine', anom_rows)
+                mean_iou_h = _mean('iou_h_bestk', anom_rows)
+                mean_loc = sum(s['loc_reward'] for s in scores) / len(scores)
+                mean_raw = sum(s['raw_iou'] for s in scores) / len(scores)
+
+                if loss_stats is not None:
+                    ls = loss_stats
+                    loss_part = (f"loss={ls.get('loss', float('nan')):.4f} "
+                                 f"pg={ls.get('pg', float('nan')):.4f} "
+                                 f"kl={ls.get('kl', float('nan')):.3f} "
+                                 f"ratio={ls.get('ratio', float('nan')):.3f} "
+                                 f"clip={ls.get('clip_fraction', float('nan')):.2f} "
+                                 f"gnorm={ls.get('grad_norm', float('nan')):.2f}")
+                else:
+                    loss_part = 'loss=-- pg=-- kl=-- ratio=-- clip=-- gnorm=--'
+
+                def _f(v):
+                    return f'{v:.3f}' if v is not None else '--'
+
+                print(f'[outcome] a={attempt}/{attempts} up={updates} sk={skipped} '
+                      f'rw={metrics["reward_mean"]:.3f} tstd={task_std:.3f} '
+                      f'loc={_f(mean_loc)} iou_f={_f(mean_iou_f)} iou_c={_f(mean_iou_c)} '
+                      f'delta={_f(mean_delta)} iou_h={_f(mean_iou_h)} '
+                      f'rs={resamples} tv={metrics["task_valid_rate"]:.2f} '
+                      f'pv={metrics["protocol_valid_rate"]:.2f} '
+                      f'tok={metrics["mean_new_tokens"]:.0f} '
+                      f'{loss_part} '
+                      f'({time.perf_counter()-started:.1f}s)', flush=True)
                 every = int(cfg['training'].get('eval_every_n_steps', 0))
+                vis_every = int((cfg.get('tensorboard') or {}).get('vis_every_n_steps', 0) or 0)
+                if vis_every > 0 and attempt % vis_every == 0:
+                    # Pick the best rollout of this group for a visual panel.
+                    best = max(range(len(parsed)), key=lambda i: (
+                        scores[i]['correct'],
+                        scores[i]['iou'],
+                        scores[i]['loc_reward'],
+                    ))
+                    log_outcome_single_case(
+                        writer, step=attempt, meta=meta,
+                        response=completions[best].text, parsed=parsed[best],
+                        iou=scores[best]['iou'], loc_reward=scores[best]['loc_reward'],
+                        correct=scores[best]['correct'], tag_prefix='train_case',
+                    )
                 if every > 0 and attempt % every == 0 and len(dev_set):
                     evaluate(cfg, model, processor, prior, dev_set, output_dir/f'dev_{attempt:06d}.json',
                              cfg['training'].get('eval_num_samples'), writer, attempt, 'dev')

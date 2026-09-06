@@ -31,7 +31,9 @@ def meta(anomaly=True):
 def test_exact_bbox_gets_full_task_reward_without_rationale():
     p = parse_output(answer())
     assert p['task_valid'] and not p['protocol_valid']
-    assert score_output(p, meta()) == dict(task=1.,protocol=0.,total=1.,iou=1.,correct=True)
+    s = score_output(p, meta())
+    assert s['task'] == 1. and s['protocol'] == 0. and s['total'] == 1. and s['correct']
+    assert s['iou'] == 1. and s['raw_iou'] == 1. and s['loc_reward'] == 1.
 
 
 def test_one_character_prose_has_no_min_length_gate():
@@ -65,15 +67,116 @@ def test_normal_rejection_and_misclassification():
     assert score_output(parse_output(full(True)),meta(False))['task'] == -1
 
 
-def test_no_dense_reward_for_displaced_tiny_box():
+def test_low_iou_dense_reward_breaks_zero_overlap_dead_zone():
     m = dict(is_anomaly=True,orig_size=[1000,1000],gt_box_px=[100,100,110,110])
-    assert score_output(parse_output(answer(box=[111,100,121,110])),m)['task'] == 0
-    assert score_output(parse_output(answer(box=[100,100,110,110])),m)['task'] == 1
+    exact = score_output(parse_output(answer(box=[100,100,110,110])),m)
+    near = score_output(parse_output(answer(box=[111,100,121,110])),m)
+    far = score_output(parse_output(answer(box=[500,500,510,510])),m)
+    assert exact['task'] == 1.0
+    # Zero overlap no longer collapses to an identical 0: closer is graded higher.
+    assert near['task'] > 0 and far['task'] >= 0 and near['task'] > far['task']
+    # Raw IoU is still reported separately for the final metric.
+    assert near['iou'] == 0.0 and near['raw_iou'] == 0.0
 
 
 def test_gt_missing_fails_loudly():
     with pytest.raises(ValueError):
         validate_gt(dict(is_anomaly=True,orig_size=[100,100],gt_box_px=None))
+
+
+def test_localization_reward_is_iou_above_threshold():
+    from outcome.protocol import localization_reward
+    # Exact box: IoU=1 >= threshold, geometry is ignored.
+    assert localization_reward([100,100,200,200], [100,100,200,200], (1000,1000)) == 1.0
+    # IoU=0.64 >= threshold returns the raw IoU, not a shaped value.
+    assert localization_reward([100,100,180,180], [100,100,200,200], (1000,1000),
+                               iou_threshold=0.3, geometry_weight=0.3) == pytest.approx(0.64)
+
+
+def test_full_image_box_cannot_hack_localization_reward():
+    from outcome.protocol import localization_reward
+    r_full = localization_reward([0,0,1000,1000], [100,100,110,110], (1000,1000))
+    r_near = localization_reward([100,100,110,110], [100,100,110,110], (1000,1000))
+    assert r_full < 0.01
+    assert r_near > r_full
+
+
+def test_localization_reward_same_center_same_area_wrong_aspect():
+    from outcome.protocol import localization_reward
+    gt = [300, 450, 700, 550]       # 400 x 100
+    bad = [450, 300, 550, 700]      # 100 x 400, same center and area
+    r = localization_reward(bad, gt, (1000,1000))
+    assert r < 0.5
+
+
+def test_candidate_metrics_split_h_c_and_f():
+    from outcome.engine import make_record
+    from outcome.policy import Completion
+    m = dict(is_anomaly=True, orig_size=[1000,1000], gt_box_px=[100,100,200,200],
+             image_path='a', ref_path='r', class_name='a',
+             prior_candidates=[{'bbox_2d':[100,100,200,200]}, {'bbox_2d':[500,500,510,510]}])
+    text = ('<understand>x</understand><compare>y</compare>'
+            '<ground>{"candidate_bbox_2d":[110,110,190,190]}</ground>'
+            '<verify>{"action":"refine","evidence":"z"}</verify>'
+            + answer(box=[100,100,200,200]))
+    parsed = parse_output(text)
+    score = score_output(parsed, m)
+    rec = make_record(parsed, score, m, Completion(torch.tensor([1]), '', 'answer'), 1, 0.)
+    assert rec['iou_h_top1'] == 1.0
+    assert rec['iou_h_bestk'] == 1.0
+    assert rec['iou_c'] == pytest.approx(0.64)
+    assert rec['iou_f'] == 1.0
+    assert rec['delta_refine'] == pytest.approx(0.36)
+
+
+def test_anomaly_zero_task_variance_triggers_resampling(tmp_path, monkeypatch):
+    import outcome.engine as engine
+    from outcome.policy import Completion
+    state = {'calls': 0, 'optimized': 0}
+
+    def fake_generate(model, processor, batch, cfg, group=1, sample=False):
+        state['calls'] += 1
+        texts = ['invalid', 'invalid'] if state['calls'] == 1 else [answer(True), 'invalid']
+        return [Completion(torch.tensor([4, 1]), t, 'answer') for t in texts]
+
+    def fake_optimize(*args, **kwargs):
+        state['optimized'] += 1
+        return {}
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__(); self.weight = torch.nn.Parameter(torch.ones(1))
+        def save_pretrained(self, path):
+            pass
+
+    class Processor:
+        def save_pretrained(self, path):
+            pass
+
+    class Dataset:
+        samples = [{'image': 'anomaly-a'}]
+        def __len__(self): return 1
+        def __getitem__(self, i): return i
+
+    class Empty:
+        samples = []
+        def __len__(self): return 0
+
+    m = meta(True)
+    m.update(ref_path='ref', class_name='a', image_path='anomaly-a', prior_candidates=[],
+             prompt_tokens=1, visual_tokens=0, prior_hint_tokens=0)
+    batch = {'input_ids': torch.tensor([[4]]), 'prompt_len': torch.tensor([1]), '_meta': [m]}
+    monkeypatch.setattr(engine, 'OutcomeCollator', lambda *args: lambda items: batch)
+    monkeypatch.setattr(engine, 'generate_group', fake_generate)
+    monkeypatch.setattr(engine, 'optimize_group', fake_optimize)
+    cfg = {'outcome': {'protocol_weight': .05, 'eval_before_train': False, 'final_test': False},
+           'grpo': {'max_attempts': 1, 'group_size': 2, 'learning_rate': 1e-6, 'save_steps': 0},
+           'training': {'seed': 42, 'eval_every_n_steps': 0}}
+    engine.run_train(cfg, Model(), Processor(), None, Dataset(), Empty(), Empty(), tmp_path)
+    assert state['calls'] == 2
+    assert state['optimized'] == 1
+    summary = json.loads((tmp_path / 'training_summary.json').read_text())
+    assert summary == {'attempts': 1, 'updates': 1, 'skipped': 0}
 
 
 def test_single_patch_and_thin_component_use_cell_edges():
@@ -143,7 +246,8 @@ def test_centered_advantage_does_not_amplify_format_noise():
 
 def test_metrics_count_invalid_normal_separately_from_true_negative():
     common=dict(task_valid=True,protocol_valid=False,iou=0.,class_name='a',size_bin='normal',
-                candidate_to_final_delta=None,new_tokens=5,seconds=1,stop_reason='eos')
+                iou_h_top1=None,iou_h_bestk=None,iou_c=None,iou_f=None,delta_refine=None,
+                new_tokens=5,seconds=1,stop_reason='eos')
     rows=[dict(common,is_anomaly=False,pred=None,task_valid=False),
           dict(common,is_anomaly=False,pred=True),
           dict(common,is_anomaly=True,pred=True,iou=.8,size_bin='small')]

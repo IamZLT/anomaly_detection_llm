@@ -116,17 +116,62 @@ def validate_gt(meta):
         raise ValueError('normal sample must have null GT bbox')
 
 
-def score_output(parsed, meta, protocol_weight=0.05):
+def localization_reward(pred_box, gt_box, orig_size, iou_threshold=0.30, geometry_weight=0.30):
+    """DCLR-style dense localization, active only below an IoU threshold.
+
+    Above the threshold the reward is exactly IoU, so geometry shaping cannot
+    keep a low-IoU box on a plateau once real overlap is achieved. Below it, a
+    multiplicative center x width x height geometry term provides a gradient
+    that raw IoU cannot (zero-overlap predictions would otherwise all score 0).
+    """
+    if pred_box is None or gt_box is None:
+        return 0.0
+    pred_px = to_pixels(pred_box, orig_size)
+    if pred_px is None:
+        return 0.0
+    iou_val = iou(pred_px, gt_box)
+    if iou_val >= iou_threshold:
+        return iou_val
+    w, h = orig_size[0], orig_size[1]
+    img_diag = math.hypot(w, h)
+    pcx = (pred_px[0] + pred_px[2]) / 2.0
+    pcy = (pred_px[1] + pred_px[3]) / 2.0
+    gcx = (gt_box[0] + gt_box[2]) / 2.0
+    gcy = (gt_box[1] + gt_box[3]) / 2.0
+    dist = math.hypot(pcx - gcx, pcy - gcy)
+    s_center = 1.0 - min(1.0, dist / (img_diag + 1e-6))
+    pw = pred_px[2] - pred_px[0]
+    ph = pred_px[3] - pred_px[1]
+    gw = gt_box[2] - gt_box[0]
+    gh = gt_box[3] - gt_box[1]
+    s_w = min(pw, gw) / max(pw, gw) if pw > 0 and gw > 0 else 0.0
+    s_h = min(ph, gh) / max(ph, gh) if ph > 0 and gh > 0 else 0.0
+    s_geo = s_center * s_w * s_h
+    return iou_val + geometry_weight * (1.0 - iou_val) * s_geo
+
+
+def score_output(parsed, meta, protocol_weight=0.05, localization=None):
     validate_gt(meta)
     if not 0 <= protocol_weight <= 0.1:
         raise ValueError('protocol_weight must be in [0, 0.1]')
+    loc = localization or {}
+    iou_threshold = float(loc.get('iou_threshold', 0.30))
+    geometry_weight = float(loc.get('geometry_weight', 0.30))
     correct = parsed['task_valid'] and parsed['is_anomaly'] == bool(meta['is_anomaly'])
-    overlap = iou(to_pixels(parsed['bbox_2d'], meta['orig_size']), meta.get('gt_box_px'))
-    task = (-1.0 if not correct else overlap if meta['is_anomaly'] else 1.0)
+    raw_iou = iou(to_pixels(parsed['bbox_2d'], meta['orig_size']), meta.get('gt_box_px'))
+    loc_reward = (localization_reward(parsed['bbox_2d'], meta.get('gt_box_px'), meta['orig_size'],
+                                      iou_threshold, geometry_weight)
+                  if meta['is_anomaly'] and correct else 0.0)
+    if not correct:
+        task = -1.0
+    elif not meta['is_anomaly']:
+        task = 1.0
+    else:
+        task = loc_reward
     protocol = float(parsed['protocol_valid'])
     return dict(task=task, protocol=protocol, total=task+protocol_weight*protocol,
-                iou=overlap if correct and meta['is_anomaly'] else 0.0,
-                correct=bool(correct))
+                iou=raw_iou if correct and meta['is_anomaly'] else 0.0,
+                raw_iou=raw_iou, loc_reward=loc_reward, correct=bool(correct))
 
 
 def prompt(class_name: str, roi: bool) -> str:

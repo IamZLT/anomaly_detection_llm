@@ -24,3 +24,12 @@ CUDA_VISIBLE_DEVICES=4 python train.py \
 cd /data2/zlt/anomaly_detection_llm
 CUDA_VISIBLE_DEVICES=1 /home/zlt/miniconda3/bin/python train_outcome.py \
   --config configs/qwen35_2b_outcome.yaml --mode eval --split dev
+
+  CUDA_VISIBLE_DEVICES=0 python train_outcome.py \
+  --config configs/qwen35_2b_outcome.yaml \
+  --mode train \
+
+
+
+cd /data2/zlt/anomaly_detection_llm && CUDA_VISIBLE_DEVICES=0 python train_outcome.py \
+  --config configs/qwen35_2b_outcome.yaml --mode train 

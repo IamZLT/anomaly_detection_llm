@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -18,6 +20,28 @@ from outcome.protocol import VERSION, parse_output, to_pixels
 from rl.grpo import move_batch
 from utils.common import set_seed
 from utils.config import load_yaml_config
+
+
+def start_tensorboard(logdir: Path, cfg: dict) -> None:
+    """Start a detached TensorBoard for this training run; never blocks training.
+
+    Reads tensorboard.port/host from the config, defaulting to 5003 / 0.0.0.0.
+    The process is detached (start_new_session) so it survives the training job.
+    """
+    tb_cfg = cfg.get('tensorboard') or {}
+    port = int(tb_cfg.get('port', 5003))
+    host = str(tb_cfg.get('host', '0.0.0.0'))
+    logdir.mkdir(parents=True, exist_ok=True)
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, '-m', 'tensorboard.main',
+             '--logdir', str(logdir), '--port', str(port), '--host', host],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        print(f'[tensorboard] 已启动 pid={proc.pid} http://{host}:{port} (logdir={logdir})', flush=True)
+    except Exception as exc:
+        print(f'[tensorboard] 启动失败: {exc}', flush=True)
 
 
 def main():
@@ -84,6 +108,7 @@ def main():
             stats = evaluate(cfg, model, processor, prior, selected, output/f'{args.split}.json', args.eval_limit, namespace=args.split)
             print(json.dumps(stats, ensure_ascii=False, indent=2))
         else:
+            start_tensorboard(output / 'tb', cfg)
             run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output)
     print(f'Output: {output}', flush=True)
 

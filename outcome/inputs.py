@@ -12,7 +12,7 @@ from PIL import Image
 
 from data.prior_dataset import PriorCollator, PriorCoTDataset, apply_chat_template_safe
 from outcome.protocol import prompt, validate_gt
-from models.anomaly_prior import softmax_fuse_maps, unpack_merge_order
+from models.anomaly_prior import heatmap_to_pil, softmax_fuse_maps, unpack_merge_order
 
 
 @torch.no_grad()
@@ -209,4 +209,11 @@ class OutcomeCollator(PriorCollator):
                                 visual_tokens=int((full['image_grid_thw'].prod(-1)//(self.prior.spatial_merge_size**2)).sum()),
                                 prior_hint_tokens=len(getattr(self.processor, 'tokenizer', self.processor).encode(
                                     json.dumps(hint, separators=(',', ':')), add_special_tokens=False)))
+        # Visualization payload (heatmap + original images + H peaks in 0-1000).
+        full['_meta'][0].update(
+            ref=item['ref'],
+            test=item['test'],
+            heatmap=heatmap_to_pil(hmap, item['test'].size),
+            prior_points=[p['peak_2d'] for p in proposals],
+        )
         return full

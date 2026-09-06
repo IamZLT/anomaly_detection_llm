@@ -6,6 +6,10 @@ runtime:
   mode: train
   run_name: qwen35_2b_outcome
   auto_create_output_dir: true
+tensorboard:
+  port: 5003
+  host: 0.0.0.0
+  vis_every_n_steps: 20
 model:
   random_init_llm: false
   arch: Qwen3.5-2B
@@ -69,7 +73,7 @@ training:
   gradient_checkpointing_kwargs:
     use_reentrant: false
   seed: 42
-  eval_every_n_steps: 100
+  eval_every_n_steps: 0
   eval_num_samples: null
   final_eval_num_samples: null
 grpo:
@@ -101,8 +105,14 @@ distributed:
 outcome:
   version: outcome-v1
   protocol_weight: 0.05
+  localization:
+    iou_threshold: 0.30
+    geometry_weight: 0.30
+  resampling:
+    min_task_std: 0.02
+    max_group_resamples: 3
   sft_adapter: null
-  eval_before_train: true
+  eval_before_train: false
   final_test: false
   prior:
     condition: real
