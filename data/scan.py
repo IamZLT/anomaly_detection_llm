@@ -31,31 +31,51 @@ def extract_bbox_from_mask(mask_path: str) -> Optional[List[int]]:
         return None
 
 
-def extract_targets_from_mask(mask_path: str) -> Optional[dict]:
-    """Component-aware mask parsing (8-connected, matching diagnose_gt_multibox.py).
+def extract_targets_from_mask(mask_path: str, min_contour_area: int = 5) -> Optional[dict]:
+    """Component-aware mask parsing via ``cv2.findContours(RETR_EXTERNAL)``.
+
+    This is the official mask→bbox convention for MVTec/VisA detection:
+      - Intel Datumaro ``datumaro.util.mask_tools.mask_to_bboxes``
+        (``cv2.findContours``, ``RETR_EXTERNAL``, one box per disjoint contour)
+      - "Adapting Vision-Language Models for Few-Shot Industrial Defect
+        Detection" (MDPI Algorithms 2026), which reformats MVTec AD masks into
+        bounding boxes with ``cv2.findContours(RETR_EXTERNAL)`` and filters
+        sub-``min_contour_area`` noise.
+
+    Each disjoint connected component (8-connected external contour) yields one
+    independent bounding box. No dilation, no proximity merging, no union-box
+    fallback. Degenerate contours (<=2 points) and sub-threshold noise are
+    skipped.
 
     Returns None for missing/empty masks, else a dict with:
-      bbox                 : global union bounding box (back-compat single box)
-      component_bboxes     : list of per-connected-component boxes [x1,y1,x2,y2]
-      num_components       : number of connected components
+      bbox                 : global union bounding box over raw mask (benchmark)
+      component_bboxes     : per-component boxes [x1,y1,x2,y2] (xyxy, native px)
+      num_components       : number of kept connected components
       mask_area_fraction   : defect pixels / (W*H)
       union_area_fraction  : union box area / (W*H)
     """
     if mask_path is None or not os.path.exists(mask_path):
         return None
     try:
-        from scipy import ndimage
+        import cv2
 
         mask = Image.open(mask_path).convert("L")
         arr = np.array(mask) > 0
         if not arr.any():
             return None
         H, W = arr.shape
-        labels, num = ndimage.label(arr, structure=np.ones((3, 3)))
+        contours, _ = cv2.findContours(arr.astype(np.uint8),
+                                       cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
         comps = []
-        for i in range(1, int(num) + 1):
-            ys, xs = np.where(labels == i)
-            comps.append([int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1])
+        for contour in contours:
+            if len(contour) <= 2:
+                continue
+            if cv2.contourArea(contour) < int(min_contour_area):
+                continue
+            x, y, w, h = cv2.boundingRect(contour)
+            # xyxy, half-open: [x1, y1, x2, y2) with x2 = x + w, y2 = y + h
+            comps.append([int(x), int(y), int(x + w), int(y + h)])
         rows = np.any(arr, axis=1)
         cols = np.any(arr, axis=0)
         ys = np.where(rows)[0]
@@ -65,19 +85,22 @@ def extract_targets_from_mask(mask_path: str) -> Optional[dict]:
         return dict(
             bbox=union,
             component_bboxes=comps,
-            num_components=int(num),
+            num_components=len(comps),
             mask_area_fraction=float(arr.sum()) / (W * H),
             union_area_fraction=float(union_area) / (W * H),
         )
-    except Exception:
-        return None
+    except Exception as exc:
+        raise RuntimeError(
+            f'failed to extract component GT from mask: {mask_path}'
+        ) from exc
 
 
 def compute_max_boxes(samples: List[dict], quantile: float = 0.95) -> int:
     """Freeze max_boxes from train-only component counts (never MVTec test).
 
     Uses a high quantile of num_components over anomaly samples so the frozen
-    value covers most cases without chasing the rare extreme (e.g. 95 components).
+    value covers most cases without chasing the rare extreme (e.g. a 63-component
+    VisA mask after ``findContours``).
     """
     counts = [
         int((s.get("metadata") or {}).get("num_components") or 0)
@@ -118,7 +141,8 @@ def _mask_for_stem(mask_dir: str, stem: str) -> Optional[str]:
     return None
 
 
-def scan_visa(root: str, *, max_normal_per_class: Optional[int] = None, seed: int = 42) -> List[dict]:
+def scan_visa(root: str, *, max_normal_per_class: Optional[int] = None, seed: int = 42,
+              min_contour_area: int = 5) -> List[dict]:
     """
     VisA 全量：{root}/{cls}/Data/Images/{Normal,Anomaly}，Masks/Anomaly/{stem}.png。
     默认使用全部异常 + 全部正常 query；max_normal_per_class 仅在需要子采样时设置。
@@ -137,7 +161,7 @@ def scan_visa(root: str, *, max_normal_per_class: Optional[int] = None, seed: in
         for name in _list_images(img_anom):
             stem = os.path.splitext(name)[0]
             mask = _mask_for_stem(mask_dir, stem)
-            targets = extract_targets_from_mask(mask) if mask else None
+            targets = extract_targets_from_mask(mask, min_contour_area=min_contour_area) if mask else None
             samples.append(
                 {
                     "id": f"visa_{cls}_anom_{stem}",
@@ -186,7 +210,7 @@ def scan_visa(root: str, *, max_normal_per_class: Optional[int] = None, seed: in
     return samples
 
 
-def scan_mvtec(root: str, split: str = "test") -> List[dict]:
+def scan_mvtec(root: str, split: str = "test", min_contour_area: int = 5) -> List[dict]:
     """MVTec-AD: {root}/{cls}/{train|test}/{defect}/xxx.png + ground_truth/{defect}/{stem}_mask.png"""
     samples: List[dict] = []
     if not os.path.isdir(root):
@@ -208,7 +232,7 @@ def scan_mvtec(root: str, split: str = "test") -> List[dict]:
             for name in _list_images(img_dir):
                 stem = os.path.splitext(name)[0]
                 mask = _mask_for_stem(gt_dir, stem) if is_anom else None
-                targets = extract_targets_from_mask(mask) if mask else None
+                targets = extract_targets_from_mask(mask, min_contour_area=min_contour_area) if mask else None
                 samples.append(
                     {
                         "id": f"mvtec_{cls}_{defect}_{stem}",
@@ -246,12 +270,14 @@ def load_prior_split(cfg: dict) -> tuple[List[dict], List[dict]]:
         root = os.path.expanduser(str(root or ""))
         if not root:
             raise ValueError(f"need data.*_root for layout={layout}")
+        min_area = _optional_int(data_cfg.get("min_contour_area"))
+        min_area = 5 if min_area is None else min_area
         if layout == "visa":
             max_n = _optional_int(data_cfg.get("visa_max_normal_per_class"))
-            return scan_visa(root, max_normal_per_class=max_n, seed=seed)
+            return scan_visa(root, max_normal_per_class=max_n, seed=seed, min_contour_area=min_area)
         if layout == "mvtec":
             split = str(data_cfg.get("mvtec_split", "test"))
-            return scan_mvtec(root, split=split)
+            return scan_mvtec(root, split=split, min_contour_area=min_area)
         raise ValueError(f"unknown layout {layout}")
 
     train_layout = str(data_cfg.get("train_layout", "visa")).lower()

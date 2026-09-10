@@ -1,5 +1,5 @@
 """Input plumbing for outcome-multibox-v1: reuse the single-box collator with
-multibox prompt/GT validation swapped in."""
+multibox GT validation swapped in."""
 from __future__ import annotations
 
 from outcome import protocol_multibox as pb
@@ -11,5 +11,4 @@ class OutcomeMultiboxDataset(OutcomeDataset):
 
 
 class OutcomeMultiboxCollator(OutcomeCollator):
-    prompt_fn = staticmethod(pb.prompt)
     validate_gt_fn = staticmethod(pb.validate_gt)

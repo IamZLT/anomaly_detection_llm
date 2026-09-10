@@ -53,6 +53,7 @@ data:
   eval_layout: mvtec
   eval_root: /data2/zlt/anomaly_detection_llm/datasets/mvtec_anomaly_detection
   visa_max_normal_per_class: null
+  min_contour_area: 5   # findContours 去噪阈值(px)，MDPI Algorithms 2026 论文默认 5
   source_dirname: VisA
   train_anomaly_only: false
   random_train_ref: true
@@ -67,21 +68,48 @@ data:
   max_pixels: null
 prompt:
   enable_thinking: false
+  template: |
+    Image 1 is a defect-free reference of {class_name}. Image 2 is the inspection image.
+    A set of region evidence tokens follows, one per candidate location: {region_tokens}. Each token encodes the inspection content at that location, its matched normal counterpart, and the discrepancy between them. Treat them as coarse visual hints, not labels; reject normal variations and search beyond the marked locations too.
+    Return these five SHORT blocks, in this exact order:
+    <understand>
+    brief object/structure observation
+    </understand>
+    <compare>
+    brief reference-test difference
+    </compare>
+    <ground>
+    candidate_bboxes_2d=[[x1,y1,x2,y2],[x1,y1,x2,y2]]
+    </ground>
+    <verify>
+    action; brief reference-based evidence
+    </verify>
+    <answer>
+    {"is_anomaly": false, "bboxes_2d": [], "description": "brief result"}
+    </answer>
+    Replace examples with your observations.
+    candidate_bboxes_2d is a provisional list of boxes, or [] if nothing suspicious. It is a hypothesis set.
+    Verification action is one of: keep, refine, reject, discover, none, followed by a semicolon and short evidence.
+    For anomaly=true, bboxes_2d contains one box per spatially disconnected anomalous region, with no duplicates and at most {max_boxes} boxes.
+    For anomaly=false, bboxes_2d MUST be [].
+    All boxes are integers [x1,y1,x2,y2] in [0,1000] for Image 2 FULL IMAGE, with x1<x2 and y1<y2.
+    Do not repeat blocks. Stop immediately after </answer>.
 training:
   max_length: 3072
   gradient_checkpointing: true
   gradient_checkpointing_kwargs:
     use_reentrant: false
   seed: 42
-  eval_every_n_steps: 0
-  eval_num_samples: null
+  eval_every_n_steps: 100
+  eval_split: test
+  eval_num_samples: 200
   final_eval_num_samples: null
 grpo:
   group_size: 8
-  policy_epochs: 1
+  policy_epochs: 3
   epochs: 2
   max_attempts: null
-  learning_rate: 1.0e-06
+  learning_rate: 5.0e-06
   gradient_accumulation_steps: 1
   max_new_tokens: 512
   rollout_micro_batch_size: 1
@@ -90,7 +118,7 @@ grpo:
   temperature: 1.0
   top_p: 1.0
   top_k: 0
-  scale_rewards: false
+  scale_rewards: true
   clip_low: 0.2
   clip_high: 0.28
   kl_beta: 0.0002
@@ -105,15 +133,26 @@ distributed:
 outcome:
   version: outcome-multibox-v1
   protocol_weight: 0.01
-  max_boxes: 16   # VisA-train component count p95=13, frozen (see data.scan.compute_max_boxes)
+  max_boxes: 16   # findContours GT p95=9 / p99=20 on VisA-train (see data.scan.compute_max_boxes)
   localization:
     iou_threshold: 0.30
     geometry_weight: 0.30
+  reward:
+    # Fine-grained reward (AD-FM style):
+    #   wrong_decision | normal_correct + focus_weight*focus | cls_weight + iou_weight*mask_iou
+    #   + count_weight*count + dense_weight*loc + refine_weight*min(0, delta_refine)
+    normal_correct: 1.0    # positive attractor for correct rejections
+    wrong_decision: -1.0
+    cls_weight: 0.0        # extra base reward for correct anomaly decision
+    iou_weight: 0.5        # AD-Copilot BBox-Mask IoU (primary localization term)
+    count_weight: 0.2      # explicit box-count reward (|m-n|=0 -> 1, 1 -> 0.5, >=2 -> -0.1)
+    dense_weight: 0.3      # DCLR dense term (early non-zero gradient)
+    focus_weight: 0.2      # normal-sample focus reward (localize-then-reject)
+    refine_weight: 0.1     # penalize degrading a good candidate (min(0, delta_refine))
   resampling:
     min_loc_range: 0.001
     max_group_resamples: 3
-  sft_adapter: null
-  eval_before_train: false
+  sft_adapter: outputs/train/region_sft_multibox/checkpoint-2000
   final_test: false
   prior:
     condition: real
@@ -121,6 +160,15 @@ outcome:
     raw_threshold: null
     max_candidates: 3
     min_cells: 1
-  roi:
-    enabled: false
-    margin: 0.25
+    # Which vision block (0-based, must be one of the layer_indices block indices)
+    # supplies per-patch features for region contrast tokens. Default: last block.
+    region_feature_index: 23
+  # H-guided region contrast tokens (the only prior channel). H candidates are turned
+  # into <|region|> placeholder tokens whose embeddings come from models/region_adapter.py.
+  # The adapter is trained by train_region_sft.py and loaded from outcome.sft_adapter.
+  region:
+    intermediate_dim: 256
+    geometry_dim: 5
+    hstat_dim: 2
+    activation: gelu
+    max_cells: 12

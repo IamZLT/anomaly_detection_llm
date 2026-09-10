@@ -70,6 +70,7 @@ backup_code_*/
 papers/
 results/
 exp_llm.bash
+.codex_changes/
 
 # App runtime files
 app/uploads/

@@ -7,8 +7,8 @@ import pytest
 import torch
 from PIL import Image
 
-from outcome.protocol import parse_output, score_output, prompt, validate_gt
-from outcome.inputs import region_proposals, crop_original, local_box_to_full
+from outcome.protocol import parse_output, score_output, render_prompt, validate_gt
+from outcome.inputs import region_proposals
 from outcome.policy import group_advantages, trim_completion
 from outcome.engine import summarize, validate_config
 from rl.grpo import padded_completion_tensors, token_logprobs
@@ -219,11 +219,13 @@ def test_anomaly_loc_collapse_triggers_resampling(tmp_path, monkeypatch):
 
 def test_single_patch_and_thin_component_use_cell_edges():
     h = np.zeros((4,4));h[3,3]=1
-    ps,_ = region_proposals(h,{})
+    ps,masks,_ = region_proposals(h,{})
     assert len(ps)==1 and ps[0]['bbox_2d']==[750,750,1000,1000]
+    assert masks.shape==(1,4,4) and bool(masks[0][3,3])
     h[0:4,3]=1
-    ps,_ = region_proposals(h,{})
+    ps,masks,_ = region_proposals(h,{})
     assert ps[0]['bbox_2d']==[750,0,1000,1000]
+    assert masks.shape==(1,4,4) and bool(masks[0,:,3].all())
 
 
 def test_flat_low_h_can_be_empty_without_forced_points():
@@ -236,16 +238,6 @@ def test_max_candidates_is_cap_not_target():
     h=np.zeros((5,5));h[0,0]=1;h[4,4]=.9
     assert len(region_proposals(h,{'max_candidates':3})[0])==2
     assert len(region_proposals(h,{'max_candidates':1})[0])==1
-
-
-def test_crop_is_from_original_and_round_trips_boundaries():
-    im=Image.new('RGB',(2000,1000));im.putpixel((400,200),(255,0,0))
-    roi,bounds=crop_original(im,[200,200,300,300],0)
-    assert roi.size==(200,100) and roi.getpixel((0,0))==(255,0,0)
-    assert bounds==[400,200,600,300]
-    assert local_box_to_full([0,0,1000,1000],bounds,im.size)==[200,200,300,300]
-    _,bounds=crop_original(im,[0,0,100,100],.25)
-    assert bounds==[0,0,250,125]
 
 
 class Tokenizer:
@@ -284,7 +276,7 @@ def test_centered_advantage_does_not_amplify_format_noise():
 
 def test_metrics_count_invalid_normal_separately_from_true_negative():
     common=dict(task_valid=True,protocol_core=False,protocol_strict=False,iou=0.,class_name='a',size_bin='normal',
-                iou_h_top1=None,iou_h_bestk=None,iou_c=None,iou_f=None,delta_refine=None,
+                iou_h_top1=None,iou_h_bestk=None,iou_c=None,iou_f=None,delta_refine=None,h_union_cov=None,
                 candidate_bbox_2d=None,bbox_2d=None,
                 new_tokens=5,seconds=1,stop_reason='eos')
     rows=[dict(common,is_anomaly=False,pred=None,task_valid=False),
@@ -297,9 +289,18 @@ def test_metrics_count_invalid_normal_separately_from_true_negative():
     assert s['miou_large'] is None
 
 
-def test_prompt_allows_rejecting_or_searching_outside_h():
-    p=prompt('bottle',True)
-    assert 'search outside H' in p and 'FULL IMAGE' in p and 'ORIGINAL inspection' in p
+def test_prompt_region_tokens():
+    cfg = dict(prompt=dict(
+        template='Image 1 is a defect-free reference of {class_name}. Image 2 is the inspection image.\n'
+                 'A set of region evidence tokens follows: {region_tokens}.\n'
+                 'Return these five SHORT blocks:\n<answer>\n{"is_anomaly": false, "bbox_2d": null}\n</answer>\n'
+                 'For anomaly=false, bbox_2d MUST be null.',
+    ))
+    p = render_prompt(cfg, 'bottle', region_tokens='<|region|> <|region|>')
+    assert 'region evidence tokens' in p
+    assert '<|region|>' in p
+    assert 'bottle' in p
+    assert 'ROI' not in p and 'Image 3' not in p
 
 
 def test_all_zero_groups_are_logged_and_consume_finite_budget(tmp_path, monkeypatch):

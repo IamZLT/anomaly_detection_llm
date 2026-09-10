@@ -9,7 +9,7 @@ runtime:
 tensorboard:
   port: 5003
   host: 0.0.0.0
-  vis_every_n_steps: 20
+  vis_every_n_steps: 10
 model:
   random_init_llm: false
   arch: Qwen3.5-2B
@@ -67,15 +67,41 @@ data:
   max_pixels: null
 prompt:
   enable_thinking: false
+  template: |
+    Image 1 is a defect-free reference of {class_name}. Image 2 is the inspection image.
+    A set of region evidence tokens follows, one per candidate location: {region_tokens}. Each token encodes the inspection content at that location, its matched normal counterpart, and the discrepancy between them. Treat them as coarse visual hints, not labels; reject normal variations and search beyond the marked locations too.
+    Return these five blocks, in this exact order:
+    <understand>
+    brief object/structure observation
+    </understand>
+    <compare>
+    brief reference-test difference
+    </compare>
+    <ground>
+    candidate_bbox_2d=[x1,y1,x2,y2]
+    </ground>
+    <verify>
+    action; brief reference-based evidence
+    </verify>
+    <answer>
+    {"is_anomaly": false, "bbox_2d": null, "description": "brief result"}
+    </answer>
+    Replace examples with your observations.
+    candidate_bbox_2d is a provisional box in [0,1000], or null if nothing suspicious.
+    Verification action is one of: keep, refine, reject, discover, none, followed by a semicolon and a short evidence.
+    For anomaly=true, bbox_2d is the single union box covering ALL defects; for anomaly=false, bbox_2d MUST be null.
+    Coordinates are integers [x1,y1,x2,y2] in [0,1000] for Image 2 FULL IMAGE, with x1<x2 and y1<y2.
+    Do not repeat blocks. Stop immediately after </answer>.
 training:
   max_length: 3072
   gradient_checkpointing: true
   gradient_checkpointing_kwargs:
     use_reentrant: false
   seed: 42
-  eval_every_n_steps: 0
-  eval_num_samples: null
-  final_eval_num_samples: null
+  eval_every_n_steps: 10
+  eval_split: test
+  eval_num_samples: 60
+  final_eval_num_samples: 60
 grpo:
   group_size: 8
   policy_epochs: 1
@@ -111,15 +137,24 @@ outcome:
   resampling:
     min_loc_range: 0.001
     max_group_resamples: 3
-  sft_adapter: null
+  sft_adapter: outputs/train/region_sft/checkpoint-1000
   eval_before_train: false
-  final_test: false
+  final_test: true
   prior:
     condition: real
     relative_threshold: 0.7
     raw_threshold: null
     max_candidates: 3
     min_cells: 1
-  roi:
-    enabled: false
-    margin: 0.25
+    # Which vision block (0-based, must be one of the layer_indices block indices)
+    # supplies per-patch features for region contrast tokens. Default: last block.
+    region_feature_index: 23
+  # H-guided region contrast tokens (the only prior channel). H candidates are turned
+  # into <|region|> placeholder tokens whose embeddings come from models/region_adapter.py.
+  # The adapter is trained by train_region_sft.py and loaded from outcome.sft_adapter.
+  region:
+    intermediate_dim: 256
+    geometry_dim: 5
+    hstat_dim: 2
+    activation: gelu
+    max_cells: 12

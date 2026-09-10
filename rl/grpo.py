@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.qwen35 import unwrap_model
+from models.region_injection import REGION_INPUT_KEYS
 from reasoning.segments import completion_segment_ids, mix_segment_advantage
 
 
@@ -27,7 +28,7 @@ def move_batch(batch: dict, device: torch.device) -> dict:
 
 
 def model_inputs(batch: dict) -> dict:
-    skip = {"labels", "_meta", "prompt_len", "image_embeds"}
+    skip = {"labels", "_meta", "prompt_len", "image_embeds"} | REGION_INPUT_KEYS
     return {k: v for k, v in batch.items() if k not in skip and torch.is_tensor(v)}
 
 

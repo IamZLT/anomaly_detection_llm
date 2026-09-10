@@ -5,6 +5,8 @@ accelerate>=0.30
 pyyaml
 pillow
 numpy
+scipy>=1.10
+opencv-python>=4.8
 tensorboard
 tqdm
 flask

@@ -187,6 +187,12 @@ class AnomalyPrior(nn.Module):
         self.hint_nms_radius = int(prior_cfg.get("hint_nms_radius", 2))
         self.prior_box_thresh = float(prior_cfg.get("prior_box_thresh", 0.5))
         self.prior_box_min_area = float(prior_cfg.get("prior_box_min_area", 0.0))
+        self.region_feature_index = int(prior_cfg.get("region_feature_index", self.block_indices[-1]))
+        if self.region_feature_index not in self.block_indices:
+            raise ValueError(
+                f"prior.region_feature_index={self.region_feature_index} must be one of "
+                f"prior.layer_indices (block indices {self.block_indices})"
+            )
 
         for p in self.visual.parameters():
             p.requires_grad = False
@@ -254,6 +260,86 @@ class AnomalyPrior(nn.Module):
             feats.append(tok)
         return feats, (th, tw), merged
 
+    def _nn_match(
+        self,
+        f_t: torch.Tensor,
+        f_r: torch.Tensor,
+        hw_t: Tuple[int, int],
+        hw_r: Tuple[int, int],
+        radius: int,
+    ) -> Dict[str, torch.Tensor]:
+        """Per-test-patch nearest-normal match, returning the raw matched feature.
+
+        Keeps the information `_nn_map` previously discarded (which normal patch each
+        test patch matched, plus its feature and grid coordinate) so region tokens can
+        express "test content vs normal counterpart vs their difference".
+
+        Returns:
+          distance              : [Ht, Wt] per-patch discrepancy (higher = more anomalous)
+          matched_ref_features  : [Ht*Wt, D] RAW reference feature at the matched position
+          match_coordinates     : [Ht*Wt, 2] (y, x) reference grid coordinate of the match
+        """
+        ft = F.normalize(f_t.float(), dim=-1)
+        fr = F.normalize(f_r.float(), dim=-1)
+        ht, wt = int(hw_t[0]), int(hw_t[1])
+        hr, wr = int(hw_r[0]), int(hw_r[1])
+        if int(f_t.shape[0]) != ht * wt:
+            raise ValueError(
+                f"test feature count {int(f_t.shape[0])} != grid {ht}x{wt}={ht * wt}; "
+                "refusing to guess the spatial grid size"
+            )
+        if int(f_r.shape[0]) != hr * wr:
+            raise ValueError(
+                f"ref feature count {int(f_r.shape[0])} != grid {hr}x{wr}={hr * wr}; "
+                "refusing to guess the spatial grid size"
+            )
+
+        if int(radius) <= 0:
+            sim = ft @ fr.T  # [Nt, Nr]
+            best = sim.argmax(dim=1)  # [Nt]
+            dist = (1.0 - sim.gather(1, best.unsqueeze(1)).squeeze(1).clamp(-1.0, 1.0)).view(ht, wt)
+            matched = f_r[best]  # [Nt, D] raw
+            coords = torch.stack([best // wr, best % wr], dim=1)
+            return dict(distance=dist, matched_ref_features=matched, match_coordinates=coords)
+
+        # Local matching over a radius-wide window of the reference grid. If the
+        # reference grid differs from the test grid we bilinearly resample both the
+        # normalized (for matching) and raw (for extraction) reference features, and
+        # record coordinates on that interpolated grid (never raw patch indices).
+        c = int(f_r.shape[-1])
+        f_r_raw = f_r
+        if (hr, wr) != (ht, wt):
+            fr_map = fr.view(1, hr, wr, c).permute(0, 3, 1, 2)
+            fr_map = F.interpolate(fr_map, size=(ht, wt), mode="bilinear", align_corners=False)
+            fr = F.normalize(fr_map.permute(0, 2, 3, 1).reshape(-1, c), dim=-1)
+            raw_map = f_r_raw.view(1, hr, wr, c).permute(0, 3, 1, 2)
+            raw_map = F.interpolate(raw_map, size=(ht, wt), mode="bilinear", align_corners=False)
+            f_r_raw = raw_map.permute(0, 2, 3, 1).reshape(-1, c)
+            hr, wr = ht, wt
+
+        win = 2 * int(radius) + 1
+        fr_map = fr.view(1, hr, wr, c).permute(0, 3, 1, 2)
+        padded = F.pad(fr_map, (radius, radius, radius, radius), mode="replicate")
+        patches = F.unfold(padded, kernel_size=win)
+        k = win * win
+        patches = patches.view(c, k, ht * wt).permute(2, 1, 0)  # [Nt, k, c]
+        sim = (ft.unsqueeze(1) * patches).sum(dim=-1)  # [Nt, k]
+        best = sim.argmax(dim=1)  # [Nt]
+        dist = (1.0 - sim.gather(1, best.unsqueeze(1)).squeeze(1).clamp(-1.0, 1.0)).view(ht, wt)
+
+        raw_map = f_r_raw.view(1, hr, wr, c).permute(0, 3, 1, 2)
+        raw_padded = F.pad(raw_map, (radius, radius, radius, radius), mode="replicate")
+        raw_patches = F.unfold(raw_padded, kernel_size=win)
+        raw_patches = raw_patches.view(c, k, ht * wt).permute(2, 1, 0)  # [Nt, k, c]
+        matched = raw_patches[torch.arange(ht * wt, device=ft.device), best]  # [Nt, c]
+
+        ys = torch.arange(ht, device=ft.device).repeat_interleave(wt)
+        xs = torch.arange(wt, device=ft.device).repeat(ht)
+        base = torch.stack([ys, xs], dim=1)  # [Nt, 2]
+        off = torch.stack([best // win - radius, best % win - radius], dim=1)  # [Nt, 2]
+        coords = base + off
+        return dict(distance=dist, matched_ref_features=matched, match_coordinates=coords)
+
     def _nn_map(
         self,
         f_t: torch.Tensor,
@@ -262,37 +348,8 @@ class AnomalyPrior(nn.Module):
         hw_r: Tuple[int, int],
         radius: int,
     ) -> torch.Tensor:
-        ft = F.normalize(f_t.float(), dim=-1)
-        fr = F.normalize(f_r.float(), dim=-1)
-        ht, wt = int(hw_t[0]), int(hw_t[1])
-        if ft.shape[0] != ht * wt:
-            side = int(round(ft.shape[0] ** 0.5))
-            ht, wt = side, side
-
-        if int(radius) <= 0:
-            sim = ft @ fr.T
-            dist = (1.0 - sim.max(dim=1).values.clamp(-1.0, 1.0)).view(ht, wt)
-            return dist
-
-        hr, wr = int(hw_r[0]), int(hw_r[1])
-        c = int(fr.shape[-1])
-        if fr.shape[0] != hr * wr:
-            side = int(round(fr.shape[0] ** 0.5))
-            hr, wr = side, side
-        if (hr, wr) != (ht, wt):
-            fr_map = fr.view(1, hr, wr, c).permute(0, 3, 1, 2)
-            fr_map = F.interpolate(fr_map, size=(ht, wt), mode="bilinear", align_corners=False)
-            fr = F.normalize(fr_map.permute(0, 2, 3, 1).reshape(-1, c), dim=-1)
-            hr, wr = ht, wt
-
-        win = 2 * int(radius) + 1
-        fr_map = fr.view(1, hr, wr, c).permute(0, 3, 1, 2)
-        padded = F.pad(fr_map, (radius, radius, radius, radius), mode="replicate")
-        patches = F.unfold(padded, kernel_size=win)
-        k = win * win
-        patches = patches.view(c, k, ht * wt).permute(2, 1, 0)
-        sim = (ft.unsqueeze(1) * patches).sum(dim=-1)
-        return (1.0 - sim.max(dim=1).values.clamp(-1.0, 1.0)).view(ht, wt)
+        """Backward-compatible distance-only wrapper around ``_nn_match``."""
+        return self._nn_match(f_t, f_r, hw_t, hw_r, radius)["distance"]
 
     @torch.no_grad()
     def forward(

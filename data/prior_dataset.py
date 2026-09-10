@@ -209,6 +209,7 @@ class PriorCoTDataset(Dataset):
             "num_components": meta.get("num_components"),
             "mask_area_fraction": meta.get("mask_area_fraction"),
             "union_area_fraction": meta.get("union_area_fraction"),
+            "full_mask_path": meta.get("full_mask_path"),
             "is_anomaly": is_anom,
             "class_name": cls,
             "defect_type": defect,

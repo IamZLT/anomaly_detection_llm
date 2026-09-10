@@ -159,11 +159,71 @@ def iou(a, b):
     return inter/union if union > 0 else 0.0
 
 
+def giou(a, b):
+    """Generalized IoU in [-1, 1]; retains a directional signal when boxes do not overlap.
+
+    GIoU = IoU - (enclosing_area - union) / enclosing_area. Non-overlapping boxes
+    still yield a negative value that grows with distance, unlike IoU's flat 0.
+    """
+    if a is None or b is None:
+        return 0.0
+    iou_val = iou(a, b)
+    ex0, ey0 = min(a[0], b[0]), min(a[1], b[1])
+    ex1, ey1 = max(a[2], b[2]), max(a[3], b[3])
+    enc_area = (ex1 - ex0) * (ey1 - ey0)
+    if enc_area <= 0:
+        return iou_val
+    area_a = (a[2]-a[0]) * (a[3]-a[1])
+    area_b = (b[2]-b[0]) * (b[3]-b[1])
+    inter = max(min(a[2], b[2]) - max(a[0], b[0]), 0) * max(min(a[3], b[3]) - max(a[1], b[1]), 0)
+    union = area_a + area_b - inter
+    return iou_val - (enc_area - union) / enc_area
+
+
 def to_pixels(box, wh):
     if box is None:
         return None
     return [box[0]*wh[0]/1000, box[1]*wh[1]/1000,
             box[2]*wh[0]/1000, box[3]*wh[1]/1000]
+
+
+def _rect_intersection(boxes):
+    x0 = max(b[0] for b in boxes); y0 = max(b[1] for b in boxes)
+    x1 = min(b[2] for b in boxes); y1 = min(b[3] for b in boxes)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return [x0, y0, x1, y1]
+
+
+def _rect_area(box):
+    return (box[2]-box[0])*(box[3]-box[1])
+
+
+def box_union_coverage(gt_px, boxes_px):
+    """Fraction of the GT box covered by the UNION of candidate boxes (pixel coords).
+
+    Offline diagnostic ("does H cover the defect") — never part of the reward. Exact
+    via inclusion-exclusion; candidates are few (<= max_candidates), so cost is small.
+    """
+    import itertools
+
+    if gt_px is None:
+        return None
+    gt_area = _rect_area(gt_px)
+    if gt_area <= 0:
+        return 0.0
+    boxes_px = [b for b in boxes_px if b is not None]
+    inter_area = 0.0
+    for k in range(1, len(boxes_px) + 1):
+        sign = (-1.0) ** (k + 1)
+        for combo in itertools.combinations(range(len(boxes_px)), k):
+            inter = _rect_intersection([boxes_px[i] for i in combo])
+            if inter is None:
+                continue
+            gi = _rect_intersection([inter, gt_px])
+            if gi is not None:
+                inter_area += sign * _rect_area(gi)
+    return float(min(1.0, max(0.0, inter_area / gt_area)))
 
 
 def validate_gt(meta):
@@ -209,10 +269,15 @@ def localization_reward(pred_box, gt_box, orig_size, iou_threshold=0.30, geometr
     s_w = min(pw, gw) / max(pw, gw) if pw > 0 and gw > 0 else 0.0
     s_h = min(ph, gh) / max(ph, gh) if ph > 0 and gh > 0 else 0.0
     s_geo = s_center * s_w * s_h
-    if iou_val >= iou_threshold:
+    # Dense geometry bonus fades to zero linearly as IoU approaches the threshold, so
+    # the reward is continuous at the threshold (a box slightly better must never score
+    # lower than a slightly worse one).
+    dense_term = geometry_weight * (1.0 - iou_val) * s_geo
+    if iou_val >= iou_threshold or iou_threshold <= 0:
         reward = iou_val
     else:
-        reward = iou_val + geometry_weight * (1.0 - iou_val) * s_geo
+        fade = iou_val / iou_threshold
+        reward = iou_val + dense_term * (1.0 - fade)
     return dict(loc_reward=float(max(0.0, min(1.0, reward))), raw_iou=float(iou_val),
                 s_center=float(s_center), s_w=float(s_w), s_h=float(s_h), s_geo=float(s_geo))
 
@@ -250,30 +315,19 @@ def score_output(parsed, meta, protocol_weight=0.01, localization=None):
                 s_center=locd['s_center'], s_w=locd['s_w'], s_h=locd['s_h'], s_geo=locd['s_geo'])
 
 
-def prompt(class_name: str, roi: bool) -> str:
-    return f'''Image 1 is a defect-free reference of {class_name}. Image 2 is the inspection image.
-H contains coarse discrepancy proposals, not labels or anomaly probabilities. H may be empty or wrong.
-Compare the images; reject normal variations and search outside H too.
-{('Image 3, if supplied, is a crop from the ORIGINAL inspection image. Its full-image bounds are given in roi. The reference is not registered: do not assume matching pixel positions.' if roi else 'Use the two full images to check candidate regions.')}
-Return these five SHORT blocks, in this exact order:
-<understand>
-brief object/structure observation
-</understand>
-<compare>
-brief reference-test difference
-</compare>
-<ground>
-candidate_bbox_2d=[x1,y1,x2,y2]
-</ground>
-<verify>
-action; brief reference-based evidence
-</verify>
-<answer>
-{{"is_anomaly": false, "bbox_2d": null, "description": "brief result"}}
-</answer>
-Replace examples with your observations.
-candidate_bbox_2d is a provisional box in [0,1000], or null if nothing suspicious.
-Verification action is one of: keep, refine, reject, discover, none, followed by a semicolon and a short evidence.
-For anomaly=true, bbox_2d is the single union box covering ALL defects; for anomaly=false, bbox_2d MUST be null.
-Coordinates are integers [x1,y1,x2,y2] in [0,1000] for Image 2 FULL IMAGE, with x1<x2 and y1<y2.
-Do not repeat blocks. Stop immediately after </answer>.'''
+def render_prompt(cfg, class_name: str, region_tokens: str = '') -> str:
+    """Build the user prompt from ``prompt.template`` in the config.
+
+    Supported placeholders: ``{class_name}``, ``{region_tokens}``, ``{max_boxes}``.
+    ``{max_boxes}`` comes from ``outcome.max_boxes``.
+    """
+    p = cfg.get('prompt') or {}
+    template = str(p.get('template') or '')
+    if not template:
+        raise ValueError('prompt.template is required in the config')
+    max_boxes = int((cfg.get('outcome') or {}).get('max_boxes', 16))
+    text = template
+    text = text.replace('{class_name}', str(class_name))
+    text = text.replace('{region_tokens}', str(region_tokens))
+    text = text.replace('{max_boxes}', str(max_boxes))
+    return text

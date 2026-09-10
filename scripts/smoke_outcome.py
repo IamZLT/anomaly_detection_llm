@@ -33,34 +33,28 @@ def main():
     _,dev,_=datasets(cfg,processor)
     index=next(i for i,s in enumerate(dev.samples) if s['metadata']['anomaly'])
     item=dev[index]
-    reports=[]
-    for roi in [False,True]:
-        cfg['outcome']['roi']['enabled']=roi
-        batch=move_batch(OutcomeCollator(processor,prior,cfg)([item]),next(model.parameters()).device)
-        model.eval()
-        inputs=model_inputs(batch)
-        with torch.no_grad():
-            raw=forward_with_vision(model,inputs,batch['input_ids'],batch['attention_mask']).logits[:,-1].float()
-            with bind_cached_image_features(model,batch['image_embeds']):
-                cached=forward_with_vision(model,inputs,batch['input_ids'],batch['attention_mask']).logits[:,-1].float()
-        error=(raw-cached).abs().max().item()
-        assert error < .03, f'cached/official visual mismatch: {error}'
-        del raw,cached
-        cs=generate_group(model,processor,batch,cfg,group=2,sample=True)
-        before={n:p.detach().clone() for n,p in model.named_parameters() if p.requires_grad}
-        opt=torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],lr=1e-6)
-        metrics=optimize_group(model,processor,batch,cs,torch.tensor([-1.,1.],device=next(model.parameters()).device),opt,cfg)
-        change=max((p.detach()-before[n]).abs().max().item() for n,p in model.named_parameters() if p.requires_grad)
-        assert change > 0, 'LoRA weights did not update'
-        report=dict(roi_enabled=roi,actual_image_count=len(batch['image_grid_thw']),prompt_tokens=int(batch['prompt_len'][0]),
-                    cached_official_max_error=error,weight_max_change=change,metrics=metrics,
-                    completion_lengths=[len(c.ids)-int(batch['prompt_len'][0]) for c in cs],
-                    stop_reasons=[c.stop_reason for c in cs],roi=batch['_meta'][0]['roi'])
-        reports.append(report)
-        Path(args.output).write_text(json.dumps(reports,indent=2))
-        print(json.dumps(report),flush=True)
-        del batch,before,opt
-        if torch.cuda.is_available():torch.cuda.empty_cache()
-    print('PASS: two-image and three-image cached generation + logprobs + backward; no weights saved',flush=True)
+    batch=move_batch(OutcomeCollator(processor,prior,cfg)([item]),next(model.parameters()).device)
+    model.eval()
+    inputs=model_inputs(batch)
+    with torch.no_grad():
+        raw=forward_with_vision(model,inputs,batch['input_ids'],batch['attention_mask']).logits[:,-1].float()
+        with bind_cached_image_features(model,batch['image_embeds']):
+            cached=forward_with_vision(model,inputs,batch['input_ids'],batch['attention_mask']).logits[:,-1].float()
+    error=(raw-cached).abs().max().item()
+    assert error < .03, f'cached/official visual mismatch: {error}'
+    del raw,cached
+    cs=generate_group(model,processor,batch,cfg,group=2,sample=True)
+    before={n:p.detach().clone() for n,p in model.named_parameters() if p.requires_grad}
+    opt=torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],lr=1e-6)
+    metrics=optimize_group(model,processor,batch,cs,torch.tensor([-1.,1.],device=next(model.parameters()).device),opt,cfg)
+    change=max((p.detach()-before[n]).abs().max().item() for n,p in model.named_parameters() if p.requires_grad)
+    assert change > 0, 'LoRA weights did not update'
+    report=dict(actual_image_count=len(batch['image_grid_thw']),prompt_tokens=int(batch['prompt_len'][0]),
+                cached_official_max_error=error,weight_max_change=change,metrics=metrics,
+                completion_lengths=[len(c.ids)-int(batch['prompt_len'][0]) for c in cs],
+                stop_reasons=[c.stop_reason for c in cs])
+    Path(args.output).write_text(json.dumps(report,indent=2))
+    print(json.dumps(report),flush=True)
+    print('PASS: two-image cached generation + logprobs + backward; no weights saved',flush=True)
 
 if __name__=='__main__':main()

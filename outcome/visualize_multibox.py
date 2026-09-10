@@ -1,8 +1,10 @@
 """TensorBoard visualization for outcome-multibox-v1: heatmap + component/multi-box overlay."""
 from __future__ import annotations
 
+import os
 from typing import List, Optional, Sequence, Tuple
 
+import numpy as np
 from PIL import Image, ImageDraw
 
 from outcome.protocol import to_pixels
@@ -14,6 +16,22 @@ from visualization.tensorboard import (
     pil_to_tb,
     vstack_labeled,
 )
+
+
+def _mask_overlay(test: Image.Image, mask_path: Optional[str], alpha: float = 0.6) -> Optional[Image.Image]:
+    """Ground-truth mask overlaid in red on the test image; None if no defect mask."""
+    if not mask_path or not os.path.exists(mask_path):
+        return None
+    try:
+        mask = Image.open(mask_path).convert("L").resize(test.size, Image.Resampling.NEAREST)
+    except Exception:
+        return None
+    arr = np.array(mask) > 0
+    if not arr.any():
+        return None
+    red = Image.new("RGB", test.size, (220, 30, 30))
+    mask_alpha = Image.fromarray((arr * int(255 * max(0.0, min(1.0, alpha)))).astype(np.uint8))
+    return Image.composite(red, test.convert("RGB"), mask_alpha)
 
 
 def _draw_box(draw, box, color, label):
@@ -98,8 +116,10 @@ def render_outcome_case(meta, response, parsed, union_iou, loc_reward, correct, 
             orig_wh=orig,
         )
 
+    mask = _mask_overlay(test, meta.get('full_mask_path')) if test is not None else None
+
     cot = format_outcome_case_text(step, meta, response, parsed, union_iou, loc_reward, correct)
-    return panel, vis, cot
+    return panel, vis, mask, cot
 
 
 def log_outcome_eval_grid(writer, *, step, cases, overlay_alpha=0.45, max_cases=16):
@@ -108,7 +128,7 @@ def log_outcome_eval_grid(writer, *, step, cases, overlay_alpha=0.45, max_cases=
     rows = []
     cot_parts = []
     for ci, c in enumerate(cases[:max_cases]):
-        panel, vis, cot = render_outcome_case(
+        panel, vis, mask, cot = render_outcome_case(
             c['meta'], c.get('response', ''), c['parsed'],
             float(c.get('union_iou', 0.0)), float(c.get('loc_reward', 0.0)),
             bool(c.get('correct', False)), step=step, overlay_alpha=overlay_alpha,
@@ -116,6 +136,8 @@ def log_outcome_eval_grid(writer, *, step, cases, overlay_alpha=0.45, max_cases=
         parts = []
         if panel is not None:
             parts.append(('H', panel))
+        if mask is not None:
+            parts.append(('GT-mask', mask))
         if vis is not None:
             parts.append(('bbox', vis))
         if parts:
@@ -135,13 +157,15 @@ def log_outcome_single_case(writer, *, step, meta, response, parsed, union_iou, 
                             tag_prefix='train', overlay_alpha=0.45):
     if writer is None:
         return
-    panel, vis, cot = render_outcome_case(
+    panel, vis, mask, cot = render_outcome_case(
         meta, response, parsed, union_iou, loc_reward, correct,
         step=step, overlay_alpha=overlay_alpha,
     )
     if panel is not None:
         writer.add_image(f'{tag_prefix}/1_heatmap', pil_to_tb(panel), step)
+    if mask is not None:
+        writer.add_image(f'{tag_prefix}/2_gt_mask', pil_to_tb(mask), step)
     if vis is not None:
-        writer.add_image(f'{tag_prefix}/2_bbox', pil_to_tb(vis), step)
-    writer.add_text(f'{tag_prefix}/3_cot', cot, step)
+        writer.add_image(f'{tag_prefix}/3_bbox', pil_to_tb(vis), step)
+    writer.add_text(f'{tag_prefix}/4_cot', cot, step)
     writer.flush()

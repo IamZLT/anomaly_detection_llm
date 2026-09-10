@@ -33,3 +33,47 @@ CUDA_VISIBLE_DEVICES=1 /home/zlt/miniconda3/bin/python train_outcome.py \
 
 cd /data2/zlt/anomaly_detection_llm && CUDA_VISIBLE_DEVICES=0 python train_outcome.py \
   --config configs/qwen35_2b_outcome.yaml --mode train 
+
+
+  CUDA_VISIBLE_DEVICES=4 python train_outcome_multibox.py \
+  --config configs/qwen35_2b_outcome_multibox.yaml \
+  --max-attempts 400
+
+
+
+
+  python train_region_sft.py \
+  --config configs/qwen35_2b_outcome.yaml \
+  --output-dir outputs/train/region_sft \
+  --epochs 5 --lr 1e-4 --save-steps 1000
+
+
+  python train_outcome_multibox.py --config configs/qwen35_2b_outcome_multibox.yaml
+
+
+  cd /data2/zlt/anomaly_detection_llm
+CUDA_VISIBLE_DEVICES=3 python train_outcome_multibox.py \
+  --config configs/qwen35_2b_outcome_multibox.yaml \
+  --mode train \
+  --max-attempts 400
+
+  cd /data2/zlt/anomaly_detection_llm
+
+CUDA_VISIBLE_DEVICES=3,4 python train_outcome_multibox.py \
+  --config configs/qwen35_2b_outcome_multibox.yaml \
+  --mode train \
+  --num-gpu 2 \
+  --max-attempts 400
+
+ CUDA_VISIBLE_DEVICES=3,4  python train_outcome.py --config configs/qwen35_2b_outcome.yaml
+
+CUDA_VISIBLE_DEVICES=3 python train_region_sft.py \
+  --config configs/qwen35_2b_outcome_multibox.yaml \
+  --output-dir outputs/train/region_sft_multibox \
+  --epochs 2 --lr 1e-4 --save-steps 1000
+
+
+  CUDA_VISIBLE_DEVICES=2,6 python train_outcome_multibox.py \
+  --config configs/qwen35_2b_outcome_multibox.yaml \
+  --mode train \
+  --num-gpu 2
